@@ -647,7 +647,7 @@ One row per metric ∈ {`avg_relevance`,`ndcg@10`,`recall@10`,`precision@10`}; `
 A single YAML/JSON config declares the *axes*; the expander produces the variant list (baseline first) for one run.
 
 ```yaml
-dataset:   { name: wands, path: ./data/wands, version: "2022.0" }
+dataset:   { name: wands, path: ./dataset/wands, version: "2022.0" }
 backend:   { kind: elasticsearch, url: ${ES_URL}, index: wands_bench,
              top_k: 100, rank_window_size: 100, min_es_version: "8.15" }   # 8.15 hard floor (§1.1)
 cutoff:    10
@@ -711,7 +711,7 @@ benchmark/
   backends/
     elasticsearch.py     # ElasticsearchBackend, ElasticsearchIndexer, ES RetrieverSpec
 docs/experiment.md
-data/wands/              # query.csv, product.csv, label.csv (gitignored)
+dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
 ```
 `pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` — never `datasets/*` or `backends/*`. Adapters are selected by `config.py` factories (`load_dataset`, `make_backend`). This enforces success criterion §1.4(3). `resolve_hybrid_rerank_best_per_model` lives in `matrix.py` and operates only on in-memory `MetricVector`s passed in by `runner.py`, so it adds no adapter dependency. The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
 
