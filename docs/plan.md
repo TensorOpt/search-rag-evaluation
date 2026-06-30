@@ -98,7 +98,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 **Deliverables (only what this phase adds).**
 - `pyproject.toml` — hatch project; an `eval` environment exposing scripts `wait-for-es`, `fetch-data`, `index`, `run` (wired to placeholders that import cleanly and exit non-destructively for now); a `dev`/`test` environment with `pytest`, `ruff`, `mypy`. Python 3.11+.
-- `benchmark/` package skeleton: empty-but-importable `models.py`, `protocols.py`, `pipeline.py`, `fusion.py`, `rerank.py`, `metrics.py`, `stats.py`, `matrix.py`, `runner.py`, `io_csv.py`, `config.py`, `datasets/__init__.py`, `datasets/wands.py`, `backends/__init__.py`, `backends/elasticsearch.py` (modules may be stubs; names must match §11 exactly).
+- `benchmark/` package skeleton: empty-but-importable `models.py`, `protocols.py`, `pipeline.py`, `fusion.py`, `rerank.py`, `metrics.py`, `stats.py`, `matrix.py`, `runner.py`, `io_csv.py`, `config.py`, `logging_setup.py`, `datasets/__init__.py`, `datasets/wands.py`, `backends/__init__.py`, `backends/elasticsearch.py` (modules may be stubs; names must match §11 exactly). `logging_setup.py` is the one module with real content this phase: console + `logs/run_{timestamp}.log` logging used everywhere instead of `print()`.
 - `docker-compose.yml` — single-node ElasticSearch **≥ 8.15** (hard floor, §1.1), security relaxed for local eval, `9200` published, `ES_JAVA_OPTS=-Xms2g -Xmx2g` pinned.
 - `.gitignore` — ignores `results/` and `dataset/` (CLAUDE.md "don't commit dataset/ or results/").
 - `eval:fetch-data` script — downloads/copies WANDS `query.csv`/`product.csv`/`label.csv` into `dataset/wands/` (README "Dataset").
@@ -458,7 +458,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Test / acceptance criteria.** *(requires dockerized ES ≥ 8.15; full corpus)*
 - Full matrix run completes; **schema lint** over every produced CSV asserts exact headers/field order (§9) for every variant.
 - **Reproducibility:** two runs with the same seed produce identical `metrics_*`/`comparison_*` stats columns (modulo documented ES nondeterminism mitigated by the doc_id tie-break); `run_config_*.json` captures the seed and all §9.1 fields.
-- **Generality check:** an import-graph test asserts `pipeline`/`metrics`/`stats`/`matrix`/`runner`/`io_csv` import only `models`/`protocols` (no adapter imports) — automating the §11 invariant.
+- **Generality check:** an import-graph test asserts `pipeline`/`metrics`/`stats`/`matrix`/`runner`/`io_csv` import only `models`/`protocols` (plus the stdlib-only `logging_setup`) and **no** adapter imports — automating the §11 invariant.
 - **DRY check:** automated/inspection confirmation of the single execution path.
 
 **Developer / reviewer responsibilities.** Developer executes the full run and the validation suite; files fixes against the owning phase modules for any defect. Reviewer signs that all four §1.4 criteria are demonstrably met.
@@ -517,6 +517,7 @@ tests/
 | `runner.py` | 11 |
 | `io_csv.py` | 7 |
 | `config.py` | 6 |
+| `logging_setup.py` | 0 |
 | `datasets/wands.py` | 8 |
 | `backends/elasticsearch.py` (BM25 + lifecycle + execute + capabilities) | 9 |
 | `backends/elasticsearch.py` (semantic + RRF + rerank + `ElasticsearchIndexer`) | 10 |

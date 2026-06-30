@@ -706,6 +706,7 @@ benchmark/
   runner.py              # ExperimentRunner (the single execution path, §8.0)
   io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
   config.py              # YAML/JSON load + resolve + ConfigInferenceModel (implements EmbeddingModel & Reranker)
+  logging_setup.py       # cross-cutting: console + file logging (logs/run_{timestamp}.log); use instead of print()
   datasets/
     wands.py             # WandsDataset (implements Dataset; label->gain; search_text concat)
   backends/
@@ -713,7 +714,7 @@ benchmark/
 docs/experiment.md
 dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
 ```
-`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` — never `datasets/*` or `backends/*`. Adapters are selected by `config.py` factories (`load_dataset`, `make_backend`). This enforces success criterion §1.4(3). `resolve_hybrid_rerank_best_per_model` lives in `matrix.py` and operates only on in-memory `MetricVector`s passed in by `runner.py`, so it adds no adapter dependency. The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
+`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib) — never `datasets/*` or `backends/*`. Adapters are selected by `config.py` factories (`load_dataset`, `make_backend`). This enforces success criterion §1.4(3). `resolve_hybrid_rerank_best_per_model` lives in `matrix.py` and operates only on in-memory `MetricVector`s passed in by `runner.py`, so it adds no adapter dependency. The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
 
 ---
 

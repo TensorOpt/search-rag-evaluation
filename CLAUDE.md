@@ -12,8 +12,9 @@ strategy improves over a **BM25 baseline** on a fixed dataset + qrel set. First 
   **This is the source of truth.** When code and this doc disagree on a name or schema, the doc wins.
 - **`README.md`** — operational guide: how to run the evals end to end.
 
-Status: **design-only**. No Python package, `pyproject.toml`, `docker-compose.yml`, or dataset
-files exist yet — they are being built to satisfy the design.
+Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-compose.yml`,
+`benchmark/` package skeleton, `config.yaml`). Build proceeds phase-by-phase per
+[`docs/plan.md`](docs/plan.md); each phase ends in a user sign-off + commit.
 
 ## Stack
 
@@ -39,5 +40,8 @@ files exist yet — they are being built to satisfy the design.
 ## Conventions
 
 - Match the style of surrounding code; keep abstractions minimal (favor stdlib/native over deps).
+- **Use logging, not `print()`.** Get a logger via `benchmark.logging_setup.get_logger(__name__)`
+  and call `setup_logging()` once at each entry point — it logs to the console and to
+  `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.
 - Before changing a name/schema, check it against `docs/experiment.md` and keep both files consistent.
-- Don't commit `dataset/` or `results/` artifacts.
+- Don't commit `dataset/`, `results/`, or `logs/` artifacts.
