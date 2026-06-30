@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "benchmark"
+version = "0.0.0"
+description = "Reproducible search-relevance benchmark harness (WANDS on ElasticSearch >= 8.15)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["benchmark"]
+
+# ---------------------------------------------------------------------------
+# eval environment — the operational CLI surface (README TL;DR).
+#   wait-for-es / fetch-data : real, pure-infra helper scripts (scripts/).
+#   index / run              : non-destructive placeholders, wired in Phase 11.
+# Helper scripts live under the top-level scripts/ package so that benchmark/
+# stays exactly the docs/experiment.md §11 module set.
+# ---------------------------------------------------------------------------
+[tool.hatch.envs.eval]
+dependencies = []
+
+[tool.hatch.envs.eval.scripts]
+wait-for-es = "python -m scripts.wait_for_es"
+fetch-data = "python -m scripts.fetch_data"
+index = "python -m scripts.index"
+run = "python -m scripts.run {args}"
+
+# ---------------------------------------------------------------------------
+# dev environment — lint / type-check / test (plan §5).
+#   hatch run dev:ruff check   and   hatch run dev:mypy benchmark
+# ---------------------------------------------------------------------------
+[tool.hatch.envs.dev]
+dependencies = [
+  "pytest",
+  "ruff",
+  "mypy",
+]
+
+[tool.hatch.envs.dev.scripts]
+test = "pytest {args}"
+lint = "ruff check {args}"
+typecheck = "mypy benchmark {args}"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["benchmark"]

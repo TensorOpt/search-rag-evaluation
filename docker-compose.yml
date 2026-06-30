@@ -1,0 +1,28 @@
+# Single-node ElasticSearch for local evaluation.
+# Image tag is >= 8.15 (hard floor, docs/experiment.md §1.1); do NOT downgrade.
+# Security is relaxed for local eval only. Port 9200 published. Heap pinned.
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.2
+    container_name: wands-bench-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+volumes:
+  es-data:
