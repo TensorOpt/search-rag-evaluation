@@ -42,28 +42,28 @@ developer implements  →  reviewer reviews  →  USER signs off  →  USER comm
 
 ```mermaid
 flowchart TB
-  P0[Phase 0\nScaffolding\npyproject/compose/tooling] --> P1[Phase 1\nmodels.py + protocols.py]
-  P1 --> P2[Phase 2\nmetrics.py]
-  P1 --> P3[Phase 3\nstats.py]
-  P1 --> P4[Phase 4\nfusion.py + rerank.py]
-  P1 --> P5[Phase 5\npipeline.py + spec_for]
+  P0["Phase 0<br/>Scaffolding<br/>pyproject/compose/tooling"] --> P1["Phase 1<br/>models.py + protocols.py"]
+  P1 --> P2["Phase 2<br/>metrics.py"]
+  P1 --> P3["Phase 3<br/>stats.py"]
+  P1 --> P4["Phase 4<br/>fusion.py + rerank.py"]
+  P1 --> P5["Phase 5<br/>pipeline.py + spec_for"]
   P4 --> P5
-  P1 --> P6[Phase 6\nmatrix.py + config.py]
-  P1 --> P7[Phase 7\nio_csv.py]
+  P1 --> P6["Phase 6<br/>matrix.py + config.py"]
+  P1 --> P7["Phase 7<br/>io_csv.py"]
   P2 --> P7
   P3 --> P7
-  P1 --> P8[Phase 8\ndatasets/wands.py]
-  P5 --> P9[Phase 9\nbackends/elasticsearch.py — BM25 + execute  (Docker ES)]
+  P1 --> P8["Phase 8<br/>datasets/wands.py"]
+  P5 --> P9["Phase 9<br/>backends/elasticsearch.py — BM25 + execute (Docker ES)"]
   P6 --> P9
-  P9 --> P10[Phase 10\nbackends/elasticsearch.py — semantic + RRF + rerank + indexer  (Docker ES)]
-  P2 --> P11[Phase 11\nrunner.py + hatch CLI scripts  (Docker ES)]
+  P9 --> P10["Phase 10<br/>backends/elasticsearch.py — semantic + RRF + rerank + indexer (Docker ES)"]
+  P2 --> P11["Phase 11<br/>runner.py + hatch CLI scripts (Docker ES)"]
   P3 --> P11
   P5 --> P11
   P6 --> P11
   P7 --> P11
   P8 --> P11
   P10 --> P11
-  P11 --> P12[Phase 12\nfull-WANDS end-to-end validation vs §1.4  (Docker ES)]
+  P11 --> P12["Phase 12<br/>full-WANDS end-to-end validation vs §1.4 (Docker ES)"]
 ```
 
 | Phase | Title | Depends on | Docker ES? |
