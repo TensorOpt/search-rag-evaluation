@@ -9,7 +9,10 @@ description = "Reproducible search-relevance benchmark harness (WANDS on Elastic
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "numpy",
+  "scipy",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["benchmark"]
@@ -52,3 +55,12 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 packages = ["benchmark"]
+
+# numpy 2.5's bundled stubs use 3.12-only `type` statements, which mypy rejects when
+# analyzing for python_version 3.11 (our supported floor). Skip following numpy's own
+# stubs (its public API is still checked as `Any` at our call sites) rather than bumping
+# the analyzed version or loosening global strictness. Targeted, minimal (§3 deps note).
+[[tool.mypy.overrides]]
+module = "numpy.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true

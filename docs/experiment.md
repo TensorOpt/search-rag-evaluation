@@ -528,7 +528,7 @@ flowchart TD
   I --> P
   P --> J[after all variants done]
   I --> J
-  J --> K[6. Comparator: for each non-baseline variant, pair deltas vs baseline over SAME query set -> comparison_bm25_variant_ts.csv]
+  J --> K[6. Comparator: ONE family-wide compare of ALL non-baseline variants vs baseline over SAME query set, Holm across the family -> split rows per variant -> comparison_bm25_variant_ts.csv each]
   K --> L[7. write run_config_ts.json]
 ```
 
@@ -536,7 +536,7 @@ Concrete materialization rules:
 - **Result CSV** (step 4): for each `RankedResult`, write one row per `ScoredDoc`, `position = 1-based index`, `score = ScoredDoc.score`. At most `top_k` rows per query.
 - **Per-query metrics** (step 5): the Evaluator joins each `RankedResult` to qrels by `query_id` (qrels indexed once into `dict[query_id, dict[doc_id, gain]]`), computes the four metrics (§7), writes one row per query, **and** returns the per-query vectors in memory keyed by `query_id` for the Comparator and for the `best_per_model` selection (so metrics are computed once, not re-derived from CSV).
 - **best_per_model resolution** (step 3c, only when `hybrid_rerank_k: best_per_model`): see §8.0a. This is an explicit phase that runs *after* all `hybrid` variants are scored and *before* `hybrid_rerank` specs are built — closing the v2 ordering gap where the single `expand_matrix` call could not know the best k.
-- **Comparison** (step 6): runs only after all runs' metric vectors exist; pairs each variant against the baseline on the **identical query set** (§8.1).
+- **Comparison** (step 6): runs only after all runs' metric vectors exist; a **single** `Comparator.compare(baseline_maps, variant_maps)` call pairs each variant against the baseline on the **identical query set** (§8.1) and applies **Holm family-wide** across all `(variant, metric)` tests (§8.3), then the returned rows are grouped by variant and written one `comparison_bm25_{variant}_{ts}.csv` each.
 
 The baseline (`bm25`) is always materialized first so every later comparison has its paired reference in memory.
 
@@ -614,11 +614,21 @@ class ExperimentRunner:
             for v in resolve_hybrid_rerank_best_per_model(cfg, per_query):
                 run_one(v)                           # now expanded with concrete k
 
-        baseline = per_query[cfg.baseline_id]
-        for vid, metrics in per_query.items():
-            if vid == cfg.baseline_id: continue
-            cmp = Comparator(cfg.stats).compare(baseline, metrics)
-            write_comparison_csv(cfg.baseline_id, vid, cmp, cfg.timestamp)
+        # Comparator pass — ONE family-wide call so Holm (§8.3) is applied across the whole run.
+        # Collect the baseline's per-query metric maps and ALL non-baseline variants' maps, call
+        # compare() ONCE (it pairs each variant vs the baseline, per metric, and Holm-corrects the
+        # whole family of (variant, metric) tests together), then split the returned rows by variant
+        # and write one comparison_bm25_{variant}_{ts}.csv each. Metrics.as_dict() supplies the plain
+        # {metric: value} maps the comparator consumes (§11 import rule: stats sees maps, not Metrics).
+        baseline_maps = {q: m.as_dict() for q, m in per_query[cfg.baseline_id].items()}
+        variant_maps = {
+            vid: {q: m.as_dict() for q, m in metrics.items()}
+            for vid, metrics in per_query.items() if vid != cfg.baseline_id
+        }
+        rows = Comparator(cfg.stats).compare(baseline_maps, variant_maps)   # family-wide Holm inside
+        for vid in variant_maps:
+            vrows = [r for r in rows if r.variant == vid]
+            write_comparison_csv(cfg.baseline_id, vid, vrows, cfg.timestamp)
         write_run_config(cfg)
 ```
 Every variant — baseline included — traverses the **identical** `run_one` code path; only `VariantCfg` differs. This is the DRY guarantee, verifiable by inspection. The only structural addition vs a flat loop is the explicit selection phase (§8.0a), which produces more `VariantCfg`s and feeds them through the *same* `run_one`.
@@ -666,8 +676,8 @@ The CI and the significance decision are deliberately kept in **distinct, clearl
   - Because sparse-delta metrics stress Wilcoxon's zero/tie handling, the **seeded paired-permutation test** (sign-flip permutation on the paired deltas, same seeded `rng`) is offered as a configurable primary; when selected it uses the same all-zero short-circuit.
 
 ### 8.3 Significance & multiple comparisons (single, coherent regime)
-- Family = all `(variant × metric)` tests **within one run**. Control family-wise error with **Holm–Bonferroni** at family `α = 0.05`, applied to the **raw** p-values.
-- **Decision rule (the *only* gate).** Order the family's raw p-values ascending `p_(1) <= … <= p_(m)`. Holm rejects `H_(i)` iff `p_(j) < α / (m − j + 1)` for **all** `j <= i` (step-down: the first failure stops the sequence and all later hypotheses are retained). `significant` for a test is exactly its Holm reject/retain outcome. This is the single error-control regime; there is no second condition.
+- Family = all `(variant × metric)` tests **within one run**. Control family-wise error with **Holm–Bonferroni** at family `α = 0.05`, applied to the **raw** p-values. Degenerate rows (`empty_paired_set` / `all_zero_delta`, §8.1) are assigned `significant=false` with `p_value=1.0` and are **NOT** counted in the Holm family size `m` — `m` is the number of *real* tests (those that produced a p-value from scipy/the permutation test).
+- **Decision rule (the *only* gate).** Order the family's raw p-values ascending `p_(1) <= … <= p_(m)`. Holm rejects `H_(i)` iff `p_(j) <= α / (m − j + 1)` for **all** `j <= i` (step-down: the first failure stops the sequence and all later hypotheses are retained). `significant` for a test is exactly its Holm reject/retain outcome. This is the single error-control regime; there is no second condition.
 - **The CI is *not* a second gate, by design — and may disagree with `significant`.** The reported CI (§8.2) is a per-comparison, unadjusted 2.5/97.5 bootstrap interval used only for effect-size context. Under Holm (a step-**down**, sequential procedure) there is **no well-defined fixed per-test alpha** to build a multiplicity-consistent CI from: a test can be **retained** (`significant=false`) because an *earlier, smaller-p* test in the ordering failed, even though its own unadjusted CI excludes 0; and conversely a rejected test's unadjusted CI excludes 0 but at no shared confidence level tied to the family decision. **Therefore the CI and the `significant` flag are not guaranteed to agree, and disagreement is normal and expected under FWER control.** We do not attempt to reconcile them, because doing so via a "Holm step-level alpha" is mathematically unsound (Holm has no fixed per-test alpha) and would re-introduce regime mixing in subtler form. The CSV documents this: `p_value` is raw, `significant` is the Holm decision on raw p, and the CI is unadjusted effect-size context.
 - **If a CI that is provably consistent with a multiplicity-controlled decision is required**, the design's alternative is to switch the *decision* to a simultaneous/joint method where duality holds — e.g. a **max-statistic bootstrap** (simultaneous confidence band over all comparisons) or **BH-FDR with matching FDR-adjusted intervals** — selected via `stats.correction`. This swaps both the decision and the interval into one joint regime; it is **not** the default and is deferred (§13). The default keeps Holm-on-raw-p with an unadjusted descriptive CI, with the disagreement caveat stated above.
 - The **raw** (uncorrected) `p_value` is written to the CSV; `significant` reflects the Holm-corrected decision. Correction method, family size `m`, and `α` are recorded in run metadata. (No per-test "adjusted alpha" is recorded, because Holm does not define one.)
