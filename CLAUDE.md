@@ -30,7 +30,8 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 - **Generality.** Swapping dataset, backend/vector index, embedding model, or reranker must be a
   new adapter + config only — never edits to pipeline/evaluator/stats. ES + WANDS are adapters
   behind Protocols.
-- **Relevance gains:** `Exact=2`, `Partial=1`, `Irrelevant=0`.
+- **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. Binary-relevance
+  threshold for precision/recall is `gain >= 0.5` (Partial or Exact).
 - **Exact CSV artifact schemas (do not rename/reorder fields):**
   - `result_{variant}_{timestamp}.csv` — `query_id, product_id, score, position`
   - `metrics_{variant}_{timestamp}.csv` — `query_id, avg_relevance, ndcg@10, recall@10, precision@10`

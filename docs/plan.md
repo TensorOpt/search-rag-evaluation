@@ -161,14 +161,14 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Implementation notes (§7).**
 - **avg_relevance** = `(1/10)·Σ_{i=1..10} gain(d_i)`; lists shorter than 10 zero-padded at gain level, **denominator stays 10**.
 - **ndcg@10 (graded):** `DCG@10 = Σ (2^{gain}−1)/log2(i+1)`; **IDCG truncated to top-10 of the ideal ordering** (`Σ_{i=1..min(10,#judged)}`), not over all judged gains; `nDCG=0` when `IDCG=0`.
-- **relevant iff gain ≥ 1** (Partial or Exact).
+- **relevant iff gain ≥ 0.5** (Partial or Exact; WANDS grades `{0, 0.5, 1}`).
 - **precision@10** = `|relevant ∩ top10| / 10` (denominator fixed at 10).
 - **recall@10** = `|relevant ∩ top10| / R`, `R = #relevant judged over all of label.csv`. **`R=0` → `recall = NaN`** in the in-memory `MetricVector` (excluded from aggregation/deltas, §8.1). The empty-cell serialization is Phase 7's concern, not here.
 - Unjudged docs treated as `gain=0` (§7).
 
 **Test / acceptance criteria.** *(pure / offline)*
 - **Hand-computed** values on tiny fixtures for all four metrics, including: a perfect ranking (nDCG=1.0); a short list (< 10 docs) confirming zero-padding and fixed-10 denominators; **R=0 → recall is `NaN`**; a query with **> 10 relevant docs** confirming IDCG truncation to 10 (not deflated); `IDCG=0 → nDCG=0`.
-- A graded case with mixed `{0,1,2}` gains where DCG/IDCG are computed by hand in the test and asserted to a tight tolerance.
+- A graded case with mixed `{0, 0.5, 1}` gains where DCG/IDCG are computed by hand in the test and asserted to a tight tolerance.
 - Unjudged doc in the ranked list scored as gain 0.
 
 **Developer / reviewer responsibilities.** Developer implements per §7. Reviewer recomputes at least the nDCG and IDCG-truncation cases independently and confirms the NaN policy.
@@ -332,14 +332,14 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 **Implementation notes (§3.2, §5.1, §7, README "Dataset").**
 - Parse **tab-separated** `query.csv` (`query_id, query, query_class`), `product.csv` (`product_id, product_name, product_description, product_features, ...`), `label.csv` (leading `id` column + `query_id, product_id, label` where label is the **string** `Exact/Partial/Irrelevant`).
-- **label→gain mapping applied at qrel emission:** `Exact=2, Partial=1, Irrelevant=0` (so the rest of the harness only sees integer gains, §3.2/§7).
+- **label→gain mapping applied at qrel emission:** `Exact=1.0, Partial=0.5, Irrelevant=0.0` (float gains; so the rest of the harness only sees floats, §3.2/§7).
 - **`search_text` concatenation:** name + description (+ features) into the canonical `search_text` field in each `Document`'s field bag (§5.1), so every variant ranks the same input text.
 - `field_schema()` returns the §5.1 roles (`product_id`→ID, name/description→bm25+semantic_source, features→bm25, class/category→bm25, ratings→numeric); `search_text_field`/`rerank_field` = `"search_text"`.
 - `documents()` is **streamed** (generator) for large corpora.
 
 **Test / acceptance criteria.** *(pure / offline, tiny fixture)*
 - Parse a **tiny committed WANDS sample** (a handful of rows of each file): assert `Query`/`Document`/`Qrel` objects round-trip with correct fields.
-- **label→gain:** `Exact→2, Partial→1, Irrelevant→0`; assert qrels carry integer gains only.
+- **label→gain:** `Exact→1.0, Partial→0.5, Irrelevant→0.0`; assert qrels carry float gains only.
 - **search_text concat:** a document's `search_text` equals the expected name+description(+features) concatenation.
 - **field_schema** matches §5.1 roles; `search_text_field == rerank_field == "search_text"`.
 - TSV parsing handles the leading `id` column in `label.csv`.

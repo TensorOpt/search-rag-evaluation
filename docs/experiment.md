@@ -60,7 +60,7 @@ flowchart LR
 |------|------------|
 | **Query** | A search request: `query_id`, `text`, optional `class`. |
 | **Document** | A retrievable item: `doc_id` + a typed field bag. For WANDS, a product. |
-| **Qrel** | A graded judgement `(query_id, doc_id) → gain`. WANDS: `Exact=2`, `Partial=1`, `Irrelevant=0`. |
+| **Qrel** | A graded judgement `(query_id, doc_id) → gain` (a float). WANDS: `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. |
 | **Run** | The ranked output of one variant over **all** queries: ordered `(query_id, doc_id, score, position)`. |
 | **Variant** | A named, fully-expanded pipeline configuration (a row of the experiment matrix). |
 | **Pipeline stage** | One composable step: `Retrieve`, `Fuse`, or `Rerank`. |
@@ -114,7 +114,7 @@ class Document:
 class Qrel:
     query_id: str
     doc_id: str
-    gain: int                              # graded 0/1/2
+    gain: float                            # graded relevance; WANDS: Exact=1.0/Partial=0.5/Irrelevant=0.0
 
 @dataclass(frozen=True)
 class ScoredDoc:
@@ -141,12 +141,15 @@ class Dataset(Protocol):
     def field_schema(self) -> "FieldSchema": ...        # declares field roles (§5)
 ```
 
-`field_schema()` is the seam that lets the indexer build a backend mapping without knowing about WANDS. The label→gain mapping is the dataset adapter's responsibility and is applied while emitting `qrels()` (so the rest of the harness only ever sees integer gains).
+`field_schema()` is the seam that lets the indexer build a backend mapping without knowing about WANDS. The label→gain mapping is the dataset adapter's responsibility and is applied while emitting `qrels()` (so the rest of the harness only ever sees float gains).
 
 ```python
 class FieldRole(StrEnum):
-    ID = "id"; BM25 = "bm25"; SEMANTIC_SOURCE = "semantic_source"
-    NUMERIC = "numeric"; STORED = "stored"
+    ID = "id"                      # unique doc identifier -> backend doc _id; not ranked
+    BM25 = "bm25"                  # text field concatenated into search_text for lexical (BM25) matching
+    SEMANTIC_SOURCE = "semantic_source"  # text field concatenated into search_text, which is embedded (semantic)
+    NUMERIC = "numeric"            # numeric field stored for filtering/faceting/analysis; not text-ranked
+    STORED = "stored"              # kept for retrieval/display/debug only; never ranked
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -156,11 +159,36 @@ class FieldSpec:
 @dataclass(frozen=True)
 class FieldSchema:
     fields: Sequence[FieldSpec]
-    # canonical concatenated field name used as BM25 target AND semantic source,
-    # so every variant ranks the SAME input text (fair comparison). See §5.1.
+    # search_text_field: the canonical text field the dataset adapter builds by
+    # CONCATENATING every BM25- and SEMANTIC_SOURCE-role field (in schema order,
+    # joined by newlines). It is used as BOTH the BM25 target AND the semantic
+    # source, so every variant ranks the SAME input text (fair comparison). See §5.1.
     search_text_field: str = "search_text"
     rerank_field: str = "search_text"      # field text passed to the reranker
 ```
+
+**What the roles mean.** Each dataset column is tagged with one `FieldRole` so the indexer knows how to map it, without hard-coding WANDS. The two *text* roles both feed the single canonical `search_text` field — because that field is simultaneously the BM25 target and the semantic-embedding source, a field marked `BM25` or `SEMANTIC_SOURCE` becomes searchable both lexically and semantically. `ID` → the backend doc id; `NUMERIC` → stored/filterable numbers; `STORED` → carried along for display/debug but never ranked.
+
+**Worked example — WANDS `field_schema()`:**
+
+```python
+FieldSchema(
+    fields=[
+        FieldSpec("product_id",          FieldRole.ID),
+        FieldSpec("product_name",        FieldRole.SEMANTIC_SOURCE),
+        FieldSpec("product_description",  FieldRole.SEMANTIC_SOURCE),
+        FieldSpec("product_features",     FieldRole.BM25),
+        FieldSpec("product_class",        FieldRole.BM25),
+        FieldSpec("average_rating",       FieldRole.NUMERIC),
+        FieldSpec("review_count",         FieldRole.NUMERIC),
+    ],
+    search_text_field="search_text",   # = "\n".join(product_name, product_description,
+                                        #              product_features, product_class)
+    rerank_field="search_text",
+)
+```
+
+Here `product_id` becomes the doc `_id`; the four text fields are concatenated (newline-joined) into `search_text`, which is what BM25 matches on *and* what each embedding model embeds; the numeric fields are stored for analysis but never ranked. Swapping in a different dataset means emitting a different `FieldSchema` — the indexer and pipeline are unchanged.
 
 ### 3.3 SearchBackend / Index
 
@@ -212,6 +240,8 @@ class BackendCapabilities:
     semantic_query: bool
 ```
 
+> **Why there is no `bm25` capability.** `BackendCapabilities` only enumerates features that **vary** across backends and that the pipeline must therefore branch on: whether fusion/rerank can run **server-side** (else the harness falls back to §3.7), and whether the version-gated `semantic` query form is available. Lexical **BM25 is not optional** — it is the baseline (§1.2) and a **mandatory primitive** of the `SearchBackend` contract (`bm25(*, fields=…)` is a required method, not a flag), so every backend in scope must provide it. A pure vector index (FAISS/Qdrant) that cannot score lexically is the one case where BM25 would become variable; that is **deferred** (§13) — the day such a backend is added, `bm25` is promoted to a capability and the matrix skips the `bm25`/`hybrid`/`bm25_rerank` variants when it is false. Until then, adding the flag would be dead configuration with no consumer.
+
 ### 3.4 Embedding model & Reranker (pluggable inference, descriptors only)
 
 ```python
@@ -259,6 +289,27 @@ class Indexer(Protocol):
     def build(self, dataset: Dataset, backend: SearchBackend,
               embeddings: Sequence[EmbeddingModel]) -> "IndexMapping": ...
 ```
+
+**What `IndexMapping` is for.** It is the value returned by `Indexer.build(...)` and is the **single source of truth for the concrete field names the pipeline must query**. The pipeline is dataset- and backend-agnostic, so it does not know that ES named the semantic field for model `elser` `"sem__elser"`; `IndexMapping` hands it those names. `spec_for(v, mapping)` (§4) reads exactly two things from it — `mapping.search_text_field` (the BM25 target) and `mapping.sem_field(model_id)` (the semantic field for a given embedding model) — to build a `PipelineSpec` without re-deriving any backend-specific naming. `backend_mapping` is the raw ES mapping body used to create the index (§5.2); `index_name` is where documents land.
+
+**Worked example** (the WANDS index built for the three §5.2 models):
+
+```python
+IndexMapping(
+    index_name="wands_bench",
+    search_text_field="search_text",                 # bm25(fields=["search_text"])
+    sem_fields={                                      # embedding_model_id -> semantic_text field
+        "e5-small":       "sem__e5_small",
+        "elser":          "sem__elser",
+        "openai-3-small": "sem__openai_3_small",
+    },
+    backend_mapping={"mappings": {"properties": { ... }}},  # the §5.2 ES mapping body
+)
+# mapping.sem_field("elser")     -> "sem__elser"      # semantic("sem__elser") for the elser variant
+# mapping.search_text_field      -> "search_text"     # bm25 target for every variant
+```
+
+So the `semantic` variant for model `elser` becomes `StageCfg.semantic(field=mapping.sem_field("elser"))`, and the `bm25` baseline becomes `StageCfg.bm25(fields=[mapping.search_text_field])` — same code path, names supplied by the mapping (§4).
 
 **Lifecycle (strict order — this is the ES `_inference`↔index seam the v1 draft left implicit):**
 1. **Register inference endpoints first.** For each `EmbeddingModel`, call `backend.register_inference(m.as_endpoint())`. A `semantic_text` field cannot be mapped before its `inference_id` exists, so this must precede `ensure_index`. (Rerankers are **not** registered here — they touch no mapping; they are registered lazily at run time in §8, step R0.)
@@ -398,7 +449,7 @@ For WANDS `product.csv`:
 | `product_class`, category hierarchy | bm25, facet | `text` + `keyword` |
 | `rating_count`, `average_rating`, `review_count` | numeric (stored) | `integer`/`float` |
 
-A canonical **`search_text`** field concatenates name + description (+ features) at ingest and is **both** the BM25 target and the semantic source — so every variant ranks the same input text (fair comparison; isolates the ranker, not the field selection). The dataset adapter performs the concatenation when emitting each `Document`'s field bag.
+A canonical **`search_text`** field is built by concatenating the values of every `BM25`- and `SEMANTIC_SOURCE`-role field (§3.2) — for WANDS: `product_name`, `product_description`, `product_features`, `product_class` — **in schema order, joined by newlines (`"\n"`)**. It is **both** the BM25 target and the semantic source — so every variant ranks the same input text (fair comparison; isolates the ranker, not the field selection). The dataset adapter performs this concatenation when emitting each `Document`'s field bag.
 
 ### 5.2 One `semantic_text` field per embedding model (verified shape)
 Multiple embedding models coexist in **one index**: each gets its own `semantic_text` field bound to that model's endpoint, and the source `search_text` field uses **`copy_to`** to populate every semantic field. Per ES docs, `copy_to` lives on the **source `text` field** and points **to** the `semantic_text` field(s) — the v1 draft's `copy_to_source` key does not exist and is corrected here.
@@ -493,7 +544,7 @@ The baseline (`bm25`) is always materialized first so every later comparison has
 
 ## 7. Metrics
 
-All metrics are per query at cutoff **k=10**, then aggregated (mean across queries) for reporting; the per-query vectors are retained for §8 statistics. Let the ranked list be `d_1..d_n` (position 1 = top) and `gain(d)` the qrel gain (0 if unjudged), graded `{0,1,2}`.
+All metrics are per query at cutoff **k=10**, then aggregated (mean across queries) for reporting; the per-query vectors are retained for §8 statistics. Let the ranked list be `d_1..d_n` (position 1 = top) and `gain(d)` the qrel gain (0 if unjudged), a float graded per dataset (WANDS: `{0, 0.5, 1}` for Irrelevant/Partial/Exact).
 
 - **avg_relevance** (per query): mean graded gain over the top-10 returned docs:
   `avg_relevance = (1/10) · Σ_{i=1..10} gain(d_i)`. Lists shorter than 10 are zero-padded at the gain level; denominator stays 10.
@@ -505,7 +556,7 @@ All metrics are per query at cutoff **k=10**, then aggregated (mean across queri
   IDCG is explicitly **truncated to the top 10** of the ideal ordering (not summed over all judged gains), so queries with more than 10 relevant docs are not deflated.
   `nDCG@10 = DCG@10 / IDCG@10`, defined `0` if `IDCG@10 = 0`.
 
-- **Binary relevance threshold:** a doc is **relevant** iff `gain >= 1` (`Partial` or `Exact`).
+- **Binary relevance threshold:** a doc is **relevant** iff `gain >= 0.5` (`Partial` or `Exact`). (Threshold tracks the grade set: with WANDS grades `{0, 0.5, 1}`, `0.5` keeps "Partial or Exact" relevant, as before the regrade from `{0,1,2}`.)
 
 - **precision@10:** `|relevant ∩ top-10| / 10` (denominator fixed at 10).
 
@@ -735,6 +786,7 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 ## 13. Open Questions / Deferred
 - `hybrid_rerank` k selection: the default is a **fixed integer** (single-pass, unbiased); `best_per_model` is the opt-in two-pass mode (§8.0a) and is **optimistically biased** (selection on the evaluation set). Whether to ship a built-in train/test query split for `best_per_model` reporting, expose alternative selection metrics (e.g. recall@10), or change the tie-break is deferred.
 - **Joint CI/decision regime:** an optional `correction: max_stat | bh_fdr` mode (§8.3) that yields a multiplicity-controlled decision *with* a provably consistent simultaneous/FDR-adjusted interval, so the CI and `significant` flag coincide by construction. Deferred; the default is Holm-on-raw-p with an unadjusted descriptive CI that may disagree with the flag (this is normal under FWER control).
+- **`bm25` as a capability:** currently BM25 is a mandatory `SearchBackend` primitive, not a `BackendCapabilities` flag (§3.3). If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, promote `bm25` to a capability and have the matrix skip `bm25`/`hybrid`/`bm25_rerank` when it is false. Deferred until such a backend exists (no consumer today).
 - Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
 - Pooling-depth / unjudged-doc sensitivity analysis (current default: unjudged = gain 0).
 - `search_text` concatenation vs per-field semantic embedding (chunking behavior of long concatenations on small-context embedding models).

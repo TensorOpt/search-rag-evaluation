@@ -38,8 +38,8 @@ def test_document_construction():
 
 
 def test_qrel_construction():
-    r = Qrel(query_id="q1", doc_id="p1", gain=2)
-    assert (r.query_id, r.doc_id, r.gain) == ("q1", "p1", 2)
+    r = Qrel(query_id="q1", doc_id="p1", gain=0.5)
+    assert (r.query_id, r.doc_id, r.gain) == ("q1", "p1", 0.5)
 
 
 def test_scoreddoc_construction():
@@ -95,7 +95,7 @@ def test_indexmapping_construction():
     [
         (Query("q1", "t"), "text", "x"),
         (Document("p1", {}), "doc_id", "p2"),
-        (Qrel("q1", "p1", 1), "gain", 2),
+        (Qrel("q1", "p1", 1.0), "gain", 2.0),
         (ScoredDoc("p1", 1.0), "score", 2.0),
         (RankedResult("q1", []), "query_id", "q2"),
         (FieldSpec("n", FieldRole.ID), "name", "m"),

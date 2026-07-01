@@ -31,11 +31,16 @@ class Document:
 
 @dataclass(frozen=True)
 class Qrel:
-    """A graded judgement ``(query_id, doc_id) -> gain`` (§3.1). gain is graded 0/1/2."""
+    """A graded relevance judgement ``(query_id, doc_id) -> gain`` (§3.1).
+
+    ``gain`` is a float relevance grade. For WANDS: ``Exact=1.0``, ``Partial=0.5``,
+    ``Irrelevant=0.0``. The grade set is a per-dataset modeling choice applied by the
+    dataset adapter's label->gain mapping; the rest of the harness only sees floats.
+    """
 
     query_id: str
     doc_id: str
-    gain: int
+    gain: float
 
 
 @dataclass(frozen=True)
@@ -59,12 +64,22 @@ class RankedResult:
 
 
 class FieldRole(StrEnum):
-    """Declared role of a dataset field (§3.2)."""
+    """Declared role of a dataset field — tells the indexer how to map/use it (§3.2).
 
+    Text roles BM25 and SEMANTIC_SOURCE both feed the canonical ``search_text`` field
+    (see FieldSchema); because ``search_text`` is *both* the BM25 target and the semantic
+    source, a field marked either way becomes searchable both lexically and semantically.
+    """
+
+    #: Unique document identifier -> becomes the backend doc id (ES ``_id``); not ranked.
     ID = "id"
+    #: Text field concatenated into ``search_text`` for lexical (BM25) matching.
     BM25 = "bm25"
+    #: Text field concatenated into ``search_text``, which is embedded as the semantic source.
     SEMANTIC_SOURCE = "semantic_source"
+    #: Numeric field stored for filtering/faceting/analysis; not used for text ranking.
     NUMERIC = "numeric"
+    #: Field retained in the index for retrieval/display/debug only; never ranked.
     STORED = "stored"
 
 
@@ -80,9 +95,12 @@ class FieldSpec:
 class FieldSchema:
     """Declares field roles and the canonical text fields (§3.2, §5.1).
 
-    ``search_text_field`` is the canonical concatenated field used as BM25 target AND
-    semantic source so every variant ranks the same input text. ``rerank_field`` is the
-    field text passed to the reranker. Both default to ``"search_text"``.
+    ``search_text_field`` names the canonical text field that the dataset adapter builds
+    by CONCATENATING the values of every BM25- and SEMANTIC_SOURCE-role field, in schema
+    order, joined by newlines (e.g. WANDS: product_name + product_description +
+    product_features). That single field is used as BOTH the BM25 target and the semantic
+    source, so every variant ranks the same input text (fair comparison). ``rerank_field``
+    is the field text passed to the reranker. Both default to ``"search_text"``.
     """
 
     fields: Sequence[FieldSpec]
