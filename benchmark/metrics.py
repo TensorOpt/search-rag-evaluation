@@ -54,6 +54,9 @@ DEFAULT_CUTOFF = 10
 #: Binary-relevance threshold: a doc is relevant iff gain >= this (§7, Partial or Exact).
 RELEVANCE_THRESHOLD = 0.5
 
+#: Absolute tolerance for treating a computed float as zero (never use `== 0.0` on floats).
+ZERO_ABS_TOL = 1e-6
+
 
 def _dcg(gains: Iterable[float]) -> float:
     """Discounted cumulative gain: Σ (2^{gain}−1)/log2(i+1), i 1-based (§7)."""
@@ -161,7 +164,8 @@ class Evaluator:
             # IDCG: DCG of the top-k ideal ordering (ALL judged gains desc, truncated to k, §7);
             # unaffected by skipping missing docs.
             idcg = _dcg(self._qrels.sorted_judged_gains(qid)[:k])
-            ndcg = dcg / idcg if idcg != 0.0 else 0.0
+            # isclose (not `!= 0.0`) — never test float equality; IDCG==0 means no positive gains.
+            ndcg = 0.0 if math.isclose(idcg, 0.0, abs_tol=ZERO_ABS_TOL) else dcg / idcg
             hits = sum(1 for g in condensed if g >= RELEVANCE_THRESHOLD)
             precision = hits / m  # denominator = n_scored (§7).
 

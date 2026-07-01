@@ -52,6 +52,9 @@ CANONICAL_METRICS: tuple[str, ...] = (
     "precision@10",
 )
 
+#: Absolute tolerance for treating a computed float as zero (never use `== 0.0` on floats).
+ZERO_ABS_TOL = 1e-6
+
 
 @dataclass(frozen=True)
 class StatsCfg:
@@ -157,8 +160,9 @@ class Comparator:
                     )
                     continue
 
-                if np.all(deltas == 0.0):
+                if bool(np.all(np.isclose(deltas, 0.0, rtol=0.0, atol=ZERO_ABS_TOL))):
                     # All-zero deltas (§8.1 table): no scipy/bootstrap call.
+                    # np.isclose (not `== 0.0`) — never test float equality; tolerance ZERO_ABS_TOL.
                     rows.append(
                         ComparisonResult(
                             variant=variant_id,
@@ -244,7 +248,10 @@ class Comparator:
                 alternative="two-sided",
             )
             return float(result.pvalue)
-        return self._permutation_p_value(deltas)
+        if cfg.test == "permutation":
+            return self._permutation_p_value(deltas)
+        # Exhaustive branch on the enumerated cfg.test — no silent default for an invalid value.
+        raise ValueError(f"unsupported stats test: {cfg.test!r}")
 
     def _permutation_p_value(self, deltas: np.ndarray) -> float:
         """Seeded sign-flip paired-permutation test, two-sided (§8.2).
@@ -255,21 +262,22 @@ class Comparator:
         """
         cfg = self._cfg
         n = deltas.size
-        obs = abs(float(np.mean(deltas)))
+        mean_delta = float(np.mean(deltas))
+        observed_stat = abs(mean_delta)  # two-sided statistic |mean delta|
 
         if 2**n <= cfg.bootstrap_B:
             # Exact enumeration over all 2^n sign vectors.
             signs = _sign_vectors(n)  # (2^n, n) of +/-1
             perm_stats = np.abs((signs * deltas).mean(axis=1))
             b = perm_stats.size
-            count = int(np.sum(perm_stats >= obs))
+            count = int(np.sum(perm_stats >= observed_stat))
             return (1 + count) / (b + 1)
 
         rng = np.random.default_rng(cfg.seed)
         b = cfg.bootstrap_B
         signs = rng.choice(np.array([-1.0, 1.0]), size=(b, n))
         perm_stats = np.abs((signs * deltas).mean(axis=1))
-        count = int(np.sum(perm_stats >= obs))
+        count = int(np.sum(perm_stats >= observed_stat))
         return (1 + count) / (b + 1)
 
 
@@ -288,11 +296,11 @@ def _paired_deltas(
     for qid in sorted(baseline):
         if qid not in variant_metrics:
             continue
-        b_val = baseline[qid].get(metric, math.nan)
-        v_val = variant_metrics[qid].get(metric, math.nan)
-        if math.isnan(b_val) or math.isnan(v_val):
+        baseline_value = baseline[qid].get(metric, math.nan)
+        variant_value = variant_metrics[qid].get(metric, math.nan)
+        if math.isnan(baseline_value) or math.isnan(variant_value):
             continue
-        deltas.append(v_val - b_val)
+        deltas.append(variant_value - baseline_value)
     return np.asarray(deltas, dtype=float)
 
 
