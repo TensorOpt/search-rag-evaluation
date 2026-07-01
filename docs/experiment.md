@@ -31,7 +31,7 @@ Each variant is scored **against the BM25 baseline**:
 - **Out:** online A/B testing, latency/throughput SLAs, query rewriting, learning-to-rank training, click models. (Latency *may* be logged as a secondary observation but is not a success criterion.)
 
 ### 1.4 Success criteria
-1. **Correctness:** all three CSV artifact types are produced with the exact schemas in §9, for every variant in the matrix; the statistics follow one coherent error-control regime (§8.3).
+1. **Correctness:** all three CSV artifact types are produced with the exact schemas in §9, for every variant in the matrix; the statistics follow one coherent multiple-comparison regime (FDR) (§8.3).
 2. **Reproducibility:** a single config + captured seed reproduces identical metrics and statistics (modulo backend nondeterminism, pinned per §9.1). This includes the `hybrid_rerank` k-selection: when `best_per_model` is used, the selection is a deterministic function of this run's in-memory hybrid metrics (§8.0a), so the same config + seed yields the same chosen k.
 3. **Generality:** swapping WANDS→another dataset, or ES→another backend, requires only a new adapter + config — **no edits to pipeline, evaluator, or stats code** (verified by §11 checklists). Edge cases that only a different dataset can trigger (e.g. all-zero or empty paired sets, §8.1) have defined, dataset-independent behavior.
 4. **DRY:** the 6 variants share **one** pipeline implementation and **one** execution path; they differ only by configuration (verified by code inspection — variants are config rows, not modules). See §4 and §8.
@@ -528,7 +528,7 @@ flowchart TD
   I --> P
   P --> J[after all variants done]
   I --> J
-  J --> K[6. Comparator: ONE family-wide compare of ALL non-baseline variants vs baseline over SAME query set, Holm across the family -> split rows per variant -> comparison_bm25_variant_ts.csv each]
+  J --> K[6. Comparator: ONE family-wide compare of ALL non-baseline variants vs baseline over SAME query set, FDR/BH across the family -> split rows per variant -> comparison_bm25_variant_ts.csv each]
   K --> L[7. write run_config_ts.json]
 ```
 
@@ -536,7 +536,7 @@ Concrete materialization rules:
 - **Result CSV** (step 4): for each `RankedResult`, write one row per `ScoredDoc`, `position = 1-based index`, `score = ScoredDoc.score`. At most `top_k` rows per query.
 - **Per-query metrics** (step 5): the Evaluator joins each `RankedResult` to qrels by `query_id` (qrels indexed once into `dict[query_id, dict[doc_id, gain]]`), computes the four metrics (§7), writes one row per query, **and** returns the per-query vectors in memory keyed by `query_id` for the Comparator and for the `best_per_model` selection (so metrics are computed once, not re-derived from CSV).
 - **best_per_model resolution** (step 3c, only when `hybrid_rerank_k: best_per_model`): see §8.0a. This is an explicit phase that runs *after* all `hybrid` variants are scored and *before* `hybrid_rerank` specs are built — closing the v2 ordering gap where the single `expand_matrix` call could not know the best k.
-- **Comparison** (step 6): runs only after all runs' metric vectors exist; a **single** `Comparator.compare(baseline_maps, variant_maps)` call pairs each variant against the baseline on the **identical query set** (§8.1) and applies **Holm family-wide** across all `(variant, metric)` tests (§8.3), then the returned rows are grouped by variant and written one `comparison_bm25_{variant}_{ts}.csv` each.
+- **Comparison** (step 6): runs only after all runs' metric vectors exist; a **single** `Comparator.compare(baseline_maps, variant_maps)` call pairs each variant against the baseline on the **identical query set** (§8.1) and applies the **FDR (BH/BY) correction family-wide** across all `(variant, metric)` tests (§8.3), then the returned rows (each carrying both raw and FDR-adjusted significance) are grouped by variant and written one `comparison_bm25_{variant}_{ts}.csv` each.
 
 The baseline (`bm25`) is always materialized first so every later comparison has its paired reference in memory.
 
@@ -614,18 +614,20 @@ class ExperimentRunner:
             for v in resolve_hybrid_rerank_best_per_model(cfg, per_query):
                 run_one(v)                           # now expanded with concrete k
 
-        # Comparator pass — ONE family-wide call so Holm (§8.3) is applied across the whole run.
+        # Comparator pass — ONE family-wide call so the FDR correction (§8.3) is applied across the run.
         # Collect the baseline's per-query metric maps and ALL non-baseline variants' maps, call
-        # compare() ONCE (it pairs each variant vs the baseline, per metric, and Holm-corrects the
-        # whole family of (variant, metric) tests together), then split the returned rows by variant
-        # and write one comparison_bm25_{variant}_{ts}.csv each. Metrics.as_dict() supplies the plain
-        # {metric: value} maps the comparator consumes (§11 import rule: stats sees maps, not Metrics).
+        # compare() ONCE (it pairs each variant vs the baseline, per metric, computes the RAW per-test
+        # significance, and FDR-corrects the whole family of (variant, metric) tests together — each
+        # returned ComparisonResult carries both the raw and the FDR-adjusted significance), then split
+        # the returned rows by variant and write one comparison_bm25_{variant}_{ts}.csv each.
+        # Metrics.as_dict() supplies the plain {metric: value} maps the comparator consumes
+        # (§11 import rule: stats sees maps, not Metrics).
         baseline_maps = {q: m.as_dict() for q, m in per_query[cfg.baseline_id].items()}
         variant_maps = {
             vid: {q: m.as_dict() for q, m in metrics.items()}
             for vid, metrics in per_query.items() if vid != cfg.baseline_id
         }
-        rows = Comparator(cfg.stats).compare(baseline_maps, variant_maps)   # family-wide Holm inside
+        rows = Comparator(cfg.stats).compare(baseline_maps, variant_maps)   # family-wide FDR inside
         for vid in variant_maps:
             vrows = [r for r in rows if r.variant == vid]
             write_comparison_csv(cfg.baseline_id, vid, vrows, cfg.timestamp)
@@ -661,13 +663,13 @@ Comparisons are **paired by `query_id`** between a variant and the baseline (`bm
 
 | Case | Trigger | Comparator output for that `(variant, metric)` row |
 |------|---------|----------------------------------------------------|
-| **Empty paired set** | 0 paired queries (the metric is `NaN` on every query for a swapped dataset — e.g. recall with `R=0` everywhere, or `avg_relevance`/`ndcg`/`precision` with `n_scored=0` everywhere) | `delta` = empty, `delta_ci_lo`/`delta_ci_high` = empty, `p_value = 1.0`, `significant = false`, and a recorded note `note=empty_paired_set` |
-| **All-zero deltas** | ≥1 paired query but every `δ_q == 0` | `delta = 0.0`, `delta_ci_lo = delta_ci_high = 0.0`, `p_value = 1.0`, `significant = false`, note `note=all_zero_delta` (§8.2) |
+| **Empty paired set** | 0 paired queries (the metric is `NaN` on every query for a swapped dataset — e.g. recall with `R=0` everywhere, or `avg_relevance`/`ndcg`/`precision` with `n_scored=0` everywhere) | `delta` = empty, `delta_ci_lo`/`delta_ci_high` = empty, `p_value = 1.0`, `significant_raw = false`, `p_value_adjusted = 1.0`, `significant = false`, and a recorded note `note=empty_paired_set`; **excluded from the FDR family size `m`** |
+| **All-zero deltas** | ≥1 paired query but every `δ_q == 0` | `delta = 0.0`, `delta_ci_lo = delta_ci_high = 0.0`, `p_value = 1.0`, `significant_raw = false`, `p_value_adjusted = 1.0`, `significant = false`, note `note=all_zero_delta` (§8.2); **excluded from the FDR family size `m`** |
 
 In both cases the comparator never calls scipy/the bootstrap, so `mean of empty set` and a bootstrap over zero indices are never evaluated. The note is recorded in `run_config_*.json` per affected `(variant, metric)`. For WANDS the empty case does not arise, but the behavior is defined so a different dataset cannot produce an undefined metric or crash.
 
 ### 8.2 Effect-size CI & p-value (seeded, reproducible)
-The CI and the significance decision are deliberately kept in **distinct, clearly-labeled roles**: the CI is per-comparison effect-size context, and `significant` is the family-wise-error-controlled decision (§8.3). They are **not** two gates and **may disagree** — see §8.3 for why that is correct under FWER control.
+The CI and the significance decision are deliberately kept in **distinct, clearly-labeled roles**: the CI is per-comparison effect-size context, and `significant` is the **FDR-controlled decision** (§8.3). They are **not** two gates and **may disagree** — see §8.3 for why that is correct under a step-up FDR procedure.
 
 - **delta_ci_lo / delta_ci_high** = **per-comparison percentile bootstrap CI at the fixed unadjusted level** (`2.5` / `97.5` percentiles, i.e. a nominal 95% interval): resample the **paired query indices** with replacement `B = 10,000` times using a seeded `numpy.random.default_rng(seed)`, recompute mean `δ` each time, and take the 2.5 / 97.5 percentiles. Resampling **query indices** (not metrics independently) preserves pairing. This interval is reported **purely as effect-size / uncertainty context for a single comparison**; it is **not** multiplicity-adjusted and is **not** a significance gate. The level (2.5/97.5) is fixed and recorded in run metadata (§9.1).
 - **p_value** = **Wilcoxon signed-rank test** (two-sided) on the paired `δ_q` (primary; no normality assumption), with explicitly pinned handling of zeros and ties (heavy in nDCG/recall/precision, where many baseline/variant rankings coincide):
@@ -675,12 +677,18 @@ The CI and the significance decision are deliberately kept in **distinct, clearl
   - **All-zero deltas** (every `δ_q == 0`, the test is undefined): the harness short-circuits to `p_value = 1.0` and `significant = false` rather than calling scipy (see §8.1 table).
   - Because sparse-delta metrics stress Wilcoxon's zero/tie handling, the **seeded paired-permutation test** (sign-flip permutation on the paired deltas, same seeded `rng`) is offered as a configurable primary; when selected it uses the same all-zero short-circuit.
 
-### 8.3 Significance & multiple comparisons (single, coherent regime)
-- Family = all `(variant × metric)` tests **within one run**. Control family-wise error with **Holm–Bonferroni** at family `α = 0.05`, applied to the **raw** p-values. Degenerate rows (`empty_paired_set` / `all_zero_delta`, §8.1) are assigned `significant=false` with `p_value=1.0` and are **NOT** counted in the Holm family size `m` — `m` is the number of *real* tests (those that produced a p-value from scipy/the permutation test).
-- **Decision rule (the *only* gate).** Order the family's raw p-values ascending `p_(1) <= … <= p_(m)`. Holm rejects `H_(i)` iff `p_(j) <= α / (m − j + 1)` for **all** `j <= i` (step-down: the first failure stops the sequence and all later hypotheses are retained). `significant` for a test is exactly its Holm reject/retain outcome. This is the single error-control regime; there is no second condition.
-- **The CI is *not* a second gate, by design — and may disagree with `significant`.** The reported CI (§8.2) is a per-comparison, unadjusted 2.5/97.5 bootstrap interval used only for effect-size context. Under Holm (a step-**down**, sequential procedure) there is **no well-defined fixed per-test alpha** to build a multiplicity-consistent CI from: a test can be **retained** (`significant=false`) because an *earlier, smaller-p* test in the ordering failed, even though its own unadjusted CI excludes 0; and conversely a rejected test's unadjusted CI excludes 0 but at no shared confidence level tied to the family decision. **Therefore the CI and the `significant` flag are not guaranteed to agree, and disagreement is normal and expected under FWER control.** We do not attempt to reconcile them, because doing so via a "Holm step-level alpha" is mathematically unsound (Holm has no fixed per-test alpha) and would re-introduce regime mixing in subtler form. The CSV documents this: `p_value` is raw, `significant` is the Holm decision on raw p, and the CI is unadjusted effect-size context.
-- **If a CI that is provably consistent with a multiplicity-controlled decision is required**, the design's alternative is to switch the *decision* to a simultaneous/joint method where duality holds — e.g. a **max-statistic bootstrap** (simultaneous confidence band over all comparisons) or **BH-FDR with matching FDR-adjusted intervals** — selected via `stats.correction`. This swaps both the decision and the interval into one joint regime; it is **not** the default and is deferred (§13). The default keeps Holm-on-raw-p with an unadjusted descriptive CI, with the disagreement caveat stated above.
-- The **raw** (uncorrected) `p_value` is written to the CSV; `significant` reflects the Holm-corrected decision. Correction method, family size `m`, and `α` are recorded in run metadata. (No per-test "adjusted alpha" is recorded, because Holm does not define one.)
+### 8.3 Significance & multiple comparisons (single, coherent FDR regime)
+- Family = all `(variant × metric)` tests **within one run**. Control the **False Discovery Rate (FDR)** — the expected proportion of false discoveries *among the rejections* — with **Benjamini-Hochberg (BH)** at FDR level `q = α = 0.05` by default, applied to the **raw** p-values. Degenerate rows (`empty_paired_set` / `all_zero_delta`, §8.1) are assigned `significant_raw=false`, `p_value=1.0`, `p_value_adjusted=1.0`, `significant=false` and are **NOT** counted in the family size `m` — `m` is the number of *real* tests (those that produced a p-value from scipy/the permutation test).
+- **`alpha` is both thresholds.** The single configured `alpha = 0.05` serves as **both** the raw per-test threshold (for `significant_raw`) **and** the FDR target level `q` (for the BH/BY step-up). There is one number, used in two clearly-labeled roles.
+- **Decision rule (the FDR gate).** Order the family's raw p-values ascending `p_(1) <= … <= p_(m)`. The BH step-up finds the **largest `k`** with `p_(k) <= (k/m)·α` and **rejects all hypotheses with rank `<= k`**. Equivalently — and this is what the harness emits — BH defines **adjusted p-values (q-values)** `q_(k) = min_{j >= k} ( m·p_(j) / j )`, monotone non-decreasing in rank and clamped to `<= 1`; `significant = (p_value_adjusted <= α)` reproduces the step-up rejection set exactly. Unlike Holm (which defines no per-test adjusted value), **BH q-values are well-defined and ARE reported** in the comparison CSV.
+- **Two significance flags are emitted, in distinct roles.** `significant_raw = (p_value <= α)` is the **uncorrected per-test decision**, computed independently of the family (it does not depend on `m` or the other tests). `significant = (p_value_adjusted <= α)` is the **FDR decision** over the family. Both are written to the CSV so a reader can see the uncorrected discovery and its post-correction fate; because BH is more powerful than Holm/FWER, a test that is `significant_raw` may or may not survive FDR correction, and both outcomes are reported honestly.
+- **Why FDR, not FWER/Holm, is the right regime here.** This is an **exploratory** analysis: the goal is **discovering the best pipeline** among many correlated retrieval configurations and inspecting hybrid-retrieval failure modes — not a confirmatory or clinical test. FDR (control the expected *proportion* of false discoveries among rejections) beats FWER/Holm (control the probability of *any* false rejection) for three reasons:
+  1. **Holm/FWER is overly strict for many correlated hypotheses** — it sacrifices power and likely **hides true metric improvements**, causing us to miss the best retrieval configuration.
+  2. **The tests are highly correlated** (e.g. `hybrid+rerank` is inherently correlated with `hybrid` without rerank; the RRF `k`-sweep is correlated across `k`). **Benjamini-Hochberg controls FDR under independence AND positive regression dependence (PRDS)**, which positively-correlated retrieval configs plausibly satisfy — it handles correlation with far more power than Bonferroni-style FWER.
+  3. **The cost of a false positive here is low and asymmetric:** it means provisionally selecting a slightly-suboptimal tuning parameter, which is caught in later A/B testing — not a life-or-death error the Holm-Bonferroni regime is designed for. Missing a real improvement (a false negative) is the more costly error for discovery, so we prefer FDR's power.
+- **Configurable arbitrary-dependence option.** The default is **BH** (`correction: bh`). **Benjamini-Yekutieli (BY)** (`correction: by`) is the conservative alternative that is **valid under arbitrary dependence** (it costs a `log`-factor of power via the `c(m) = Σ_{i=1..m} 1/i` scaling); offer it via config for when PRDS is doubted. Any `correction` other than `bh`/`by` raises `NotImplementedError`.
+- **The CI is *not* a second gate, by design — and may disagree with `significant`.** The reported CI (§8.2) is a per-comparison, unadjusted 2.5/97.5 bootstrap interval used only for effect-size context. Under a **step-up FDR procedure** there is **no simple per-test alpha** that yields a matching interval: a test's rejection depends on the *whole ordered family*, so its unadjusted CI can exclude 0 while it is not FDR-significant (or vice versa) at no shared confidence level tied to the family decision. **Therefore the CI and the `significant` flag are not guaranteed to agree, and disagreement is normal and expected.** We do not attempt to reconcile them; a matching FDR-adjusted-interval regime remains **deferred (§13)**. The CSV documents this: `p_value` is raw, `significant_raw` is the raw per-test decision, `p_value_adjusted` is the BH q-value, `significant` is the FDR decision, and the CI is unadjusted effect-size context.
+- The **raw** (uncorrected) `p_value` **and** the FDR-adjusted `p_value_adjusted` (q-value) are both written to the CSV, alongside `significant_raw` and `significant`. Correction method (`bh`/`by`), family size `m`, and `α` (as the raw threshold AND the FDR level `q`) are recorded in run metadata.
 
 ---
 
@@ -702,12 +710,12 @@ One row per query. `n_scored` and `n_missing` are **non-negative integers, ALWAY
 
 **`comparison_{baseline}_{variant}_{timestamp}.csv`**
 ```
-variant,metric,delta,delta_ci_lo,delta_ci_high,significant,p_value
+variant,metric,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
 ```
-One row per metric ∈ {`avg_relevance`,`ndcg@10`,`recall@10`,`precision@10`}; `significant` ∈ {`true`,`false`}. `delta_ci_lo/high` are the **per-comparison unadjusted 2.5/97.5 bootstrap interval (effect-size context only, §8.2)**; `p_value` is the **raw** Wilcoxon (or permutation) p; `significant` is the Holm-corrected decision (§8.3). The CI and `significant` are in different roles and **may disagree** (§8.3). For a degenerate paired set, `delta` and the CI cells are written **empty** (empty paired set) or `0.0` (all-zero deltas) per the §8.1 table, with `p_value=1.0`, `significant=false`.
+One row per metric ∈ {`avg_relevance`,`ndcg@10`,`recall@10`,`precision@10`}; `significant` ∈ {`true`,`false`} and `significant_raw` ∈ {`true`,`false`}. `delta_ci_lo/high` are the **per-comparison unadjusted 2.5/97.5 bootstrap interval (effect-size context only, §8.2)**; `p_value` is the **raw** (uncorrected) Wilcoxon (or permutation) p; `significant_raw` is the **uncorrected per-test decision** (`p_value <= α`); `p_value_adjusted` is the **BH (or BY) FDR-adjusted p-value (q-value)** over the family; `significant` is the **FDR decision** (`p_value_adjusted <= α`, §8.3). The CI is in a different role from the significance flags and **may disagree** with them (§8.3). For a degenerate paired set, `delta` and the CI cells are written **empty** (empty paired set) or `0.0` (all-zero deltas) per the §8.1 table, with `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`.
 
 ### 9.1 Reproducibility
-- **Config capture:** the fully-resolved config (expanded variants including any `best_per_model`-selected k, its selection metric, and the `hybrid_rerank_selection_bias` flag; model/reranker ids, k values, W, bootstrap B, the fixed CI level 2.5/97.5, family α, family size m, correction method, test + its zero/tie params, any degenerate-paired-set notes, dataset version, ES + endpoint versions, cutoff, seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. No per-test "adjusted alpha" is recorded (Holm defines none, §8.3).
+- **Config capture:** the fully-resolved config (expanded variants including any `best_per_model`-selected k, its selection metric, and the `hybrid_rerank_selection_bias` flag; model/reranker ids, k values, W, bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test + its zero/tie params, any degenerate-paired-set notes, dataset version, ES + endpoint versions, cutoff, seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits FDR-adjusted p-values (q-values) per test in the comparison CSV (§9), so — unlike Holm — the adjusted significance is fully materialized.
 - **Seeds:** one master seed feeds the bootstrap and any permutation test; recorded in config. Given the seed, stats are deterministic. The `best_per_model` selection is seed-independent (a deterministic argmax with defined tie-break, §8.0a).
 - **Determinism caveats:** ES scoring ties and approximate-kNN introduce nondeterminism. Mitigations: stable tie-break on `doc_id` in `execute()`; idempotent indexing (`_id = product_id`); recorded ES/endpoint versions.
 
@@ -737,12 +745,13 @@ rerankers:                              # → *_rerank
       task_settings:    { top_n: 100 } }
 rrf_k_sweep: [10,20,30,40,50,60,70,80,90,100]   # → hybrid
 variants:  [bm25, semantic, hybrid, bm25_rerank, semantic_rerank, hybrid_rerank]
-stats:     { bootstrap_B: 10000, ci_level: 0.95, alpha: 0.05, correction: holm, test: wilcoxon,
+stats:     { bootstrap_B: 10000, ci_level: 0.95, alpha: 0.05, correction: bh, test: wilcoxon,
              wilcoxon_zero_method: wilcox, wilcoxon_correction: true, seed: 1234 }
              # ci_level is the UNADJUSTED per-comparison effect-size CI (§8.2); it is NOT a gate.
-             # correction: holm controls the significance decision (§8.3). For a CI that is
-             # provably consistent with the decision, set correction to a joint method
-             # (max_stat | bh_fdr) — deferred (§13).
+             # correction: bh is the FDR (Benjamini-Hochberg) decision, the DEFAULT (§8.3); by =
+             # Benjamini-Yekutieli, the conservative arbitrary-dependence option. alpha is BOTH the
+             # raw per-test threshold AND the FDR level q. The CI stays unadjusted/descriptive and may
+             # disagree with the decision; a matching FDR-adjusted-interval regime is deferred (§13).
 hybrid_rerank_k: 60                     # DEFAULT: a fixed integer (single-pass, fully static; no
                                         # selection-on-eval-set bias). set to `best_per_model` for the
                                         # opt-in two-pass mode (§8.0a) — biased, exploratory only.
@@ -772,7 +781,7 @@ benchmark/
   fusion.py              # fuse_rrf_local (harness-side fallback, windowed)
   rerank.py              # rerank_local (harness-side fallback, windowed)
   metrics.py             # Evaluator, Metrics, QrelIndex (ndcg/recall/precision/avg_relevance)
-  stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, Holm; degenerate-set handling)
+  stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, FDR/BH-BY; degenerate-set handling)
   matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), VariantCfg, ResolvedConfig
   runner.py              # ExperimentRunner (the single execution path, §8.0)
   io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
@@ -805,7 +814,7 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 
 ## 13. Open Questions / Deferred
 - `hybrid_rerank` k selection: the default is a **fixed integer** (single-pass, unbiased); `best_per_model` is the opt-in two-pass mode (§8.0a) and is **optimistically biased** (selection on the evaluation set). Whether to ship a built-in train/test query split for `best_per_model` reporting, expose alternative selection metrics (e.g. recall@10), or change the tie-break is deferred.
-- **Joint CI/decision regime:** an optional `correction: max_stat | bh_fdr` mode (§8.3) that yields a multiplicity-controlled decision *with* a provably consistent simultaneous/FDR-adjusted interval, so the CI and `significant` flag coincide by construction. Deferred; the default is Holm-on-raw-p with an unadjusted descriptive CI that may disagree with the flag (this is normal under FWER control).
+- **Matching FDR-adjusted interval regime:** **BH-FDR is now the DEFAULT decision** (§8.3), with an unadjusted descriptive CI (§8.2) that may disagree with the flag. What remains **deferred** is a **matching FDR-adjusted confidence-interval regime** (or a max-statistic simultaneous confidence band) so the reported interval and the FDR decision coincide *by construction* rather than living in separate roles — and, possibly, **switching BY to the default** if PRDS proves doubtful for these correlated retrieval configs.
 - **`bm25` as a capability:** currently BM25 is a mandatory `SearchBackend` primitive, not a `BackendCapabilities` flag (§3.3). If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, promote `bm25` to a capability and have the matrix skip `bm25`/`hybrid`/`bm25_rerank` when it is false. Deferred until such a backend exists (no consumer today).
 - Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
 - Pooling-depth / missing-judgement sensitivity analysis (current default: **missing judgements are skipped via condensed-list evaluation**, §7 — NOT scored as gain 0; only judged-irrelevant docs count as a 0).

@@ -1,27 +1,34 @@
-"""Comparator: bootstrap CI, Wilcoxon/permutation p-value, Holm decision (docs/experiment.md §8). Phase 3.
+"""Comparator: bootstrap CI, Wilcoxon/permutation p-value, FDR decision (docs/experiment.md §8). Phase 3.
 
 The :class:`Comparator` pairs each non-baseline variant against the ``bm25`` baseline, per metric,
-and produces one :class:`ComparisonRow` per ``(variant, metric)``. It implements the single coherent
-error-control regime of §8:
+and produces one :class:`ComparisonResult` per ``(variant, metric)``. It implements the single
+coherent multiple-comparison regime of §8 — **False Discovery Rate (FDR)** control, Benjamini-Hochberg
+by default:
 
 - **Pairing (§8.1).** Paired by ``query_id`` over queries present in BOTH runs AND whose metric value
   is finite (not NaN) in BOTH runs — the *generalized* per-metric NaN exclusion. Any metric may be
   NaN for a query (``avg_relevance``/``ndcg@10``/``precision@10`` when ``n_scored == 0``; ``recall@10``
   when ``R == 0``, §7); recall's ``R == 0`` case is just one instance of this rule.
 - **Degenerate short-circuits (§8.1 table), BEFORE any scipy/bootstrap call.** An *empty paired set*
-  yields ``delta``/CI = ``None``, ``p_value = 1.0``, ``significant = False``, ``note="empty_paired_set"``.
-  *All-zero deltas* (>=1 paired query, every delta 0) yield ``delta = 0.0``, CI ``0.0/0.0``,
-  ``p_value = 1.0``, ``significant = False``, ``note="all_zero_delta"``. Degenerate rows are NOT part
-  of the Holm family and never trigger scipy or the RNG.
+  yields ``delta``/CI = ``None``, ``p_value = 1.0``, ``significant_raw = False``,
+  ``p_value_adjusted = 1.0``, ``significant = False``, ``note="empty_paired_set"``. *All-zero deltas*
+  (>=1 paired query, every delta 0) yield ``delta = 0.0``, CI ``0.0/0.0``, ``p_value = 1.0``,
+  ``significant_raw = False``, ``p_value_adjusted = 1.0``, ``significant = False``,
+  ``note="all_zero_delta"``. Degenerate rows are NOT part of the FDR family and never trigger scipy
+  or the RNG.
 - **Effect-size CI (§8.2).** Percentile bootstrap over PAIRED QUERY INDICES with replacement,
   ``B = bootstrap_B`` resamples, using a FRESH ``numpy.random.default_rng(seed)`` per ``(variant, metric)``
   so the CI is fully deterministic regardless of iteration order. The CI is reported as effect-size
-  context ONLY — it is never a significance gate and MAY DISAGREE with ``significant`` (§8.3).
-- **p-value (§8.2).** Two-sided Wilcoxon signed-rank (``zero_method``/``correction`` pinned), or a
-  seeded sign-flip paired-permutation test, selected by ``StatsCfg.test``.
-- **Holm (§8.3), family-wide across the whole run.** The family = ALL non-degenerate ``(variant, metric)``
-  tests. Holm–Bonferroni step-down at family ``alpha`` on the raw p-values; ``significant`` is exactly
-  the Holm reject/retain outcome. Degenerate rows are excluded from the family size ``m``.
+  context ONLY — it is never a significance gate and MAY DISAGREE with ``significant`` /
+  ``significant_raw`` (§8.3).
+- **Raw p-value (§8.2).** Two-sided Wilcoxon signed-rank (``zero_method``/``correction`` pinned), or a
+  seeded sign-flip paired-permutation test, selected by ``StatsCfg.test``. ``significant_raw`` is the
+  uncorrected per-test decision ``p_value <= alpha``, computed independently of the family.
+- **FDR (§8.3), family-wide across the whole run.** The family = ALL non-degenerate ``(variant, metric)``
+  tests (those with a real p-value). Benjamini-Hochberg (default) or Benjamini-Yekutieli adjusted
+  p-values (q-values) are computed over the family; ``significant = (p_value_adjusted <= alpha)``.
+  ``alpha`` is BOTH the raw per-test threshold AND the FDR target level ``q``. Degenerate rows are
+  excluded from the family size ``m``.
 
 This module imports ONLY the stdlib + numpy + scipy (no ``benchmark.*``): the comparator operates on
 plain metric maps (``query_id -> {metric_name: value}``), exactly what ``Metrics.as_dict()`` produces;
@@ -51,14 +58,16 @@ class StatsCfg:
     """Statistics configuration (§8, §10 ``stats`` block).
 
     ``ci_level`` is the UNADJUSTED per-comparison bootstrap CI level (§8.2) — NOT a gate.
-    ``alpha`` is the family-wise Holm alpha (§8.3). ``correction`` only implements ``"holm"``;
-    ``max_stat``/``bh_fdr`` are deferred (§13) and raise ``NotImplementedError``.
+    ``alpha`` (0.05) is BOTH the raw per-test threshold AND the FDR target level ``q`` (§8.3).
+    ``correction`` selects the FDR procedure: ``"bh"`` (Benjamini-Hochberg, default) or ``"by"``
+    (Benjamini-Yekutieli, valid under arbitrary dependence). Any other value raises
+    ``NotImplementedError``.
     """
 
     bootstrap_B: int = 10000
     ci_level: float = 0.95
     alpha: float = 0.05
-    correction: str = "holm"
+    correction: str = "bh"
     test: str = "wilcoxon"
     wilcoxon_zero_method: str = "wilcox"
     wilcoxon_correction: bool = True
@@ -66,13 +75,16 @@ class StatsCfg:
 
 
 @dataclass(frozen=True)
-class ComparisonRow:
+class ComparisonResult:
     """One ``(variant, metric)`` comparison result (§8.1 table, §9 comparison CSV).
 
     ``delta``/``delta_ci_lo``/``delta_ci_high`` are ``None`` for an empty paired set (serialized as
-    empty cells, §9). ``p_value`` is the RAW test p-value (Wilcoxon or permutation). ``significant``
-    is the Holm-corrected decision (§8.3) and may disagree with the CI. ``note`` records a degenerate
-    case: ``"empty_paired_set"`` | ``"all_zero_delta"`` | ``None``.
+    empty cells, §9). ``p_value`` is the RAW, uncorrected test p-value (Wilcoxon or permutation) and
+    ``significant_raw`` is the uncorrected per-test decision (``p_value <= alpha``), independent of the
+    family. ``p_value_adjusted`` is the FDR (BH/BY) adjusted p-value (q-value) over the family — ``1.0``
+    for degenerate rows — and ``significant`` is the FDR decision (``p_value_adjusted <= alpha``, §8.3).
+    Either significance flag may disagree with the CI. ``note`` records a degenerate case:
+    ``"empty_paired_set"`` | ``"all_zero_delta"`` | ``None``.
     """
 
     variant: str
@@ -80,24 +92,26 @@ class ComparisonRow:
     delta: float | None
     delta_ci_lo: float | None
     delta_ci_high: float | None
-    significant: bool
     p_value: float
+    significant_raw: bool
+    p_value_adjusted: float | None
+    significant: bool
     note: str | None = None
 
 
 class Comparator:
-    """Pairs variants vs the baseline and applies the §8 CI / p-value / Holm regime.
+    """Pairs variants vs the baseline and applies the §8 CI / p-value / FDR regime.
 
     ``compare`` returns rows in a deterministic order: variants sorted by id, and within each variant
     the canonical metrics in :data:`CANONICAL_METRICS` order.
     """
 
     def __init__(self, cfg: StatsCfg) -> None:
-        if cfg.correction != "holm":
-            # max_stat | bh_fdr are the deferred joint regimes (§8.3, §13).
+        if cfg.correction not in ("bh", "by"):
+            # FDR procedures only: 'bh' (Benjamini-Hochberg, default) | 'by' (Benjamini-Yekutieli).
             raise NotImplementedError(
                 f"correction={cfg.correction!r} is not implemented; "
-                "only 'holm' is supported (max_stat|bh_fdr deferred, §13)"
+                "only 'bh' (Benjamini-Hochberg) and 'by' (Benjamini-Yekutieli) are supported"
             )
         if cfg.test not in ("wilcoxon", "permutation"):
             raise ValueError(f"unknown test={cfg.test!r}; expected 'wilcoxon' or 'permutation'")
@@ -107,18 +121,18 @@ class Comparator:
         self,
         baseline: Mapping[str, Mapping[str, float]],
         variants: Mapping[str, Mapping[str, Mapping[str, float]]],
-    ) -> list[ComparisonRow]:
-        """Compare every variant vs the baseline, per canonical metric, with family-wide Holm (§8).
+    ) -> list[ComparisonResult]:
+        """Compare every variant vs the baseline, per canonical metric, with family-wide FDR (§8).
 
         ``baseline`` maps ``query_id -> {metric_name: value}``; ``variants`` maps
         ``variant_id -> query_id -> {metric_name: value}``. These are exactly what
-        ``Metrics.as_dict()`` produces per query. Holm is applied across the family of all
-        non-degenerate ``(variant, metric)`` tests in this call (§8.3).
+        ``Metrics.as_dict()`` produces per query. The FDR correction (BH/BY) is applied across the
+        family of all non-degenerate ``(variant, metric)`` tests in this call (§8.3).
         """
         cfg = self._cfg
-        rows: list[ComparisonRow] = []
-        # (index into rows) for each non-degenerate test, plus its raw p-value and Holm sort key.
-        family: list[tuple[int, float, tuple[str, str]]] = []
+        rows: list[ComparisonResult] = []
+        # (index into rows, raw p-value) for each non-degenerate test (the FDR family).
+        family: list[tuple[int, float]] = []
 
         for variant_id in sorted(variants):
             variant_metrics = variants[variant_id]
@@ -128,14 +142,16 @@ class Comparator:
                 if deltas.size == 0:
                     # Empty paired set (§8.1 table): no scipy/bootstrap call.
                     rows.append(
-                        ComparisonRow(
+                        ComparisonResult(
                             variant=variant_id,
                             metric=metric,
                             delta=None,
                             delta_ci_lo=None,
                             delta_ci_high=None,
-                            significant=False,
                             p_value=1.0,
+                            significant_raw=False,
+                            p_value_adjusted=1.0,
+                            significant=False,
                             note="empty_paired_set",
                         )
                     )
@@ -144,14 +160,16 @@ class Comparator:
                 if np.all(deltas == 0.0):
                     # All-zero deltas (§8.1 table): no scipy/bootstrap call.
                     rows.append(
-                        ComparisonRow(
+                        ComparisonResult(
                             variant=variant_id,
                             metric=metric,
                             delta=0.0,
                             delta_ci_lo=0.0,
                             delta_ci_high=0.0,
-                            significant=False,
                             p_value=1.0,
+                            significant_raw=False,
+                            p_value_adjusted=1.0,
+                            significant=False,
                             note="all_zero_delta",
                         )
                     )
@@ -164,31 +182,36 @@ class Comparator:
 
                 idx = len(rows)
                 rows.append(
-                    ComparisonRow(
+                    ComparisonResult(
                         variant=variant_id,
                         metric=metric,
                         delta=delta,
                         delta_ci_lo=ci_lo,
                         delta_ci_high=ci_high,
-                        significant=False,  # set by Holm below
                         p_value=p_value,
+                        # Raw per-test decision, independent of the family (§8.3).
+                        significant_raw=p_value <= cfg.alpha,
+                        p_value_adjusted=None,  # set by the FDR step below
+                        significant=False,  # set by the FDR step below
                         note=None,
                     )
                 )
-                family.append((idx, p_value, (variant_id, metric)))
+                family.append((idx, p_value))
 
-        # Holm–Bonferroni family-wide over the non-degenerate tests (§8.3).
-        significant_by_idx = _holm(family, cfg.alpha)
-        for idx, is_sig in significant_by_idx.items():
+        # FDR (BH/BY) family-wide over the non-degenerate tests (§8.3).
+        adjusted_by_idx = _fdr_adjust([p for _, p in family], cfg.correction)
+        for (idx, _p), q in zip(family, adjusted_by_idx):
             row = rows[idx]
-            rows[idx] = ComparisonRow(
+            rows[idx] = ComparisonResult(
                 variant=row.variant,
                 metric=row.metric,
                 delta=row.delta,
                 delta_ci_lo=row.delta_ci_lo,
                 delta_ci_high=row.delta_ci_high,
-                significant=is_sig,
                 p_value=row.p_value,
+                significant_raw=row.significant_raw,
+                p_value_adjusted=q,
+                significant=q <= cfg.alpha,
                 note=row.note,
             )
         return rows
@@ -279,24 +302,49 @@ def _sign_vectors(n: int) -> np.ndarray:
     return 1.0 - 2.0 * bits  # 0 -> +1, 1 -> -1
 
 
-def _holm(
-    family: Sequence[tuple[int, float, tuple[str, str]]],
-    alpha: float,
-) -> dict[int, bool]:
-    """Holm–Bonferroni step-down over the family; returns ``row_index -> significant`` (§8.3).
+def _fdr_adjust(ps: Sequence[float], method: str) -> list[float]:
+    """FDR-adjusted p-values (q-values) over the family, in input order (§8.3).
 
-    ``family`` is ``(row_index, raw_p, (variant, metric))`` for every non-degenerate test. Sort by
-    raw p ascending, tie-break by ``(variant, metric)``. Going in ascending order, reject while
-    ``p_(j) <= alpha / (m - j + 1)``; at the FIRST failure, stop and RETAIN it and all larger.
+    ``method`` is ``"bh"`` (Benjamini-Hochberg, controls FDR under independence and PRDS) or ``"by"``
+    (Benjamini-Yekutieli, valid under arbitrary dependence). Prefers
+    ``scipy.stats.false_discovery_control`` when available in the installed scipy, else falls back to a
+    correct hand-rolled step-up that is monotone non-decreasing in rank and clamped to ``<= 1``.
+
+    ``significant`` for a test is then ``q <= alpha``; because BH's adjusted p-value ``q_(k)`` satisfies
+    ``q_(k) <= alpha`` iff ``k`` is within the BH step-up rejection set, this reproduces the classic
+    step-up rule (largest ``k`` with ``p_(k) <= (k/m)*alpha``; reject all with rank ``<= k``).
     """
-    m = len(family)
-    ordered = sorted(family, key=lambda t: (t[1], t[2]))
-    result: dict[int, bool] = {}
-    failed = False
-    for j, (idx, p, _key) in enumerate(ordered, start=1):
-        if not failed and p <= alpha / (m - j + 1):
-            result[idx] = True
-        else:
-            failed = True
-            result[idx] = False
-    return result
+    if not ps:
+        return []
+
+    scipy_fdr = getattr(scipy_stats, "false_discovery_control", None)
+    if scipy_fdr is not None:
+        adjusted = scipy_fdr(np.asarray(ps, dtype=float), method=method)
+        return [float(min(q, 1.0)) for q in adjusted]
+
+    return _fdr_adjust_manual(ps, method)
+
+
+def _fdr_adjust_manual(ps: Sequence[float], method: str) -> list[float]:
+    """Hand-rolled BH/BY adjusted p-values (fallback when scipy lacks ``false_discovery_control``).
+
+    Standard step-up: sort p ascending, scale ``p_(k)`` by ``m / (k * c(m))`` (``c(m) = 1`` for BH,
+    ``c(m) = sum_{i=1..m} 1/i`` for BY), enforce monotonicity from the largest rank downward, clamp to
+    ``<= 1``, and scatter back to the original order.
+    """
+    m = len(ps)
+    order = sorted(range(m), key=lambda i: ps[i])  # indices sorted by ascending p
+    c_m = 1.0 if method == "bh" else float(np.sum(1.0 / np.arange(1, m + 1)))
+
+    adjusted_sorted = [0.0] * m
+    running_min = 1.0
+    # Walk from the largest p (rank m) down to rank 1, enforcing monotone non-decreasing in rank.
+    for rank in range(m, 0, -1):
+        raw = ps[order[rank - 1]] * m * c_m / rank
+        running_min = min(running_min, raw)
+        adjusted_sorted[rank - 1] = min(running_min, 1.0)
+
+    out = [0.0] * m
+    for sorted_pos, orig_idx in enumerate(order):
+        out[orig_idx] = adjusted_sorted[sorted_pos]
+    return out

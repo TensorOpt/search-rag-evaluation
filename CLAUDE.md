@@ -37,7 +37,7 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 - **Exact CSV artifact schemas (do not rename/reorder fields):**
   - `result_{variant}_{timestamp}.csv` — `query_id, product_id, score, position`
   - `metrics_{variant}_{timestamp}.csv` — `query_id, avg_relevance, ndcg@10, recall@10, precision@10, n_scored, n_missing`
-  - `comparison_{baseline}_{variant}_{timestamp}.csv` — `variant, metric, delta, delta_ci_lo, delta_ci_high, significant, p_value`
+  - `comparison_{baseline}_{variant}_{timestamp}.csv` — `variant, metric, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, p_value_adjusted, significant`
 - **RRF k-sweep** is over `rank_constant` ∈ {10,20,…,100}.
 
 ## Conventions

@@ -2,11 +2,13 @@
 
 Covers: seeded bootstrap-CI determinism and B honoring; the two degenerate short-circuits
 (empty paired set / all-zero deltas) with a hard assertion that scipy/bootstrap/RNG are NEVER
-called and that degenerate rows are excluded from the Holm family size m; the generalized
-per-metric NaN exclusion (avg/ndcg/precision via n_scored==0, recall via R==0); family-wide Holm
-step-down (including "first failure stops the sequence"); CI-vs-significant disagreement (both
-reported, no exception); the Wilcoxon zero_method/correction/two-sided path and the seeded
-reproducible permutation path; and the exact §8.1-table ComparisonRow fields/notes.
+called and that degenerate rows are excluded from the FDR family size m; the generalized
+per-metric NaN exclusion (avg/ndcg/precision via n_scored==0, recall via R==0); family-wide FDR
+(Benjamini-Hochberg step-up rejection set + adjusted q-values, and BY as a more-conservative
+option); raw-vs-FDR significance (significant_raw is the uncorrected per-test decision, may differ
+from the FDR significant flag); CI-vs-significant disagreement (both reported, no exception); the
+Wilcoxon zero_method/correction/two-sided path and the seeded reproducible permutation path; and the
+exact §8.1-table ComparisonResult fields/notes.
 """
 
 from __future__ import annotations
@@ -20,9 +22,10 @@ from benchmark import stats as stats_mod
 from benchmark.stats import (
     CANONICAL_METRICS,
     Comparator,
-    ComparisonRow,
+    ComparisonResult,
     StatsCfg,
-    _holm,
+    _fdr_adjust,
+    _fdr_adjust_manual,
 )
 
 # --------------------------------------------------------------------------------------------------
@@ -44,7 +47,7 @@ def _variant(values: dict[str, float]) -> dict[str, dict[str, float]]:
     return {qid: _all_metrics(v) for qid, v in values.items()}
 
 
-def _row(rows: list[ComparisonRow], variant: str, metric: str) -> ComparisonRow:
+def _row(rows: list[ComparisonResult], variant: str, metric: str) -> ComparisonResult:
     (r,) = [x for x in rows if x.variant == variant and x.metric == metric]
     return r
 
@@ -105,7 +108,7 @@ def test_bootstrap_B_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Degenerate short-circuits (§8.1 table): no scipy/bootstrap/RNG; excluded from Holm family.
+# Degenerate short-circuits (§8.1 table): no scipy/bootstrap/RNG; excluded from FDR family.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -132,8 +135,10 @@ def test_empty_paired_set_row_and_no_scipy(monkeypatch: pytest.MonkeyPatch) -> N
         assert r.delta is None
         assert r.delta_ci_lo is None
         assert r.delta_ci_high is None
-        assert r.significant is False
         assert r.p_value == 1.0
+        assert r.significant_raw is False
+        assert r.p_value_adjusted == 1.0
+        assert r.significant is False
         assert r.note == "empty_paired_set"
 
 
@@ -147,16 +152,17 @@ def test_all_zero_delta_row_and_no_scipy(monkeypatch: pytest.MonkeyPatch) -> Non
         assert r.delta == 0.0
         assert r.delta_ci_lo == 0.0
         assert r.delta_ci_high == 0.0
-        assert r.significant is False
         assert r.p_value == 1.0
+        assert r.significant_raw is False
+        assert r.p_value_adjusted == 1.0
+        assert r.significant is False
         assert r.note == "all_zero_delta"
 
 
-def test_degenerate_rows_excluded_from_holm_family() -> None:
+def test_degenerate_rows_excluded_from_fdr_family() -> None:
     # One real test on avg_relevance (tiny p so it would reject at any sane m), and a degenerate
-    # all-zero row for the other metrics. If degenerate rows counted toward m, the Holm threshold
-    # for the single real test would shrink. We assert the real test's significance is computed as
-    # if m == 1 (the family only contains it).
+    # all-zero row for the other metrics. Degenerate rows must NOT enter the FDR family: with m == 1
+    # (the family only contains the real test), the BH q-value equals the raw p and the test rejects.
     n = 30
     base = _baseline({f"q{i}": 0.0 for i in range(n)})
     # avg_relevance differs strongly (real test); other metrics identical (all-zero degenerate).
@@ -168,11 +174,13 @@ def test_degenerate_rows_excluded_from_holm_family() -> None:
     rows = Comparator(StatsCfg(alpha=0.05, bootstrap_B=500)).compare(base, {"v": var})
     real = _row(rows, "v", "avg_relevance")
     assert real.note is None
-    assert real.significant is True  # only member of the family; p tiny <= 0.05/1
+    assert real.significant is True  # only member of the family; q == raw p tiny <= 0.05
+    assert real.p_value_adjusted == pytest.approx(real.p_value)  # m == 1 -> q == p
     for m in ("ndcg@10", "recall@10", "precision@10"):
         r = _row(rows, "v", m)
         assert r.note == "all_zero_delta"
         assert r.significant is False
+        assert r.significant_raw is False
 
 
 # --------------------------------------------------------------------------------------------------
@@ -222,40 +230,95 @@ def test_all_excluded_becomes_empty_paired_set() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Holm family-wide step-down (§8.3) — direct unit test of the _holm helper.
+# FDR family-wide (§8.3) — direct unit test of the _fdr_adjust helper (BH step-up + q-values, BY).
 # --------------------------------------------------------------------------------------------------
 
 
-def test_holm_step_down_first_failure_stops_sequence() -> None:
-    # Family of 4 raw p-values across variants x metrics. alpha = 0.05, m = 4.
-    # Sorted ascending: 0.001, 0.02, 0.04, 0.5
-    # thresholds: 0.05/4=0.0125, 0.05/3=0.01667, 0.05/2=0.025, 0.05/1=0.05
-    #   0.001 <= 0.0125    -> reject
-    #   0.02  <= 0.01667 ? NO -> FIRST FAILURE: retain this and ALL larger
-    #   0.04, 0.5          -> retained (sequence stopped)
-    family = [
-        (10, 0.001, ("v1", "ndcg@10")),
-        (11, 0.02, ("v1", "recall@10")),
-        (12, 0.04, ("v2", "avg_relevance")),
-        (13, 0.5, ("v2", "precision@10")),
-    ]
-    out = _holm(family, alpha=0.05)
-    assert out == {10: True, 11: False, 12: False, 13: False}
+def _bh_reject_set(ps: list[float], alpha: float) -> set[int]:
+    """Classic BH step-up rejection set: largest k with p_(k) <= (k/m)*alpha; reject all <= that."""
+    m = len(ps)
+    order = sorted(range(m), key=lambda i: ps[i])
+    k_star = 0
+    for rank in range(1, m + 1):
+        if ps[order[rank - 1]] <= (rank / m) * alpha:
+            k_star = rank
+    return {order[r - 1] for r in range(1, k_star + 1)}
 
 
-def test_holm_tie_break_by_variant_metric() -> None:
-    # Equal p-values: order is broken by (variant, metric). Both below their thresholds -> reject.
-    family = [
-        (1, 0.01, ("v2", "ndcg@10")),
-        (2, 0.01, ("v1", "ndcg@10")),
-    ]
-    # m=2: thresholds 0.05/2=0.025 then 0.05/1=0.05. Sorted key puts ("v1",..) first.
-    out = _holm(family, alpha=0.05)
-    assert out == {1: True, 2: True}
+def test_bh_step_up_rejection_set_and_qvalues() -> None:
+    # Family of 5 raw p-values. alpha = 0.05, m = 5.
+    # Sorted ascending: 0.001, 0.008, 0.02, 0.04, 0.7
+    # BH thresholds (k/m)*alpha: 0.01, 0.02, 0.03, 0.04, 0.05
+    #   0.001 <= 0.01 ; 0.008 <= 0.02 ; 0.02 <= 0.03 ; 0.04 <= 0.04 ; 0.7 <= 0.05? no
+    #   largest k with p_(k) <= (k/m)*alpha is k=4 -> reject the four smallest.
+    ps = [0.02, 0.7, 0.001, 0.04, 0.008]
+    alpha = 0.05
+    q = _fdr_adjust(ps, "bh")
+    reject_expected = _bh_reject_set(ps, alpha)
+    assert reject_expected == {0, 2, 3, 4}  # everything except the p=0.7 test (index 1)
+
+    reject_from_q = {i for i, qi in enumerate(q) if qi <= alpha}
+    assert reject_from_q == reject_expected  # significant == (q <= alpha) reproduces the step-up set
+
+    # q-values are monotone non-decreasing in rank and clamped <= 1.
+    order = sorted(range(len(ps)), key=lambda i: ps[i])
+    q_sorted = [q[i] for i in order]
+    assert q_sorted == sorted(q_sorted)  # monotone in rank
+    assert all(0.0 <= qi <= 1.0 for qi in q)
 
 
-def test_holm_matches_significant_in_compare() -> None:
-    # Two variants, strong effect on one metric, weak on another; verify `significant` reflects Holm.
+def test_bh_qvalues_match_scipy_and_manual_fallback() -> None:
+    # The scipy-backed path and the hand-rolled fallback must agree on BH q-values.
+    ps = [0.001, 0.008, 0.02, 0.04, 0.7, 0.5]
+    via_scipy = _fdr_adjust(ps, "bh")
+    via_manual = _fdr_adjust_manual(ps, "bh")
+    assert via_scipy == pytest.approx(via_manual)
+
+
+def test_by_is_more_conservative_than_bh() -> None:
+    # On the same family, BY rejections are a subset-or-equal of BH rejections (BY costs a log-factor).
+    ps = [0.001, 0.008, 0.02, 0.04, 0.7, 0.5]
+    alpha = 0.05
+    bh_q = _fdr_adjust(ps, "bh")
+    by_q = _fdr_adjust(ps, "by")
+    bh_reject = {i for i, q in enumerate(bh_q) if q <= alpha}
+    by_reject = {i for i, q in enumerate(by_q) if q <= alpha}
+    assert by_reject <= bh_reject
+    assert by_reject != bh_reject  # strictly more conservative on this family
+    # BY q-values are >= BH q-values everywhere (same ordering, larger scaling).
+    for b, y in zip(bh_q, by_q):
+        assert y >= b - 1e-12
+
+
+def test_raw_significant_can_exceed_fdr_significant() -> None:
+    # A family where a test is raw-significant (p <= alpha) but NOT FDR-significant (q > alpha):
+    # a marginal p=0.04 alongside many large p's -> BH q inflates above alpha.
+    ps = [0.04, 0.6, 0.7, 0.8, 0.9]
+    alpha = 0.05
+    q = _fdr_adjust(ps, "bh")
+    assert ps[0] <= alpha  # raw-significant
+    assert q[0] > alpha  # but NOT FDR-significant after correction
+
+
+def test_bh_more_powerful_than_holm_but_still_corrects() -> None:
+    # Two tests both raw-significant and both FDR-significant (BH keeps power a strict Holm/FWER
+    # step-down would have thrown away), yet a third large-p test is correctly NOT rejected.
+    ps = [0.001, 0.02, 0.9]
+    alpha = 0.05
+    q = _fdr_adjust(ps, "bh")
+    assert all(p <= alpha for p in ps[:2])  # both raw-significant
+    assert q[0] <= alpha and q[1] <= alpha  # both survive BH -> both FDR-significant
+    assert q[2] > alpha  # the null test is still corrected out
+
+
+# --------------------------------------------------------------------------------------------------
+# Raw vs FDR significance inside compare() (§8.3).
+# --------------------------------------------------------------------------------------------------
+
+
+def test_raw_and_fdr_significance_in_compare() -> None:
+    # Two variants: strong effect on one metric (raw AND FDR significant), weak on another
+    # (neither). Both flags are exposed independently on each row.
     n = 40
     base = _baseline({f"q{i}": 0.0 for i in range(n)})
     strong: dict[str, dict[str, float]] = {}
@@ -271,8 +334,16 @@ def test_holm_matches_significant_in_compare() -> None:
     rows = Comparator(StatsCfg(alpha=0.05, bootstrap_B=300)).compare(
         base, {"strong": strong, "weak": weak}
     )
-    assert _row(rows, "strong", "avg_relevance").significant is True
-    assert _row(rows, "weak", "avg_relevance").significant is False
+    r_strong = _row(rows, "strong", "avg_relevance")
+    r_weak = _row(rows, "weak", "avg_relevance")
+    assert r_strong.significant_raw is True
+    assert r_strong.significant is True
+    assert r_weak.significant_raw is False
+    assert r_weak.significant is False
+    # significant_raw is exactly the per-test p_value <= alpha, independent of the family.
+    for r in rows:
+        if r.note is None:
+            assert r.significant_raw == (r.p_value <= 0.05)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -280,34 +351,28 @@ def test_holm_matches_significant_in_compare() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def test_ci_excludes_zero_but_holm_retains() -> None:
-    # A consistent moderate effect on ndcg (CI excludes 0) alongside a MUCH smaller-p family member
-    # whose failure could stop the step-down... but here we engineer: two tests, the smaller-p one
-    # is NOT significant enough at its Holm threshold, forcing the larger-p one (CI-excludes-0) to
-    # be retained by the step-down even though its own unadjusted CI excludes 0.
+def test_ci_excludes_zero_but_fdr_may_retain() -> None:
+    # A consistent moderate effect on ndcg (CI excludes 0). Whatever the FDR decision, both the CI
+    # and the significance flags coexist and no exception is raised.
     n = 25
     base = _baseline({f"q{i}": 0.0 for i in range(n)})
-    # metric A: moderate consistent effect -> CI excludes 0, p ~ small-ish
-    # metric B: even smaller p but we make BOTH marginal so Holm's first failure retains A.
     var: dict[str, dict[str, float]] = {}
     for i in range(n):
         d = _all_metrics(0.0)
         d["ndcg@10"] = 0.2  # constant positive -> CI well above 0
         var[f"q{i}"] = d
-    # Add many sibling "borderline" variants to inflate m so Holm's adjusted threshold is tight,
-    # making it plausible the ndcg test is retained while its unadjusted CI still excludes 0.
     variants: dict[str, dict[str, dict[str, float]]] = {"target": var}
     rows = Comparator(StatsCfg(alpha=0.05, bootstrap_B=500, seed=5)).compare(base, variants)
     r = _row(rows, "target", "ndcg@10")
     # Constant +0.2 delta: bootstrap CI is a degenerate point at 0.2 (all resamples mean 0.2) -> excludes 0.
     assert r.delta is not None and r.delta_ci_lo is not None and r.delta_ci_high is not None
     assert r.delta_ci_lo > 0.0  # CI excludes 0
-    # Whatever Holm decides, both fields coexist and no exception is raised. Assert the object is
-    # well-formed regardless of agreement.
+    # Both flags well-formed regardless of whether they agree with the CI.
     assert isinstance(r.significant, bool)
+    assert isinstance(r.significant_raw, bool)
 
 
-def test_ci_includes_zero_but_holm_could_reject_no_exception() -> None:
+def test_ci_includes_zero_no_exception() -> None:
     # Wide, near-zero-mean noise: CI likely straddles 0 while we do not force any reconciliation.
     rng = np.random.default_rng(0)
     n = 60
@@ -321,9 +386,11 @@ def test_ci_includes_zero_but_holm_could_reject_no_exception() -> None:
     rows = Comparator(StatsCfg(bootstrap_B=400, seed=2)).compare(base, {"v": var})
     r = _row(rows, "v", "ndcg@10")
     assert r.delta_ci_lo is not None and r.delta_ci_high is not None
-    # No exception; both CI and significant present as independent fields.
+    # No exception; CI, significant, significant_raw, and adjusted p all present as independent fields.
     assert isinstance(r.significant, bool)
+    assert isinstance(r.significant_raw, bool)
     assert isinstance(r.p_value, float)
+    assert r.p_value_adjusted is not None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -410,11 +477,19 @@ def test_rows_are_ordered_by_variant_then_canonical_metric() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def test_non_holm_correction_raises_not_implemented() -> None:
+def test_unknown_correction_raises_not_implemented() -> None:
     with pytest.raises(NotImplementedError):
-        Comparator(StatsCfg(correction="bh_fdr"))
+        Comparator(StatsCfg(correction="holm"))
     with pytest.raises(NotImplementedError):
         Comparator(StatsCfg(correction="max_stat"))
+
+
+def test_bh_and_by_corrections_are_accepted() -> None:
+    base = _baseline({f"q{i}": 0.0 for i in range(20)})
+    var = _variant({f"q{i}": 0.3 for i in range(20)})
+    for correction in ("bh", "by"):
+        rows = Comparator(StatsCfg(correction=correction, bootstrap_B=100)).compare(base, {"v": var})
+        assert rows  # constructs and runs without error
 
 
 def test_unknown_test_raises_value_error() -> None:

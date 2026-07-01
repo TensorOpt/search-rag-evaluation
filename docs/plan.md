@@ -103,7 +103,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - `.gitignore` — ignores `results/` and `dataset/` (CLAUDE.md "don't commit dataset/ or results/").
 - `eval:fetch-data` script — downloads/copies WANDS `query.csv`/`product.csv`/`label.csv` into `dataset/wands/` (README "Dataset").
 - `eval:wait-for-es` script — polls `${ES_URL}/_cluster/health?wait_for_status=yellow` (README).
-- `config.yaml` — the §10 / README config matrix, verbatim axes (embedding_models, rerankers, `rrf_k_sweep` {10..100}, `variants`, `hybrid_rerank_k: 60`) and the §10 `stats` block verbatim: `bootstrap_B: 10000`, `ci_level: 0.95`, `alpha: 0.05`, `correction: holm`, `test: wilcoxon`, `wilcoxon_zero_method: wilcox`, `wilcoxon_correction: true`, `seed: 1234`.
+- `config.yaml` — the §10 / README config matrix, verbatim axes (embedding_models, rerankers, `rrf_k_sweep` {10..100}, `variants`, `hybrid_rerank_k: 60`) and the §10 `stats` block verbatim: `bootstrap_B: 10000`, `ci_level: 0.95`, `alpha: 0.05`, `correction: bh`, `test: wilcoxon`, `wilcoxon_zero_method: wilcox`, `wilcoxon_correction: true`, `seed: 1234`.
 - `tests/` layout + shared fixtures scaffold (see §5).
 
 **Depends on.** —
@@ -114,7 +114,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - `hatch env create eval` and `hatch env show` succeed; `hatch run dev:ruff check` and `hatch run dev:mypy benchmark` run clean over the (empty) package.
 - `python -c "import benchmark.models, benchmark.protocols, benchmark.pipeline, benchmark.fusion, benchmark.rerank, benchmark.metrics, benchmark.stats, benchmark.matrix, benchmark.runner, benchmark.io_csv, benchmark.config, benchmark.datasets.wands, benchmark.backends.elasticsearch"` imports with no error (skeleton importability).
 - `docker compose config` validates; image tag ≥ 8.15. (Compose is validated, not necessarily started, in this phase.)
-- **`config.yaml` stats block matches §10 verbatim:** assert the keys/values `bootstrap_B: 10000`, `alpha: 0.05`, `correction: holm`, `test: wilcoxon`, `wilcoxon_zero_method: wilcox`, `wilcoxon_correction: true`, and a `seed` are present (these are load-bearing for Phases 3/6/7/11 reproducibility); assert the inline comments are present that `ci_level` is the **unadjusted per-comparison effect-size CI, not a gate** and that `top_n` is a `task_settings` key. Catches drift at sign-off rather than in Phase 11.
+- **`config.yaml` stats block matches §10 verbatim:** assert the keys/values `bootstrap_B: 10000`, `alpha: 0.05`, `correction: bh`, `test: wilcoxon`, `wilcoxon_zero_method: wilcox`, `wilcoxon_correction: true`, and a `seed` are present (these are load-bearing for Phases 3/6/7/11 reproducibility); assert the inline comments are present that `ci_level` is the **unadjusted per-comparison effect-size CI, not a gate** and that `top_n` is a `task_settings` key. Catches drift at sign-off rather than in Phase 11.
 - `.gitignore` excludes `results/` and `dataset/`; `git status` shows neither after creating them.
 
 **Developer / reviewer responsibilities.** Developer creates the tree, tooling, compose, and `config.yaml`. Reviewer checks every filename against §11/README, the ES image floor, the gitignore entries, and that lint/type/import all pass.
@@ -180,31 +180,31 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 ### Phase 3 — `stats.py`
 
-**Objective.** Implement the `Comparator`: bootstrap CI, Wilcoxon/permutation p-value, Holm decision, and degenerate-set handling — one coherent regime (§8).
+**Objective.** Implement the `Comparator`: bootstrap CI, Wilcoxon/permutation p-value, FDR (BH/BY) decision, and degenerate-set handling — one coherent multiple-comparison regime (§8).
 
 **Deliverables.**
-- `benchmark/stats.py` — `StatsCfg` (frozen; `bootstrap_B`/`ci_level`/`alpha`/`correction`/`test`/`wilcoxon_zero_method`/`wilcoxon_correction`/`seed`), `ComparisonRow` (frozen; `variant, metric, delta, delta_ci_lo, delta_ci_high, significant, p_value, note`), and `Comparator(cfg).compare(baseline, variants) -> list[ComparisonRow]`. **Input is PLAIN metric maps, not `Metrics`** (so `stats` imports only stdlib + numpy + scipy — no `benchmark.*`, §11): `baseline` maps `query_id -> {metric: value}` and `variants` maps `variant_id -> query_id -> {metric: value}` (exactly `Metrics.as_dict()` per query; the runner adapts). Variants iterated in `sorted()` order, metrics in the fixed canonical order. Holm is applied **family-wide** across all non-degenerate `(variant × metric)` tests in the one `compare` call; degenerate rows are excluded from the family size `m`. `correction != "holm"` → `NotImplementedError` (`max_stat`/`bh_fdr` deferred, §13).
+- `benchmark/stats.py` — `StatsCfg` (frozen; `bootstrap_B`/`ci_level`/`alpha`/`correction`/`test`/`wilcoxon_zero_method`/`wilcoxon_correction`/`seed`; `correction` default `"bh"`), `ComparisonResult` (frozen; `variant, metric, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, p_value_adjusted, significant, note`), and `Comparator(cfg).compare(baseline, variants) -> list[ComparisonResult]`. **Input is PLAIN metric maps, not `Metrics`** (so `stats` imports only stdlib + numpy + scipy — no `benchmark.*`, §11): `baseline` maps `query_id -> {metric: value}` and `variants` maps `variant_id -> query_id -> {metric: value}` (exactly `Metrics.as_dict()` per query; the runner adapts). Variants iterated in `sorted()` order, metrics in the fixed canonical order. The FDR correction (Benjamini-Hochberg default, Benjamini-Yekutieli optional) is applied **family-wide** across all non-degenerate `(variant × metric)` tests in the one `compare` call; degenerate rows are excluded from the family size `m`. Each row carries **both** the raw per-test significance (`significant_raw`, `p_value`) **and** the FDR-adjusted significance (`significant`, `p_value_adjusted` q-value). `correction not in {"bh","by"}` → `NotImplementedError`.
 
 **Depends on.** Phase 1.
 
 **Implementation notes (§8).**
 - **Input shape:** the comparator takes plain metric maps (`baseline: query_id -> {metric: value}`, `variants: variant_id -> query_id -> {metric: value}`), NOT the `Metrics` type — so `stats.py` imports only stdlib + numpy + scipy (no `benchmark.metrics`/adapters, §11). The runner adapts `Metrics -> maps` via `as_dict()`.
 - **Pairing (§8.1):** paired by `query_id` over queries present in BOTH runs; **per-metric** `NaN` exclusion — for EACH metric independently, restrict the paired set to queries whose value for that metric is FINITE (not `NaN`) in BOTH runs (recall@10 is just the `R==0` case; `avg_relevance`/`ndcg@10`/`precision@10` can be `NaN` when `n_scored==0`, §7). Detection is by the in-memory `NaN` in the maps, **never** by re-reading CSV.
-- **Degenerate sets (§8.1 table), short-circuited before any scipy/bootstrap call:** *empty paired set* → `delta`/CI empty, `p_value=1.0`, `significant=false`, `note=empty_paired_set`; *all-zero deltas* → `delta=0.0`, CI `0.0/0.0`, `p_value=1.0`, `significant=false`, `note=all_zero_delta`.
+- **Degenerate sets (§8.1 table), short-circuited before any scipy/bootstrap call:** *empty paired set* → `delta`/CI empty, `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`, `note=empty_paired_set`; *all-zero deltas* → `delta=0.0`, CI `0.0/0.0`, `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`, `note=all_zero_delta`. Degenerate rows are excluded from the FDR family size `m`.
 - **CI (§8.2):** percentile bootstrap, **B=10000**, seeded `numpy.random.default_rng(seed)`, resample **paired query indices** (preserve pairing), recompute mean δ, take **2.5/97.5** percentiles. This CI is **effect-size context only, not a gate**.
-- **p_value (§8.2):** two-sided **Wilcoxon signed-rank**, `zero_method="wilcox"`, `correction=True` (both recorded); seeded **paired-permutation** test selectable as primary via `stats.test`. Raw p written to CSV.
-- **Holm (§8.3), family-wide across the whole `compare` call:** family = all **non-degenerate** `(variant × metric)` tests, `m` = family size, `α=0.05`; sort by raw p ascending (tie-break `(variant, metric)`), step-down reject while `p_(j) <= α/(m−j+1)`, first failure retains it and all larger; `significant` is exactly the Holm reject/retain outcome. Degenerate rows keep `significant=false`/`p_value=1.0` and are **excluded from `m`**. Implement Holm directly (no statsmodels). **The CI is not a second gate and may legitimately disagree** — do not reconcile.
+- **p_value (§8.2):** two-sided **Wilcoxon signed-rank**, `zero_method="wilcox"`, `correction=True` (both recorded); seeded **paired-permutation** test selectable as primary via `stats.test`. Raw p written to CSV; `significant_raw = (p_value <= α)` is the uncorrected per-test decision, computed independently of the family.
+- **FDR (§8.3), family-wide across the whole `compare` call:** family = all **non-degenerate** `(variant × metric)` tests, `m` = family size, `α=q=0.05`. Compute **Benjamini-Hochberg** (default) or **Benjamini-Yekutieli** (`correction: by`) adjusted p-values (q-values) over the family; `significant = (p_value_adjusted <= α)` — equivalent to the BH step-up rejection set (largest `k` with `p_(k) <= (k/m)·α`; reject all `<= k`). q-values are monotone non-decreasing in rank and clamped `<= 1`. Prefer `scipy.stats.false_discovery_control(ps, method="bh"|"by")` when the installed scipy provides it, else a correct hand-rolled BH/BY. Degenerate rows keep `significant_raw=false`/`significant=false`/`p_value=1.0`/`p_value_adjusted=1.0` and are **excluded from `m`**. **The CI is not a second gate and may legitimately disagree** with either flag — do not reconcile.
 
 **Test / acceptance criteria.** *(pure / offline)*
 - **Seeded determinism:** same `seed` → byte-identical `delta_ci_lo/high` across repeated runs; different seed → (generally) different CI; recorded B=10000 honored.
 - **Degenerate sets:** empty paired set and all-zero deltas each produce the exact §8.1-table outputs **without** calling scipy (assert via monkeypatch/spy that the bootstrap/test is never invoked).
-- **Holm:** a hand-constructed family of raw p-values verifies step-down reject/retain (including the "first failure stops the sequence" behavior) and that `significant` matches.
-- **CI vs significant may disagree:** a constructed case where an unadjusted CI excludes 0 but Holm retains (and vice versa) — assert no exception, both reported as designed.
+- **FDR (BH):** a hand-constructed family of raw p-values verifies the BH step-up rejection set (largest `k` with `p_(k) <= (k/m)·α`; reject all `<= k`) and the BH adjusted q-values (monotone non-decreasing in rank, clamped `<= 1`, and `significant == (q <= α)`). Show a case where `significant_raw=true` but FDR `significant=false`, and a case where both are true (BH more powerful than FWER but still corrects). **BY:** on the same family, BY rejections are a subset-or-equal of BH rejections (more conservative).
+- **CI vs significant may disagree:** a constructed case where an unadjusted CI excludes 0 while the FDR decision may retain (and vice versa) — assert no exception, both reported as designed.
 - Per-metric pairing excludes `NaN` queries (recall on `R==0`; avg/ndcg/precision on `n_scored==0`); Wilcoxon zero/tie params are passed through and recorded.
 
-**Developer / reviewer responsibilities.** Developer implements per §8.1–§8.3. Reviewer verifies the short-circuits fire *before* scipy, the seeded RNG is `default_rng(seed)`, Holm is on raw p, and that no "adjusted alpha" or CI-as-gate logic sneaks in.
+**Developer / reviewer responsibilities.** Developer implements per §8.1–§8.3. Reviewer verifies the short-circuits fire *before* scipy, the seeded RNG is `default_rng(seed)`, the FDR correction (BH/BY) is on raw p over the non-degenerate family, `significant_raw` is the per-test raw decision, and that no CI-as-gate logic sneaks in.
 
-**User sign-off gate.** Inspect the Holm step-down test, the seeded-CI determinism test, and the degenerate-set table assertions. Approve → **commit on user consent only.**
+**User sign-off gate.** Inspect the BH step-up / q-value test, the raw-vs-FDR significance test, the seeded-CI determinism test, and the degenerate-set table assertions. Approve → **commit on user consent only.**
 
 ---
 
@@ -304,18 +304,18 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **Exact headers / field order (do not rename/reorder):**
   - result → `query_id,product_id,score,position`
   - metrics → `query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing`
-  - comparison → `variant,metric,delta,delta_ci_lo,delta_ci_high,significant,p_value`
+  - comparison → `variant,metric,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant` (9 columns)
 - **`position` derived** as the 1-based index into `RankedResult.docs` at write time (§3.1, §9); ≤ `top_k` rows/query.
-- **Any of the FOUR metric cells `NaN` → empty field** (two adjacent commas, no quoting) per §7/§9: `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored==0`, `recall@10` empty when `R==0`. `n_scored`/`n_missing` are non-negative ints, **ALWAYS present** (never empty). `significant` ∈ {`true`,`false`} lowercase.
-- **Degenerate comparison rows (§8.1/§9):** empty paired set → `delta`/CI cells empty, `p_value=1.0`, `significant=false`; all-zero → `0.0`/`0.0`/`0.0`, `p_value=1.0`.
-- `write_run_config` serializes the fully-resolved config + seed per §9.1 (expanded variants incl. any selected k, selection metric + `hybrid_rerank_selection_bias` flag, B, fixed CI level 2.5/97.5, α, family size m, correction, test + zero/tie params, degenerate notes, dataset/ES/endpoint versions, cutoff, seed). **No per-test adjusted alpha** (Holm defines none).
+- **Any of the FOUR metric cells `NaN` → empty field** (two adjacent commas, no quoting) per §7/§9: `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored==0`, `recall@10` empty when `R==0`. `n_scored`/`n_missing` are non-negative ints, **ALWAYS present** (never empty). `significant_raw`/`significant` ∈ {`true`,`false`} lowercase; `p_value`/`p_value_adjusted` are numeric.
+- **Degenerate comparison rows (§8.1/§9):** empty paired set → `delta`/CI cells empty, `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`; all-zero → `0.0`/`0.0`/`0.0`, `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`.
+- `write_run_config` serializes the fully-resolved config + seed per §9.1 (expanded variants incl. any selected k, selection metric + `hybrid_rerank_selection_bias` flag, B, fixed CI level 2.5/97.5, `α` as both the raw threshold and the FDR level q, family size m, correction (`bh`/`by`), test + zero/tie params, degenerate notes, dataset/ES/endpoint versions, cutoff, seed). The BH/BY q-values are emitted per test in the comparison CSV (`p_value_adjusted`).
 
 **Test / acceptance criteria.** *(pure / offline, golden files)*
 - **Exact headers** for all three CSVs asserted byte-for-byte against committed golden files (the metrics header includes the trailing `n_scored,n_missing` columns).
 - **position derivation:** `docs[0]` → `position=1`, ascending; ≤ `top_k` rows.
 - **NaN metric empty cells:** a `NaN` value in ANY of the four metric columns serializes as an empty field (golden row shows two adjacent commas); `n_scored`/`n_missing` are always written as integers.
 - **Degenerate rows** serialize exactly per the §8.1 table.
-- **run_config JSON** round-trips and contains every §9.1 field (and omits any "adjusted alpha").
+- **run_config JSON** round-trips and contains every §9.1 field (correction is `bh`/`by`; `α` recorded as both the raw threshold and the FDR level q).
 
 **Developer / reviewer responsibilities.** Developer implements writers + golden fixtures. Reviewer diffs headers char-for-char against §9 and CLAUDE.md, and checks the NaN→empty and degenerate serializations.
 
@@ -426,7 +426,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **One `run_one` path for every variant — baseline included** (DRY guarantee, §8.0): R0 register reranker if `reranker_id` and `assert v.window <= ep.task_settings["top_n"]`; `spec_for`; `pipeline.run` over the **frozen shared query set**; `write_result_csv`; `Evaluator.score_run`; `write_metrics_csv`; stash per-query vectors keyed by `v.id`.
 - **Baseline materialized first** (§6) so every comparison has its paired reference in memory.
 - **§8.0a phase** runs only when `hybrid_rerank_k == "best_per_model"`, after all static variants, feeding selected `VariantCfg`s through the **same** `run_one`.
-- **Comparator pass (family-wide, §8.0/§8.3):** collect the baseline's per-query metric maps and ALL non-baseline variants' maps (adapt `Metrics` → plain `{metric: value}` via `Metrics.as_dict()`, since `stats` consumes maps, not `Metrics`), call `Comparator(cfg.stats).compare(baseline_maps, variant_maps)` **once** so Holm is applied across the whole `(variant × metric)` family, then group the returned rows by variant and `write_comparison_csv` one `comparison_bm25_{variant}_*` per variant; then `write_run_config`.
+- **Comparator pass (family-wide, §8.0/§8.3):** collect the baseline's per-query metric maps and ALL non-baseline variants' maps (adapt `Metrics` → plain `{metric: value}` via `Metrics.as_dict()`, since `stats` consumes maps, not `Metrics`), call `Comparator(cfg.stats).compare(baseline_maps, variant_maps)` **once** so the FDR correction (BH/BY) is applied across the whole `(variant × metric)` family, then group the returned rows by variant and `write_comparison_csv` one `comparison_bm25_{variant}_*` per variant; then `write_run_config`.
 - `--dry-run` prints the expanded variant list and runs nothing (README).
 
 **Test / acceptance criteria.** *(requires dockerized ES ≥ 8.15; small subset)*

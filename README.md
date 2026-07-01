@@ -86,7 +86,7 @@ Every variant is a `PipelineSpec` row of a config-driven matrix — there is no 
 │   ├── fusion.py              # fuse_rrf_local (harness-side fallback)
 │   ├── rerank.py              # rerank_local (harness-side fallback)
 │   ├── metrics.py             # Evaluator, Metrics, QrelIndex
-│   ├── stats.py               # Comparator (bootstrap CI, Wilcoxon/permutation, Holm)
+│   ├── stats.py               # Comparator (bootstrap CI, Wilcoxon/permutation, FDR/BH-BY)
 │   ├── matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), VariantCfg, ResolvedConfig
 │   ├── runner.py              # ExperimentRunner — the single execution path
 │   ├── io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
@@ -291,7 +291,7 @@ One row per query. Metrics use **condensed-list** evaluation: a returned doc wit
 ### `comparison_{baseline}_{variant}_{timestamp}.csv`
 
 ```
-variant,metric,delta,delta_ci_lo,delta_ci_high,significant,p_value
+variant,metric,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
 ```
 
 One row per metric ∈ {`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`}.
@@ -299,9 +299,11 @@ One row per metric ∈ {`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`}
 - `delta` — mean paired difference (variant − baseline) over the shared query set.
 - `delta_ci_lo` / `delta_ci_high` — the **per-comparison, unadjusted 2.5/97.5 percentile bootstrap interval**. This is effect-size context only; it is **not** a significance gate.
 - `p_value` — the **raw** (uncorrected) Wilcoxon signed-rank (or permutation) p-value.
-- `significant` ∈ {`true`,`false`} — the **Holm–Bonferroni** decision over the family of all `(variant × metric)` tests in the run, at family `α = 0.05`.
+- `significant_raw` ∈ {`true`,`false`} — the **uncorrected** per-test decision (`p_value <= α`), independent of the family.
+- `p_value_adjusted` — the **FDR-adjusted p-value (q-value)**: Benjamini-Hochberg by default (Benjamini-Yekutieli if `correction: by`), computed over the family of all `(variant × metric)` tests in the run.
+- `significant` ∈ {`true`,`false`} — the **FDR decision** (`p_value_adjusted <= α`) over that family, at level `q = α = 0.05`.
 
-> The CI and `significant` live in different roles and **may disagree** — this is expected under family-wise-error control (see §8.3 of the design doc). The CI is descriptive; `significant` is the only gate.
+> The CI lives in a different role from the significance flags and **may disagree** with them — this is expected under a step-up FDR procedure (see §8.3 of the design doc). The CI is descriptive; `significant` is the FDR gate, `significant_raw` is the uncorrected view. The design uses FDR (not FWER/Holm) because this is an **exploratory** search for the best pipeline among many **correlated** configurations, where the cost of a false positive is low and asymmetric and BH keeps far more power than Bonferroni-style FWER.
 
 ### `run_config_{timestamp}.json`
 
@@ -341,8 +343,10 @@ rerankers:                              # → *_rerank ; top_n is a TASK setting
       task_settings:    { top_n: 100 } }
 rrf_k_sweep: [10,20,30,40,50,60,70,80,90,100]   # → hybrid
 variants:  [bm25, semantic, hybrid, bm25_rerank, semantic_rerank, hybrid_rerank]
-stats:     { bootstrap_B: 10000, ci_level: 0.95, alpha: 0.05, correction: holm, test: wilcoxon,
+stats:     { bootstrap_B: 10000, ci_level: 0.95, alpha: 0.05, correction: bh, test: wilcoxon,
              wilcoxon_zero_method: wilcox, wilcoxon_correction: true, seed: 1234 }
+             # correction: bh = Benjamini-Hochberg FDR (default); by = Benjamini-Yekutieli
+             # (conservative, arbitrary-dependence). alpha is BOTH the raw threshold AND the FDR level q.
 hybrid_rerank_k: 60                     # fixed int (default, unbiased) | best_per_model (opt-in, biased)
 ```
 
