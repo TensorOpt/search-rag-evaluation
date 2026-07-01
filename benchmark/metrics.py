@@ -1,7 +1,7 @@
 """Evaluator, Metrics, and QrelIndex over graded relevance (docs/experiment.md §7). Phase 2.
 
 Per-query metrics at cutoff k=10, computed once and returned in memory keyed by ``query_id``
-so §8 statistics and the §8.0a ``best_per_model`` selection reuse them without re-parsing CSV.
+so §8 statistics reuse them without re-parsing CSV.
 
 **Missing-judgement policy — condensed-list evaluation (§7, Sakai).** A returned doc that has a
 qrel entry uses its float gain (``0.0``/``0.5``/``1.0``); a returned doc with NO qrel entry has

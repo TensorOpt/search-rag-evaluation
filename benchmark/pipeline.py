@@ -2,14 +2,14 @@
 
 Everything that produces a ranked list is a ``Searcher`` (§3.3). The three concrete composers
 here wire leaf ``Searcher``s (the ES-specific ``LexicalSearcher``/``VectorSearch``, Phase 9/10)
-into the six variants as object graphs — no declarative spec layer, no per-variant branching:
+into the six retrieval shapes as object graphs — no declarative spec layer, no per-variant branching:
 
 - ``RRFFuser``     — a ``Fuser`` that reciprocal-rank-fuses result lists client-side (§3.7).
 - ``HybridSearch`` — a ``Searcher`` that runs N retrievers and fuses their lists client-side.
 - ``SearchPipeline`` — the top-level ``Searcher``: an optional rerank pass over a retriever.
 
 Imports only ``benchmark.models`` / ``benchmark.protocols`` / ``benchmark.fusion`` + stdlib —
-never adapters, ``matrix``, or numpy (§11). ``spec_for`` (``VariantCfg`` -> ``SearchPipeline``
+never adapters, ``matrix``, or numpy (§11). ``build_pipeline`` (``PipelineCfg`` -> ``SearchPipeline``
 object graph) lives in ``matrix.py`` (Phase 6), not here, to avoid a pipeline->matrix forward
 dependency (§4).
 """

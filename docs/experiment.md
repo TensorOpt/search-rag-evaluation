@@ -15,26 +15,29 @@ Build a **reproducible search-relevance benchmark harness** that measures, for a
 - **Baseline ranker:** BM25.
 
 ### 1.2 Variants under test
-Each variant is scored **against the BM25 baseline**:
+Each variant is scored **against the BM25 baseline**. These are the six *conceptual* retrieval
+shapes; they are realized as **explicit named pipelines** the user writes in the config (§10) — there
+is **no matrix expansion and no sweep**. A user who wants two embedding models or two RRF `k` values
+writes two named pipelines by hand.
 
-| # | Variant | One-line description |
-|---|---------|----------------------|
+| # | Strategy | One-line description |
+|---|----------|----------------------|
 | 0 | `bm25` (baseline) | Lexical BM25 over text fields. |
-| 1 | `semantic` | Dense/sparse vector retrieval. Pluggable across multiple embedding models. |
-| 2 | `hybrid` | RRF fusion of BM25 + semantic. Sweep `rank_constant` k ∈ {10,20,…,100}. |
-| 3 | `bm25_rerank` | BM25 candidates → rerank. Pluggable rerankers. |
-| 4 | `semantic_rerank` | Semantic candidates → rerank. Pluggable rerankers. |
-| 5 | `hybrid_rerank` | RRF(BM25, semantic) → rerank. Pluggable rerankers. |
+| 1 | `semantic` | Dense/sparse vector retrieval, over a chosen embedder. |
+| 2 | `hybrid` | RRF fusion of BM25 + semantic at a chosen `rank_constant`. |
+| 3 | `bm25_rerank` | BM25 candidates → rerank. |
+| 4 | `semantic_rerank` | Semantic candidates → rerank. |
+| 5 | `hybrid_rerank` | RRF(BM25, semantic) → rerank. |
 
 ### 1.3 Scope (in / out)
-- **In:** offline ranking quality on a static qrel set; ES inference endpoints; config-driven sweeps; statistical comparison vs baseline; reproducible artifacts.
+- **In:** offline ranking quality on a static qrel set; ES inference endpoints; explicit config-driven named pipelines; statistical comparison vs baseline; reproducible artifacts.
 - **Out:** online A/B testing, latency/throughput SLAs, query rewriting, learning-to-rank training, click models. (Latency *may* be logged as a secondary observation but is not a success criterion.)
 
 ### 1.4 Success criteria
 1. **Correctness:** all three CSV artifact types are produced with the exact schemas in §9, for every variant in the matrix; the statistics follow one coherent multiple-comparison regime (FDR) (§8.3).
-2. **Reproducibility:** a single config + captured seed reproduces identical metrics and statistics (modulo backend nondeterminism, pinned per §9.1). This includes the `hybrid_rerank` k-selection: when `best_per_model` is used, the selection is a deterministic function of this run's in-memory hybrid metrics (§8.0a), so the same config + seed yields the same chosen k.
+2. **Reproducibility:** a single config + captured seed reproduces identical metrics and statistics (modulo backend nondeterminism, pinned per §9.1). Pipelines are fully explicit in the config, so the set of runs is exactly what the file declares — there is no expansion or data-dependent selection to reproduce.
 3. **Generality:** swapping WANDS→another dataset, or ES→another backend, requires only a new adapter + config — **no edits to pipeline, evaluator, or stats code** (verified by §11 checklists). Edge cases that only a different dataset can trigger (e.g. all-zero or empty paired sets, §8.1) have defined, dataset-independent behavior.
-4. **DRY:** the 6 variants share **one** pipeline implementation and **one** execution path; they differ only by configuration (verified by code inspection — variants are config rows, not modules). See §4 and §8.
+4. **DRY:** every named pipeline shares **one** pipeline implementation and **one** execution path; they differ only by configuration (verified by code inspection — pipelines are config entries, not modules). See §4 and §8.
 
 ---
 
@@ -45,8 +48,8 @@ flowchart LR
   DS[Dataset] -->|documents + field_schema| IDX[Indexer]
   IDX --> BK[(SearchBackend / Index)]
   DS -->|queries| HARNESS[ExperimentRunner]
-  CFG[Config / Matrix] --> HARNESS
-  HARNESS -->|SearchPipeline object graph per variant| PIPE[SearchPipeline]
+  CFG[Config: explicit named pipelines] --> HARNESS
+  HARNESS -->|SearchPipeline object graph per named pipeline| PIPE[SearchPipeline]
   PIPE -->|search per query| BK
   PIPE --> RUN[Run: ranked results -> result CSV]
   DS -->|qrels| EVAL[Evaluator]
@@ -62,7 +65,7 @@ flowchart LR
 | **Document** | A retrievable item: `doc_id` + a typed field bag. For WANDS, a product. |
 | **Qrel** | A graded judgement `(query_id, doc_id) → gain` (a float). WANDS: `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. |
 | **Run** | The ranked output of one variant over **all** queries: ordered `(query_id, doc_id, score, position)`. |
-| **Variant** | A named, fully-expanded pipeline configuration (a row of the experiment matrix). |
+| **Variant** | A named pipeline declared explicitly in the config (§10) — one `pipelines.variants` entry, run and compared against the baseline. No matrix expansion. |
 | **Searcher** | Anything that turns a query into a ranked list: `search(query, *, top_k) -> [ScoredDoc]`. Leaf retrievers, `HybridSearch`, and the top-level `SearchPipeline` are all `Searcher`s (§3.3). |
 | **Fuser** | Combines several ranked lists into one, client-side: `fuse(result_lists, *, rank_window_size)`. `RRFFuser` wraps `fuse_rrf_local` (§3.7). |
 | **Reranker** | Behavioral: rescores + reorders a candidate list for a query, client-side: `rerank(query, candidates) -> [ScoredDoc]` (§3.4). |
@@ -270,7 +273,7 @@ class Reranker(ABC):                       # BEHAVIORAL — rescores at query ti
     def rerank(self, query: str, candidates: Sequence[ScoredDoc]) -> list[ScoredDoc]: ...
 ```
 
-`EmbeddingModel` **stays a descriptor**: embeddings are registered once at ingest via `register_inference(endpoint)` → `PUT _inference/{task_type}/{inference_id}` and then produced by the backend at index time. The config (§10) constructs the `InferenceEndpoint` directly; a `ConfigInferenceModel` dataclass implements the `EmbeddingModel` descriptor — no per-service adapter class.
+`EmbeddingModel` **stays a descriptor**: embeddings are registered once at ingest via `register_inference(endpoint)` → `PUT _inference/{task_type}/{inference_id}` and then produced by the backend at index time. The config (§10) constructs the `InferenceEndpoint` directly; an `EmbedderCfg` service entry (§10) implements the `EmbeddingModel` descriptor via `as_endpoint()` — no per-service adapter class.
 
 `Reranker` is now **behavioral** (§3.3): a concrete reranker (e.g. ES `ESReranker`) is constructed from its endpoint id + a doc-text lookup and, inside `rerank(query, candidates)`, calls the `_inference` rerank endpoint over the candidate doc-text and returns the reordered list (via the `rerank_local` helper, §3.7). The reranker endpoint is still registered through `register_inference` (lazily at run time, §8 R0).
 
@@ -293,7 +296,7 @@ class Indexer(Protocol):
               embeddings: Sequence[EmbeddingModel]) -> "IndexMapping": ...
 ```
 
-**What `IndexMapping` is for.** It is the value returned by `Indexer.build(...)` and is the **single source of truth for the concrete field names each leaf `Searcher` must query**. The composers are dataset- and backend-agnostic, so nothing upstream knows that ES named the semantic field for model `elser` `"sem__elser"`; `IndexMapping` hands it those names. `spec_for(v, mapping, factory)` (§4) reads exactly two things from it — `mapping.search_text_field` (the lexical target) and `mapping.sem_field(model_id)` (the semantic field for a given embedding model) — to build the leaf `Searcher`s without re-deriving any backend-specific naming. `backend_mapping` is the raw ES mapping body used to create the index (§5.2); `index_name` is where documents land.
+**What `IndexMapping` is for.** It is the value returned by `Indexer.build(...)` and is the **single source of truth for the concrete field names each leaf `Searcher` must query**. The composers are dataset- and backend-agnostic, so nothing upstream knows that ES named the semantic field for model `elser` `"sem__elser"`; `IndexMapping` hands it those names. `build_pipeline(pcfg, services, mapping, factory)` (§4) reads exactly two things from it — `mapping.search_text_field` (the lexical target) and `mapping.sem_field(embedder)` (the semantic field for a given embedder) — to build the leaf `Searcher`s without re-deriving any backend-specific naming. `backend_mapping` is the raw ES mapping body used to create the index (§5.2); `index_name` is where documents land.
 
 **Worked example** (the WANDS index built for the three §5.2 models):
 
@@ -354,7 +357,7 @@ class SearchPipeline(Searcher):
         return self.reranker.rerank(query, candidates)[:top_k]
 ```
 
-**The six variants as object graphs** (built by `spec_for` in Phase 6, §4):
+**The six strategies as object graphs** (built by `build_pipeline` in Phase 6, §4):
 
 ```python
 bm25            = SearchPipeline(retriever=LexicalSearcher(...))
@@ -407,42 +410,46 @@ def rerank_local(query: Query, candidates: Sequence[ScoredDoc], *,
 
 ## 4. Variants as Object Compositions (DRY)
 
-Every variant is a **`SearchPipeline` object graph** built from the same composers (§3.6). No variant has bespoke code; the matrix (§10) provides the `VariantCfg`, and `spec_for` builds the graph.
+Every variant is a **`SearchPipeline` object graph** built from the same composers (§3.6). No variant has bespoke code; the config (§10) declares each pipeline explicitly as a `PipelineCfg`, and `build_pipeline` assembles the graph. There is **no matrix expansion** — the pipelines run are exactly the ones written in the config.
 
-> `spec_for` lives in **`matrix.py`** (§11) and is built in **Phase 6**, not with the pipeline: it maps a `VariantCfg` → a `SearchPipeline`, so keeping it in `matrix.py` avoids a `pipeline`→`matrix` forward dependency. `pipeline.py` (Phase 5) defines only the composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`). `spec_for` takes a `searcher_factory` that builds the backend-specific leaf `Searcher`s / `Reranker` (the ES `LexicalSearcher`/`VectorSearch`/`ESReranker` land in Phase 9/10) so `matrix.py` stays backend-agnostic. The sketch below is illustrative.
+> `build_pipeline` lives in **`matrix.py`** (§11 — historical filename; it is now the pipeline-assembly module) and is built in **Phase 6**, not with the pipeline: it maps a `PipelineCfg` → a `SearchPipeline`, so keeping it in `matrix.py` avoids a `pipeline`→`matrix` forward dependency. `pipeline.py` (Phase 5) defines only the composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`). `build_pipeline` takes a `searcher_factory` that builds the backend-specific leaf `Searcher`s / `Reranker` (the ES `LexicalSearcher`/`VectorSearch`/`ESReranker` land in Phase 9/10) and the typed `Services` registry (§10) so `matrix.py` stays backend-agnostic. The six strategies below are the conceptual shapes; each is an *example a user writes* as a named pipeline, not something auto-expanded.
 
-| Variant | retriever graph | reranker |
-|---------|-----------------|----------|
+| Strategy | retriever graph | reranker |
+|----------|-----------------|----------|
 | `bm25` (baseline) | `LexicalSearcher(search_text)` | — |
-| `semantic` | `VectorSearch(sem_field[m])` | — |
+| `semantic` | `VectorSearch(sem_field[embedder])` | — |
 | `hybrid` | `HybridSearch([Lexical, Vector], RRFFuser(k), W)` | — |
 | `bm25_rerank` | `LexicalSearcher` | `ESReranker(r), rerank_window_size=W` |
-| `semantic_rerank` | `VectorSearch(sem_field[m])` | `ESReranker(r), rerank_window_size=W` |
-| `hybrid_rerank` | `HybridSearch([Lexical, Vector], RRFFuser(k_resolved), W)` | `ESReranker(r), rerank_window_size=W` |
+| `semantic_rerank` | `VectorSearch(sem_field[embedder])` | `ESReranker(r), rerank_window_size=W` |
+| `hybrid_rerank` | `HybridSearch([Lexical, Vector], RRFFuser(k), W)` | `ESReranker(r), rerank_window_size=W` |
 
 ```python
-def spec_for(v: VariantCfg, mapping: IndexMapping, factory: SearcherFactory) -> SearchPipeline:
-    retrievers: list[Searcher] = []
-    if v.use_bm25:
-        retrievers.append(factory.lexical(fields=[mapping.search_text_field]))
-    if v.embedding_model_id:
-        retrievers.append(factory.vector(field=mapping.sem_field(v.embedding_model_id)))
+def build_pipeline(pcfg: PipelineCfg, services: Services,
+                   mapping: IndexMapping, factory: SearcherFactory) -> SearchPipeline:
+    leaves: list[Searcher] = []
+    for name in pcfg.retrievers:                      # each name is a searcher SERVICE (§10)
+        searcher = services.searcher(name)
+        if searcher.kind == "lexical":
+            leaves.append(factory.lexical(fields=[mapping.search_text_field]))
+        else:                                          # "vector" -> resolve its embedder service
+            embedder = services.embedder(searcher.embedder)
+            leaves.append(factory.vector(field=mapping.sem_field(embedder.name)))
 
-    if v.fuse:
-        retriever: Searcher = HybridSearch(retrievers=retrievers,
-                                           fuser=RRFFuser(rank_constant=v.rrf_k),
-                                           retrieval_window_size=v.window)
+    if pcfg.fuser is not None:                         # 2+ retrievers require a fuser (§10)
+        retriever: Searcher = HybridSearch(retrievers=leaves,
+                                           fuser=RRFFuser(rank_constant=pcfg.fuser.rank_constant),
+                                           retrieval_window_size=pcfg.fuser.window)
     else:
-        (retriever,) = retrievers            # exactly one leaf when not fusing
+        (retriever,) = leaves                          # exactly one leaf when not fusing
 
-    if v.reranker_id:
+    if pcfg.reranker is not None:
         return SearchPipeline(retriever=retriever,
-                              reranker=factory.reranker(v.reranker_id, mapping.search_text_field),
-                              rerank_window_size=v.window)
+                              reranker=factory.reranker(pcfg.reranker, mapping.search_text_field),
+                              rerank_window_size=pcfg.rerank_window_size)
     return SearchPipeline(retriever=retriever)
 ```
 
-> The `hybrid` k-sweep and `hybrid_rerank` reuse the *same* composition; they differ only in `RRFFuser`'s `rank_constant` and the presence of a reranker. Adding "semantic+rerank" costs zero new pipeline code — only a matrix row. For `hybrid_rerank`, `v.rrf_k` is already resolved to a concrete integer before `spec_for` is called (a fixed literal, or the best-per-model k chosen in §8.0a) — `spec_for` never performs selection.
+> All six shapes reuse the *same* composition; they differ only in how many retrievers a pipeline lists, `RRFFuser`'s `rank_constant`, and whether a reranker is set. Adding "semantic+rerank" costs zero new pipeline code — only a named `pipelines.variants` entry. `pcfg.fuser.rank_constant` is a concrete integer read straight from the config — `build_pipeline` never performs any selection.
 
 > The reranker's field argument is `mapping.search_text_field` — `IndexMapping` (§3.5) carries only `search_text_field`/`sem_fields`, and §5.3 fixes `search_text` as the ES rerank field (`FieldSchema.rerank_field` also defaults to it). If a dataset ever needs a distinct rerank field, add `rerank_field` to `IndexMapping` and read it here.
 
@@ -520,25 +527,21 @@ Each retriever is realized as its **own ES query** and returns a materialized `l
 ```mermaid
 flowchart TD
   A[1. Dataset.load -> queries, documents, qrels, field_schema] --> B[2. Indexer.build -> register embed endpoints, ensure_index, bulk_index -> IndexMapping]
-  B --> C[3. Matrix expand -> static variants incl. baseline; hybrid_rerank deferred if best_per_model]
-  C --> D{for each static variant}
+  B --> C[3. Read explicit pipelines from config: baseline + named variants, baseline first]
+  C --> D{for each named pipeline}
   D --> E[3a. register reranker endpoint if needed - R0, set+assert task_settings.top_n >= W]
-  E --> F[3b. spec_for -> SearchPipeline graph; pipeline.search per query over ALL queries]
+  E --> F[3b. build_pipeline -> SearchPipeline graph; pipeline.search per query over ALL queries]
   F --> G[4. write result_variant_ts.csv: query_id,product_id,score,position]
   G --> H[5. Evaluator.score per query -> write metrics_variant_ts.csv]
   H --> I[(per-query metric vectors held in memory keyed by query_id)]
-  D --> P[3c. if best_per_model: select best k per model from hybrid metrics; expand+run hybrid_rerank now]
-  I --> P
-  P --> J[after all variants done]
-  I --> J
-  J --> K[6. Comparator: ONE family-wide compare of ALL non-baseline variants vs baseline over SAME query set, FDR/BH across the family -> split rows per variant -> comparison_bm25_variant_ts.csv each]
+  I --> J[after all pipelines done]
+  J --> K[6. Comparator: ONE family-wide compare of ALL variant pipelines vs baseline over SAME query set, FDR/BH across the family -> split rows per variant -> comparison_bm25_variant_ts.csv each]
   K --> L[7. write run_config_ts.json]
 ```
 
 Concrete materialization rules:
 - **Result CSV** (step 4): for each `RankedResult`, write one row per `ScoredDoc`, `position = 1-based index`, `score = ScoredDoc.score`. At most `top_k` rows per query.
-- **Per-query metrics** (step 5): the Evaluator joins each `RankedResult` to qrels by `query_id` (qrels indexed once into `dict[query_id, dict[doc_id, gain]]`), computes the four metrics (§7), writes one row per query, **and** returns the per-query vectors in memory keyed by `query_id` for the Comparator and for the `best_per_model` selection (so metrics are computed once, not re-derived from CSV).
-- **best_per_model resolution** (step 3c, only when `hybrid_rerank_k: best_per_model`): see §8.0a. This is an explicit phase that runs *after* all `hybrid` variants are scored and *before* `hybrid_rerank` specs are built — closing the v2 ordering gap where the single `expand_matrix` call could not know the best k.
+- **Per-query metrics** (step 5): the Evaluator joins each `RankedResult` to qrels by `query_id` (qrels indexed once into `dict[query_id, dict[doc_id, gain]]`), computes the four metrics (§7), writes one row per query, **and** returns the per-query vectors in memory keyed by `query_id` for the Comparator (so metrics are computed once, not re-derived from CSV).
 - **Comparison** (step 6): runs only after all runs' metric vectors exist; a **single** `Comparator.compare(baseline_maps, variant_maps)` call pairs each variant against the baseline on the **identical query set** (§8.1) and applies the **FDR (BH/BY) correction family-wide** across all `(variant, metric)` tests (§8.3), then the returned rows (each carrying both raw and FDR-adjusted significance) are grouped by variant and written one `comparison_bm25_{variant}_{ts}.csv` each.
 
 The baseline (`bm25`) is always materialized first so every later comparison has its paired reference in memory.
@@ -586,44 +589,37 @@ Two per-query counts are recorded:
 class ExperimentRunner:
     def run(self, cfg: ResolvedConfig) -> None:
         dataset = load_dataset(cfg.dataset)
-        backend = make_backend(cfg.backend)          # ingest seam (register/ensure_index/bulk_index)
-        mapping = Indexer().build(dataset, backend, cfg.embedding_models)
-        factory = make_searcher_factory(cfg.backend) # builds leaf Searcher/Reranker (ES: Lexical/Vector/ESReranker)
+        indexer = make_indexer(cfg.indexer)          # ingest seam (register/ensure_index/bulk_index)
+        mapping = Indexer().build(dataset, indexer, [e for e in cfg.services.embedders.values()])
+        factory = make_searcher_factory(cfg.indexer) # builds leaf Searcher/Reranker (ES: Lexical/Vector/ESReranker)
         queries = list(dataset.queries())            # frozen, shared query set
         qrels   = QrelIndex(dataset.qrels())
 
-        # static variants: everything whose spec is fully known up front
-        # (bm25, semantic, hybrid, bm25_rerank, semantic_rerank, and hybrid_rerank
-        #  IFF hybrid_rerank_k is a fixed literal). baseline first (§10).
-        static_variants = expand_matrix(cfg)
+        # The pipelines are exactly what the config declares — baseline first, then the named
+        # variants in config order (§10). No expansion, no sweep, no selection phase.
         per_query: dict[str, dict[str, Metrics]] = {}
 
-        def run_one(v: VariantCfg) -> None:
-            if v.reranker_id:                        # R0: lazy reranker endpoint
-                ep = cfg.reranker_endpoint(v.reranker_id)
-                backend.register_inference(ep)       # emits service_settings + task_settings
-                assert v.window <= ep.task_settings["top_n"]   # W <= top_n (§5.3)
-            pipeline = spec_for(v, mapping, factory)         # a SearchPipeline object graph (§4)
+        def run_one(pcfg: PipelineCfg) -> None:
+            if pcfg.reranker:                        # R0: lazy reranker endpoint
+                ep = cfg.services.reranker(pcfg.reranker).as_endpoint()
+                indexer.register_inference(ep)       # emits service_settings + task_settings
+                assert pcfg.rerank_window_size <= ep.task_settings["top_n"]   # W <= top_n (§5.3)
+            pipeline = build_pipeline(pcfg, cfg.services, mapping, factory)   # a SearchPipeline graph (§4)
             results = [
                 RankedResult(q.query_id, pipeline.search(q.text, top_k=cfg.top_k))
                 for q in queries
             ]
-            write_result_csv(v, results, cfg.timestamp)
+            write_result_csv(pcfg, results, cfg.timestamp)
             metrics = Evaluator(qrels).score_run(results)   # per-query vectors
-            write_metrics_csv(v, metrics, cfg.timestamp)
-            per_query[v.id] = metrics
+            write_metrics_csv(pcfg, metrics, cfg.timestamp)
+            per_query[pcfg.id] = metrics
 
-        for v in static_variants:
-            run_one(v)
-
-        # 8.0a — explicit best_per_model phase (only if configured)
-        if cfg.hybrid_rerank_k == "best_per_model":
-            for v in resolve_hybrid_rerank_best_per_model(cfg, per_query):
-                run_one(v)                           # now expanded with concrete k
+        for pcfg in cfg.pipelines():                 # baseline first, then variants
+            run_one(pcfg)
 
         # Comparator pass — ONE family-wide call so the FDR correction (§8.3) is applied across the run.
-        # Collect the baseline's per-query metric maps and ALL non-baseline variants' maps, call
-        # compare() ONCE (it pairs each variant vs the baseline, per metric, computes the RAW per-test
+        # Collect the baseline's per-query metric maps and ALL variant pipelines' maps, call compare()
+        # ONCE (it pairs each variant vs the baseline, per metric, computes the RAW per-test
         # significance, and FDR-corrects the whole family of (variant, metric) tests together — each
         # returned ComparisonResult carries both the raw and the FDR-adjusted significance), then split
         # the returned rows by variant and write one comparison_bm25_{variant}_{ts}.csv each.
@@ -640,24 +636,7 @@ class ExperimentRunner:
             write_comparison_csv(cfg.baseline_id, vid, vrows, cfg.timestamp)
         write_run_config(cfg)
 ```
-Every variant — baseline included — traverses the **identical** `run_one` code path; only `VariantCfg` differs. This is the DRY guarantee, verifiable by inspection. The only structural addition vs a flat loop is the explicit selection phase (§8.0a), which produces more `VariantCfg`s and feeds them through the *same* `run_one`.
-
-### 8.0a `hybrid_rerank` k-selection (resolving the data-flow ordering gap)
-`hybrid_rerank_k` has two modes; the default is a **fixed integer** for a single deterministic expansion pass (see §10), with `best_per_model` as an explicit opt-in two-pass mode:
-
-- **Fixed literal `k`** (default): `hybrid_rerank` is a fully static variant; `expand_matrix` emits it directly with that k. No second phase.
-- **`best_per_model`** (opt-in, two-pass): `expand_matrix` does **not** emit `hybrid_rerank` rows. After all `hybrid` variants have run and been scored, `resolve_hybrid_rerank_best_per_model(cfg, per_query)`:
-  1. For each embedding model `m`, looks at every `hybrid` variant for `m` in the sweep and reads its in-memory metric vectors.
-  2. **Selection metric:** the chosen k for model `m` is `argmax_k (mean over queries of nDCG@10)` for `hybrid__m__k*`. nDCG@10 is the selection metric because it is the graded, position-aware primary.
-  3. **Tie-break:** on equal mean nDCG@10, choose the **smallest** k (smaller `rank_constant` is the more conservative / standard default), then lexicographically smallest variant id as a final guard. This makes selection a deterministic, seed-independent function of the run's metrics (success criterion §1.4(2)).
-  4. Emits one `hybrid_rerank` `VariantCfg` per `(m, reranker)` at the chosen `k`, which `run_one` then executes.
-
-> **Selection-on-the-evaluation-set bias (caveat, recorded in run metadata).** Under `best_per_model`, k is tuned by argmax mean nDCG@10 on the **same** query/qrel set later used to report the `hybrid_rerank` delta and its significance vs baseline. This is selection on the evaluation set: it **optimistically biases the reported `hybrid_rerank` nDCG delta and inflates its apparent significance**, because k was chosen to maximize the very quantity being reported. Consequences and guidance:
-> - For **headline comparisons**, prefer the **fixed-k default** (k is not data-selected, so no optimistic bias).
-> - If `best_per_model` is used for reporting, treat its `hybrid_rerank` row as **exploratory / upper-bound**, or use a **train/test query split** (select k on a held-out query subset, report deltas on the disjoint remainder) to remove the bias.
-> - The runner records, in `run_config_*.json`, that the run used `best_per_model`, the selected k per model, the selection metric, and an explicit `hybrid_rerank_selection_bias: true` flag so downstream readers do not over-interpret the row.
-
-This makes the previously-implicit selection an explicit phase with a defined metric, tie-break, and a recorded bias caveat, present in both §6 and §8.0, so the default config expands and executes as documented.
+Every pipeline — baseline included — traverses the **identical** `run_one` code path; only the `PipelineCfg` differs. This is the DRY guarantee, verifiable by inspection: the runner is a flat loop over the explicit config pipelines with no expansion or selection phase.
 
 ### 8.1 Pairing, point estimate, and empty/degenerate paired sets
 Comparisons are **paired by `query_id`** between a variant and the baseline (`bm25`). For metric `m` and query `q`: `δ_q = m_variant(q) − m_baseline(q)`.
@@ -691,7 +670,7 @@ The CI and the significance decision are deliberately kept in **distinct, clearl
 - **Two significance flags are emitted, in distinct roles.** `significant_raw = (p_value <= α)` is the **uncorrected per-test decision**, computed independently of the family (it does not depend on `m` or the other tests). `significant = (p_value_adjusted <= α)` is the **FDR decision** over the family. Both are written to the CSV so a reader can see the uncorrected discovery and its post-correction fate; because BH is more powerful than Holm/FWER, a test that is `significant_raw` may or may not survive FDR correction, and both outcomes are reported honestly.
 - **Why FDR, not FWER/Holm, is the right regime here.** This is an **exploratory** analysis: the goal is **discovering the best pipeline** among many correlated retrieval configurations and inspecting hybrid-retrieval failure modes — not a confirmatory or clinical test. FDR (control the expected *proportion* of false discoveries among rejections) beats FWER/Holm (control the probability of *any* false rejection) for three reasons:
   1. **Holm/FWER is overly strict for many correlated hypotheses** — it sacrifices power and likely **hides true metric improvements**, causing us to miss the best retrieval configuration.
-  2. **The tests are highly correlated** (e.g. `hybrid+rerank` is inherently correlated with `hybrid` without rerank; the RRF `k`-sweep is correlated across `k`). **Benjamini-Hochberg controls FDR under independence AND positive regression dependence (PRDS)**, which positively-correlated retrieval configs plausibly satisfy — it handles correlation with far more power than Bonferroni-style FWER.
+  2. **The tests are highly correlated** (e.g. `hybrid+rerank` is inherently correlated with `hybrid` without rerank; two hybrid pipelines at different RRF `k` are correlated). **Benjamini-Hochberg controls FDR under independence AND positive regression dependence (PRDS)**, which positively-correlated retrieval configs plausibly satisfy — it handles correlation with far more power than Bonferroni-style FWER.
   3. **The cost of a false positive here is low and asymmetric:** it means provisionally selecting a slightly-suboptimal tuning parameter, which is caught in later A/B testing — not a life-or-death error the Holm-Bonferroni regime is designed for. Missing a real improvement (a false negative) is the more costly error for discovery, so we prefer FDR's power.
 - **Configurable arbitrary-dependence option.** The default is **BH** (`correction: bh`). **Benjamini-Yekutieli (BY)** (`correction: by`) is the conservative alternative that is **valid under arbitrary dependence** (it costs a `log`-factor of power via the `c(m) = Σ_{i=1..m} 1/i` scaling); offer it via config for when PRDS is doubted. Any `correction` other than `bh`/`by` raises `NotImplementedError`.
 - **The CI is *not* a second gate, by design — and may disagree with `significant`.** The reported CI (§8.2) is a per-comparison, unadjusted 2.5/97.5 bootstrap interval used only for effect-size context. Under a **step-up FDR procedure** there is **no simple per-test alpha** that yields a matching interval: a test's rejection depends on the *whole ordered family*, so its unadjusted CI can exclude 0 while it is not FDR-significant (or vice versa) at no shared confidence level tied to the family decision. **Therefore the CI and the `significant` flag are not guaranteed to agree, and disagreement is normal and expected.** We do not attempt to reconcile them; a matching FDR-adjusted-interval regime remains **deferred (§13)**. The CSV documents this: `p_value` is raw, `significant_raw` is the raw per-test decision, `p_value_adjusted` is the BH q-value, `significant` is the FDR decision, and the CI is unadjusted effect-size context.
@@ -701,7 +680,7 @@ The CI and the significance decision are deliberately kept in **distinct, clearl
 
 ## 9. Output Artifacts, Naming, Reproducibility
 
-`{timestamp}` = UTC `YYYYMMDDTHHMMSSZ` of run start (single value for the whole run). `{variant}` = matrix-expanded variant id including model/reranker/k (e.g. `hybrid__e5-small__k60`). `{baseline}` = `bm25`. All CSVs UTF-8, comma-separated, header present. **Field names and order are fixed:**
+`{timestamp}` = UTC `YYYYMMDDTHHMMSSZ` of run start (single value for the whole run). `{variant}` = the pipeline's name from config (its `pipelines.variants` map key, e.g. `hybrid_e5_k60`). `{baseline}` = the baseline pipeline's id (`bm25`/`baseline`). All CSVs UTF-8, comma-separated, header present. **Field names and order are fixed:**
 
 **`result_{variant}_{timestamp}.csv`**
 ```
@@ -722,59 +701,89 @@ variant,metric,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_a
 One row per metric ∈ {`avg_relevance`,`ndcg@10`,`recall@10`,`precision@10`}; `significant` ∈ {`true`,`false`} and `significant_raw` ∈ {`true`,`false`}. `delta_ci_lo/high` are the **per-comparison unadjusted 2.5/97.5 bootstrap interval (effect-size context only, §8.2)**; `p_value` is the **raw** (uncorrected) Wilcoxon (or permutation) p; `significant_raw` is the **uncorrected per-test decision** (`p_value <= α`); `p_value_adjusted` is the **BH (or BY) FDR-adjusted p-value (q-value)** over the family; `significant` is the **FDR decision** (`p_value_adjusted <= α`, §8.3). The CI is in a different role from the significance flags and **may disagree** with them (§8.3). For a degenerate paired set, `delta` and the CI cells are written **empty** (empty paired set) or `0.0` (all-zero deltas) per the §8.1 table, with `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`.
 
 ### 9.1 Reproducibility
-- **Config capture:** the fully-resolved config (expanded variants including any `best_per_model`-selected k, its selection metric, and the `hybrid_rerank_selection_bias` flag; model/reranker ids, k values, W, bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test + its zero/tie params, any degenerate-paired-set notes, dataset version, ES + endpoint versions, cutoff, seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits FDR-adjusted p-values (q-values) per test in the comparison CSV (§9), so — unlike Holm — the adjusted significance is fully materialized.
-- **Seeds:** one master seed feeds the bootstrap and any permutation test; recorded in config. Given the seed, stats are deterministic. The `best_per_model` selection is seed-independent (a deterministic argmax with defined tie-break, §8.0a).
+- **Config capture:** the fully-resolved config (the resolved **services** registry — embedders/rerankers/searchers by name — and the resolved **pipelines**: the baseline plus every named variant with its retrievers/fuser/reranker/window; bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test + its zero/tie params, any degenerate-paired-set notes, dataset version, ES + endpoint versions, cutoff, seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits FDR-adjusted p-values (q-values) per test in the comparison CSV (§9), so — unlike Holm — the adjusted significance is fully materialized.
+- **Seeds:** one master seed feeds the bootstrap and any permutation test; recorded in config. Given the seed, stats are deterministic. There is no data-dependent pipeline selection, so the set of runs depends only on the config file.
 - **Determinism caveats:** ES scoring ties and approximate-kNN introduce nondeterminism. Mitigations: stable tie-break on `doc_id` in each `Searcher.search` (score desc, doc_id asc, §9.1); idempotent indexing (`_id = product_id`); recorded ES/endpoint versions.
 
 ---
 
-## 10. Config-Driven Experiment Matrix
+## 10. Explicit Config
 
-A single YAML/JSON config declares the *axes*; the expander produces the variant list (baseline first) for one run.
+A single YAML/JSON config declares everything as **explicit, named building blocks** — no axes, no
+expander, no sweep. The user reads the config top to bottom and sees exactly which pipelines run.
+The structure is: `dataset` / `services` (named embedders, rerankers, searchers) / `indexer` /
+`pipelines` (one `baseline` + a map of named `variants`) / `stats` / `cutoff` / `top_k`.
 
 ```yaml
-dataset:   { name: wands, path: ./dataset/wands, version: "2022.0" }
-backend:   { kind: elasticsearch, url: ${ES_URL}, index: wands_bench,
-             top_k: 100, rank_window_size: 100, min_es_version: "8.15" }   # 8.15 hard floor (§1.1)
-cutoff:    10
-embedding_models:                       # → semantic / hybrid / *_rerank
-  - { inference_id: e5-small,       service: elasticsearch, task_type: text_embedding,   service_settings: {...} }
-  - { inference_id: elser,          service: elasticsearch, task_type: sparse_embedding,  service_settings: {...} }
-  - { inference_id: openai-3-small, service: openai,        task_type: text_embedding,    service_settings: { api_key: ${OPENAI_KEY}, model_id: text-embedding-3-small } }
-rerankers:                              # → *_rerank
-  # top_n is a TASK setting (rank-window cap), NOT a service setting. service_settings
-  # carries auth/model identity; task_settings carries top_n. (§3.4, §5.3)
-  - { inference_id: cohere-rerank-v3, service: cohere,       task_type: rerank,
-      service_settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5 },
-      task_settings:    { top_n: 100 } }
-  - { inference_id: bge-reranker,     service: hugging_face, task_type: rerank,
-      service_settings: { api_key: ${HF_KEY}, url: ${HF_URL} },
-      task_settings:    { top_n: 100 } }
-rrf_k_sweep: [10,20,30,40,50,60,70,80,90,100]   # → hybrid
-variants:  [bm25, semantic, hybrid, bm25_rerank, semantic_rerank, hybrid_rerank]
-stats:     { bootstrap_B: 10000, ci_level: 0.95, alpha: 0.05, correction: bh, test: wilcoxon,
-             wilcoxon_zero_method: wilcox, wilcoxon_correction: true, seed: 1234 }
-             # ci_level is the UNADJUSTED per-comparison effect-size CI (§8.2); it is NOT a gate.
-             # correction: bh is the FDR (Benjamini-Hochberg) decision, the DEFAULT (§8.3); by =
-             # Benjamini-Yekutieli, the conservative arbitrary-dependence option. alpha is BOTH the
-             # raw per-test threshold AND the FDR level q. The CI stays unadjusted/descriptive and may
-             # disagree with the decision; a matching FDR-adjusted-interval regime is deferred (§13).
-hybrid_rerank_k: 60                     # DEFAULT: a fixed integer (single-pass, fully static; no
-                                        # selection-on-eval-set bias). set to `best_per_model` for the
-                                        # opt-in two-pass mode (§8.0a) — biased, exploratory only.
+dataset:
+  name: wands
+  path: ./dataset/wands
+services:                       # named, typed, reusable building blocks
+  - embedder: { name: e5,     provider: elasticsearch, task_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+  - embedder: { name: cohere, provider: cohere,        task_type: text_embedding, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
+  - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
+  - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
+  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
+  - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
+indexer:
+  provider: elasticsearch
+  index: wands_bench
+  settings: { url: ${ES_URL} }
+pipelines:
+  baseline:                      # the reference every variant is compared against
+    retriever: bm25
+  variants:                      # each is one explicit run; the map key is its id
+    semantic_e5:   { retriever: semantic_e5 }
+    semantic_co:   { retriever: semantic_co }
+    hybrid_e5_k60:
+      retrievers: [bm25, semantic_e5]
+      fuser: { type: rrf, rank_constant: 60, window: 100 }
+    bm25_rerank:
+      retriever: bm25
+      reranker: co-rr
+      rerank_window_size: 100
+    hybrid_e5_rerank:
+      retrievers: [bm25, semantic_e5]
+      fuser: { type: rrf, rank_constant: 60, window: 100 }
+      reranker: co-rr
+      rerank_window_size: 100
+stats:
+  test: wilcoxon
+  correction: bh                 # Benjamini-Hochberg FDR (§8.3, default); by = Benjamini-Yekutieli
+  alpha: 0.05                    # BOTH the raw per-test threshold AND the FDR target level q
+  bootstrap_B: 10000
+  ci_level: 0.95                 # UNADJUSTED per-comparison effect-size CI (§8.2); NOT a gate
+  seed: 1234
+cutoff: 10                       # metrics @10
+top_k: 100                       # results retrieved per query
 ```
 
-**Expansion rules (deterministic order; `bm25` emitted first):**
-- `bm25` → 1 variant (the baseline).
-- `semantic` → one per embedding model.
-- `hybrid` → embedding_models × `rrf_k_sweep`.
-- `bm25_rerank` → one per reranker.
-- `semantic_rerank` → embedding_models × rerankers.
-- `hybrid_rerank`:
-  - If `hybrid_rerank_k` is an **integer** (default): `expand_matrix` emits embedding_models × rerankers at that fixed k — a static, deterministic expansion alongside the others.
-  - If `hybrid_rerank_k: best_per_model`: `expand_matrix` emits **no** `hybrid_rerank` rows; they are produced in the explicit post-hybrid selection phase (§8.0a) at the per-model best k. This keeps `expand_matrix` a pure deterministic function and confines the data dependency to one named phase. Reported deltas for these rows are optimistically biased (§8.0a caveat).
+**Services (`${VAR}` env placeholders resolved at load, secrets never in the file):**
+- **`embedder`** — a named embedding model. `provider` selects the backend adapter; `settings`
+  carries provider knobs (`model_id`, `api_key`, …). Flattens to an embedding `InferenceEndpoint`
+  (`inference_id = name`) the indexer registers at ingest (§3.4/§3.5).
+- **`reranker`** — a named reranker. `top_n` (the rank-window cap) is a **`task_settings`** key
+  (§3.4/§5.3); the rest of `settings` is `service_settings`. Registered lazily at R0 (§8.0).
+- **`searcher`** — a named leaf retriever. `kind` is `lexical` or `vector`; a `vector` searcher
+  references an `embedder` by name.
 
-Each expanded row → a `SearchPipeline` object graph (§4) → one `result_*` + `metrics_*` + `comparison_bm25_*` triple. Each reranker endpoint's `task_settings.top_n` must be `>= rank_window_size` (set + asserted at R0, §8.0 / §5.3).
+**Pipeline field rules (validated at load; a violation raises a clear `ConfigError`, exhaustive — no silent default):**
+- Exactly **one of `retriever`** (a single searcher name) **XOR `retrievers`** (a list of 2+ searcher names).
+- `retrievers` (2+) **requires a `fuser`**; a `fuser` is only allowed with `retrievers`.
+  `fuser: { type: rrf, rank_constant: <int>, window: <int> }` — `type` is exhaustive (only `rrf`
+  today; anything else raises).
+- `reranker` (a reranker service name) **requires `rerank_window_size`**, and vice-versa.
+- Every referenced service name must **exist and be the right type**; a vector searcher must
+  reference an existing embedder.
+- `pipelines.baseline` is the reference; `pipelines.variants` is a map of `id -> pipeline spec`. The
+  run ids are the map keys (baseline id = `baseline`, configurable via `baseline_id`). A variant id
+  that duplicates the baseline id is an error.
+
+Each named pipeline → a `SearchPipeline` object graph (§4, `build_pipeline`) → one `result_*` +
+`metrics_*` + `comparison_bm25_*` triple. Each reranker's `top_n` must be `>= rerank_window_size`
+(asserted at R0, §8.0 / §5.3). **There is no matrix expansion and no k-sweep** — the pipelines run
+are exactly those listed. An optional sweep/expansion helper that would *generate* many pipelines
+from axes is a possible future convenience, deliberately omitted here for config legibility (§13).
 
 ---
 
@@ -789,10 +798,10 @@ benchmark/
   rerank.py              # rerank_local (client-side score+reorder helper, windowed)
   metrics.py             # Evaluator, Metrics, QrelIndex (ndcg/recall/precision/avg_relevance)
   stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, FDR/BH-BY; degenerate-set handling)
-  matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), spec_for(), VariantCfg, ResolvedConfig
+  matrix.py              # PipelineCfg + build_pipeline (assemble a SearchPipeline from an explicit named pipeline); Services/EmbedderCfg/RerankerCfg/SearcherCfg/FuserCfg + ResolvedConfig value types; NO expansion
   runner.py              # ExperimentRunner (the single execution path, §8.0)
   io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
-  config.py              # YAML/JSON load + resolve + ConfigInferenceModel (implements EmbeddingModel descriptor; carries reranker endpoint)
+  config.py              # YAML/JSON load + resolve; owns the services registry + ResolvedConfig; lazy adapter factories (load_dataset / make_indexer / make_searcher_factory)
   logging_setup.py       # cross-cutting: console + file logging (logs/run_{timestamp}.log); use instead of print()
   datasets/
     wands.py             # WandsDataset (implements Dataset; label->gain; search_text concat)
@@ -801,7 +810,7 @@ benchmark/
 docs/experiment.md
 dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
 ```
-`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib; `pipeline` also imports the leaf `fusion`) — never `datasets/*` or `backends/*`. Adapters are selected by `config.py` factories (`load_dataset`, `make_backend`, and the `searcher_factory` that builds leaf `Searcher`/`Reranker`). This enforces success criterion §1.4(3). `resolve_hybrid_rerank_best_per_model` lives in `matrix.py` and operates only on in-memory `Metrics` passed in by `runner.py`, so it adds no adapter dependency. The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
+`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib; `pipeline` also imports the leaf `fusion`; `matrix` imports `pipeline`, the one allowed backward edge, §4) — never `datasets/*` or `backends/*`. `matrix.py` holds the pure resolved-config value types (`Services` registry + `PipelineCfg` + `ResolvedConfig`) and `build_pipeline`; `config.py` parses the §10 YAML into them and owns the lazy adapter factories (`load_dataset`, `make_indexer`, and the `searcher_factory` that builds leaf `Searcher`/`Reranker`). This enforces success criterion §1.4(3). The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
 
 ---
 
@@ -811,19 +820,19 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 
 **Add a dataset:** implement `Dataset` (`queries/documents/qrels/field_schema`, incl. label→gain and `search_text` concat) in `datasets/`, register in `config.py`, set `dataset.name`. The stats layer already defines empty/all-zero paired-set behavior for every metric (§8.1), so a new dataset cannot produce an undefined metric or crash even if some metric is degenerate on every query.
 
-**Add a backend (Vespa, OpenSearch, Qdrant, FAISS, …):** implement (a) the ingest `SearchBackend` (`register_inference`, `ensure_index`, `bulk_index`) + an `Indexer`, and (b) the leaf retrieval seams — a lexical `Searcher`, a vector `Searcher`, and a `Reranker` — in `backends/`, wired through the `searcher_factory`. `HybridSearch` + `RRFFuser` + `SearchPipeline` (client-side, §3.6/§3.7) compose those leaves into `hybrid`/`*_rerank` with no new code, reproducing ES's `rank_window_size` semantics. The `Reranker` uses the `rerank_local` helper. Set `backend.kind`.
+**Add a backend (Vespa, OpenSearch, Qdrant, FAISS, …):** implement (a) the ingest `SearchBackend` (`register_inference`, `ensure_index`, `bulk_index`) + an `Indexer`, and (b) the leaf retrieval seams — a lexical `Searcher`, a vector `Searcher`, and a `Reranker` — in `backends/`, wired through the `searcher_factory`. `HybridSearch` + `RRFFuser` + `SearchPipeline` (client-side, §3.6/§3.7) compose those leaves into `hybrid`/`*_rerank` with no new code, reproducing ES's `rank_window_size` semantics. The `Reranker` uses the `rerank_local` helper. Set `indexer.provider`.
 
-**Add an embedding model:** add an `embedding_models` entry → indexer auto-registers the endpoint, adds a `semantic_text` field + `copy_to` (§5.2), reindex. It auto-joins `semantic`, `hybrid`, `*_rerank` expansions.
+**Add an embedding model:** add an `embedder` service (and a `vector` `searcher` that references it) → the indexer registers the endpoint, adds a `semantic_text` field + `copy_to` (§5.2), reindex. Reference the new searcher from whatever named pipelines you want it in.
 
-**Add a reranker:** add a `rerankers` entry (with `task_settings.top_n >= rank_window_size`) → auto-joins `bm25_rerank`, `semantic_rerank`, `hybrid_rerank`. No code changes.
+**Add a reranker:** add a `reranker` service (with `settings.top_n >= rerank_window_size`) → reference it from the pipelines that should rerank. No code changes.
 
 ---
 
 ## 13. Open Questions / Deferred
-- `hybrid_rerank` k selection: the default is a **fixed integer** (single-pass, unbiased); `best_per_model` is the opt-in two-pass mode (§8.0a) and is **optimistically biased** (selection on the evaluation set). Whether to ship a built-in train/test query split for `best_per_model` reporting, expose alternative selection metrics (e.g. recall@10), or change the tie-break is deferred.
+- **Optional sweep / expansion helper (deliberately omitted):** pipelines are **fully explicit** named config entries (§10) — chosen for legibility, so the config is readable at a glance and the runner is a flat loop with no data-dependent selection. A convenience helper that *generates* many pipelines from axes (e.g. embedding_models × RRF-k) could be added later as pure config sugar that emits explicit `PipelineCfg`s before the run; it is intentionally not shipped, to keep the config transparent and reproducible. If added, any data-dependent auto-selection (e.g. "best k per model" on the eval set) would reintroduce selection-on-the-evaluation-set bias and must be treated as exploratory.
 - **Matching FDR-adjusted interval regime:** **BH-FDR is now the DEFAULT decision** (§8.3), with an unadjusted descriptive CI (§8.2) that may disagree with the flag. What remains **deferred** is a **matching FDR-adjusted confidence-interval regime** (or a max-statistic simultaneous confidence band) so the reported interval and the FDR decision coincide *by construction* rather than living in separate roles — and, possibly, **switching BY to the default** if PRDS proves doubtful for these correlated retrieval configs.
 - **Server-side fusion / rerank as a performance optimization (deferred):** fusion and rerank run **client-side** (§3.6/§3.7) — chosen for simplicity and generality (one composite model, any backend that returns ranked leaf lists composes). ES *can* fuse (`rrf`) and rerank (`text_similarity_reranker`) server-side in a single round trip, which would cut per-query latency; adopting that as an optional fast path (an alternate `Searcher` that emits the nested retriever tree, selected by config) is deferred as a performance optimization. It is out of scope for the v1 relevance-quality success criteria.
-- **Lexical-less backend (no `bm25` graph):** BM25 is realized as a concrete `LexicalSearcher` (§3.3), so every in-scope backend provides it. If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, the matrix should skip `bm25`/`hybrid`/`bm25_rerank` (a matrix concern — there is no backend capability flag). Deferred until such a backend exists (no consumer today).
+- **Lexical-less backend (no `bm25` graph):** BM25 is realized as a concrete `LexicalSearcher` (§3.3), so every in-scope backend provides it. If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, simply omit the lexical `searcher` service and any pipeline that references it (a config concern — there is no backend capability flag). Deferred until such a backend exists (no consumer today).
 - Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
 - Pooling-depth / missing-judgement sensitivity analysis (current default: **missing judgements are skipped via condensed-list evaluation**, §7 — NOT scored as gain 0; only judged-irrelevant docs count as a 0).
 - **Missing-judgement ratio → LLM-as-a-judge backfill.** After the first full-pass run, inspect the aggregate missing-judgement ratio `n_missing / (n_scored + n_missing)` (summed over queries, from the §9 metrics CSVs). If judgements are missing **> 10%** of the time, run a separate measurement: compute **Cohen's kappa** agreement between the original WANDS labels and an **LLM-as-a-judge** evaluator on the judged pairs; then **backfill** the missing judgements with the LLM judge into `dataset/wands/label_augmented.csv` and re-run against the augmented labels.

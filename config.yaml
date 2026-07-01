@@ -1,34 +1,47 @@
-# Config-driven experiment matrix (docs/experiment.md §10).
-# Declares the axes; the expander (benchmark/matrix.py) produces the variant
-# list for one run, baseline (bm25) first. Secrets are referenced via ${VAR}
-# and resolved at load time — they never live in this file.
-dataset:   { name: wands, path: ./dataset/wands, version: "2022.0" }
-backend:   { kind: elasticsearch, url: "${ES_URL}", index: wands_bench,
-             top_k: 100, rank_window_size: 100, min_es_version: "8.15" }   # 8.15 hard floor (§1.1)
-cutoff:    10                           # top_n is a task_settings key (§3.4); cutoff is the metric depth k=10
-embedding_models:                       # → semantic / hybrid / *_rerank
-  - { inference_id: e5-small,       service: elasticsearch, task_type: text_embedding,   service_settings: {} }
-  - { inference_id: elser,          service: elasticsearch, task_type: sparse_embedding,  service_settings: {} }
-  - { inference_id: openai-3-small, service: openai,        task_type: text_embedding,    service_settings: { api_key: "${OPENAI_KEY}", model_id: text-embedding-3-small } }
-rerankers:                              # → *_rerank
-  # top_n is a TASK setting (rank-window cap), NOT a service setting. service_settings
-  # carries auth/model identity; task_settings carries top_n. (§3.4, §5.3)
-  - { inference_id: cohere-rerank-v3, service: cohere,       task_type: rerank,
-      service_settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5 },
-      task_settings:    { top_n: 100 } }
-  - { inference_id: bge-reranker,     service: hugging_face, task_type: rerank,
-      service_settings: { api_key: "${HF_KEY}", url: "${HF_URL}" },
-      task_settings:    { top_n: 100 } }
-rrf_k_sweep: [10,20,30,40,50,60,70,80,90,100]   # → hybrid
-variants:  [bm25, semantic, hybrid, bm25_rerank, semantic_rerank, hybrid_rerank]
-stats:     { bootstrap_B: 10000, ci_level: 0.95, alpha: 0.05, correction: bh, test: wilcoxon,
-             wilcoxon_zero_method: wilcox, wilcoxon_correction: true, seed: 1234 }
-             # ci_level is the UNADJUSTED per-comparison effect-size CI (§8.2); it is NOT a gate.
-             # correction: bh is the FDR (Benjamini-Hochberg) decision, the DEFAULT (§8.3);
-             # by = Benjamini-Yekutieli, the conservative arbitrary-dependence option. alpha is BOTH
-             # the raw per-test threshold AND the FDR target level q. The CI stays unadjusted/
-             # descriptive and may disagree with the decision; a matching FDR-adjusted-interval
-             # regime remains deferred (§13).
-hybrid_rerank_k: 60                     # DEFAULT: a fixed integer (single-pass, fully static; no
-                                        # selection-on-eval-set bias). set to `best_per_model` for the
-                                        # opt-in two-pass mode (§8.0a) — biased, exploratory only.
+# Explicit experiment config (docs/experiment.md §10).
+# FULLY EXPLICIT: named services + named pipelines. There is NO matrix expansion and NO sweep — you
+# write each pipeline you want to run by hand, so the config is readable at a glance. config.py
+# (benchmark/config.py) parses + validates this into a ResolvedConfig; the runner iterates the
+# baseline + explicit variant pipelines. Secrets are referenced via ${VAR} and resolved at load
+# time — they never live in this file.
+dataset:
+  name: wands
+  path: ./dataset/wands
+services:                       # named, typed, reusable building blocks
+  - embedder: { name: e5,     provider: elasticsearch, task_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+  - embedder: { name: cohere, provider: cohere,        task_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
+  - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100 } }
+  - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
+  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
+  - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
+indexer:
+  provider: elasticsearch
+  index: wands_bench
+  settings: { url: "${ES_URL}" }
+pipelines:
+  baseline:                     # the reference every variant is compared against
+    retriever: bm25
+  variants:                     # each is one explicit run; the map key is its id
+    semantic_e5:   { retriever: semantic_e5 }
+    semantic_co:   { retriever: semantic_co }
+    hybrid_e5_k60:
+      retrievers: [bm25, semantic_e5]
+      fuser: { type: rrf, rank_constant: 60, window: 100 }
+    bm25_rerank:
+      retriever: bm25
+      reranker: co-rr
+      rerank_window_size: 100
+    hybrid_e5_rerank:
+      retrievers: [bm25, semantic_e5]
+      fuser: { type: rrf, rank_constant: 60, window: 100 }
+      reranker: co-rr
+      rerank_window_size: 100
+stats:
+  test: wilcoxon
+  correction: bh                # Benjamini-Hochberg FDR (§8.3, default); by = Benjamini-Yekutieli
+  alpha: 0.05                   # BOTH the raw per-test threshold AND the FDR target level q
+  bootstrap_B: 10000
+  ci_level: 0.95                # UNADJUSTED per-comparison effect-size CI (§8.2); NOT a gate
+  seed: 1234
+cutoff: 10                      # metrics @10
+top_k: 100                      # results retrieved per query
