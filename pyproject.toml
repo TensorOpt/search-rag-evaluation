@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
   "numpy",
   "scipy>=1.11",  # scipy.stats.false_discovery_control (BH/BY FDR) was added in 1.11
+  "pyyaml>=6",    # config.py loads the §10 YAML config matrix
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -64,3 +65,9 @@ packages = ["benchmark"]
 module = "numpy.*"
 follow_imports = "skip"
 follow_imports_for_stubs = true
+
+# PyYAML ships no type stubs (types-PyYAML is a separate stub-only package). config.py uses only
+# yaml.safe_load; ignore the missing-stub import rather than pulling a stubs dep for one call.
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true

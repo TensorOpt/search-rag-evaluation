@@ -437,12 +437,14 @@ def spec_for(v: VariantCfg, mapping: IndexMapping, factory: SearcherFactory) -> 
 
     if v.reranker_id:
         return SearchPipeline(retriever=retriever,
-                              reranker=factory.reranker(v.reranker_id, mapping.rerank_field),
+                              reranker=factory.reranker(v.reranker_id, mapping.search_text_field),
                               rerank_window_size=v.window)
     return SearchPipeline(retriever=retriever)
 ```
 
 > The `hybrid` k-sweep and `hybrid_rerank` reuse the *same* composition; they differ only in `RRFFuser`'s `rank_constant` and the presence of a reranker. Adding "semantic+rerank" costs zero new pipeline code — only a matrix row. For `hybrid_rerank`, `v.rrf_k` is already resolved to a concrete integer before `spec_for` is called (a fixed literal, or the best-per-model k chosen in §8.0a) — `spec_for` never performs selection.
+
+> The reranker's field argument is `mapping.search_text_field` — `IndexMapping` (§3.5) carries only `search_text_field`/`sem_fields`, and §5.3 fixes `search_text` as the ES rerank field (`FieldSchema.rerank_field` also defaults to it). If a dataset ever needs a distinct rerank field, add `rerank_field` to `IndexMapping` and read it here.
 
 ---
 
@@ -781,7 +783,7 @@ Each expanded row → a `SearchPipeline` object graph (§4) → one `result_*` +
 ```
 benchmark/
   models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, InferenceEndpoint
-  protocols.py           # Searcher/Fuser/Reranker ABCs; Dataset, EmbeddingModel, Indexer, SearchBackend (ingest) Protocols
+  protocols.py           # Searcher/Fuser/Reranker ABCs; Dataset, EmbeddingModel, Indexer, SearchBackend (ingest), SearcherFactory Protocols
   pipeline.py            # RRFFuser, HybridSearch, SearchPipeline (the composers)
   fusion.py              # fuse_rrf_local (client-side RRF, windowed)
   rerank.py              # rerank_local (client-side score+reorder helper, windowed)
