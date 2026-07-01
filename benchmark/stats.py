@@ -306,9 +306,9 @@ def _fdr_adjust(ps: Sequence[float], method: str) -> list[float]:
     """FDR-adjusted p-values (q-values) over the family, in input order (§8.3).
 
     ``method`` is ``"bh"`` (Benjamini-Hochberg, controls FDR under independence and PRDS) or ``"by"``
-    (Benjamini-Yekutieli, valid under arbitrary dependence). Prefers
-    ``scipy.stats.false_discovery_control`` when available in the installed scipy, else falls back to a
-    correct hand-rolled step-up that is monotone non-decreasing in rank and clamped to ``<= 1``.
+    (Benjamini-Yekutieli, valid under arbitrary dependence). Computed with
+    ``scipy.stats.false_discovery_control`` (added in scipy 1.11 and pinned as the floor in
+    pyproject.toml, so the routine is always present — no runtime capability probing).
 
     ``significant`` for a test is then ``q <= alpha``; because BH's adjusted p-value ``q_(k)`` satisfies
     ``q_(k) <= alpha`` iff ``k`` is within the BH step-up rejection set, this reproduces the classic
@@ -316,35 +316,5 @@ def _fdr_adjust(ps: Sequence[float], method: str) -> list[float]:
     """
     if not ps:
         return []
-
-    scipy_fdr = getattr(scipy_stats, "false_discovery_control", None)
-    if scipy_fdr is not None:
-        adjusted = scipy_fdr(np.asarray(ps, dtype=float), method=method)
-        return [float(min(q, 1.0)) for q in adjusted]
-
-    return _fdr_adjust_manual(ps, method)
-
-
-def _fdr_adjust_manual(ps: Sequence[float], method: str) -> list[float]:
-    """Hand-rolled BH/BY adjusted p-values (fallback when scipy lacks ``false_discovery_control``).
-
-    Standard step-up: sort p ascending, scale ``p_(k)`` by ``m / (k * c(m))`` (``c(m) = 1`` for BH,
-    ``c(m) = sum_{i=1..m} 1/i`` for BY), enforce monotonicity from the largest rank downward, clamp to
-    ``<= 1``, and scatter back to the original order.
-    """
-    m = len(ps)
-    order = sorted(range(m), key=lambda i: ps[i])  # indices sorted by ascending p
-    c_m = 1.0 if method == "bh" else float(np.sum(1.0 / np.arange(1, m + 1)))
-
-    adjusted_sorted = [0.0] * m
-    running_min = 1.0
-    # Walk from the largest p (rank m) down to rank 1, enforcing monotone non-decreasing in rank.
-    for rank in range(m, 0, -1):
-        raw = ps[order[rank - 1]] * m * c_m / rank
-        running_min = min(running_min, raw)
-        adjusted_sorted[rank - 1] = min(running_min, 1.0)
-
-    out = [0.0] * m
-    for sorted_pos, orig_idx in enumerate(order):
-        out[orig_idx] = adjusted_sorted[sorted_pos]
-    return out
+    adjusted = scipy_stats.false_discovery_control(np.asarray(ps, dtype=float), method=method)
+    return [float(min(q, 1.0)) for q in adjusted]

@@ -25,7 +25,6 @@ from benchmark.stats import (
     ComparisonResult,
     StatsCfg,
     _fdr_adjust,
-    _fdr_adjust_manual,
 )
 
 # --------------------------------------------------------------------------------------------------
@@ -267,12 +266,13 @@ def test_bh_step_up_rejection_set_and_qvalues() -> None:
     assert all(0.0 <= qi <= 1.0 for qi in q)
 
 
-def test_bh_qvalues_match_scipy_and_manual_fallback() -> None:
-    # The scipy-backed path and the hand-rolled fallback must agree on BH q-values.
+def test_bh_qvalues_match_hand_computed() -> None:
+    # BH q_(k) = min over j>=k of p_(j)*m/j, monotone non-decreasing by rank, clamped <=1.
+    # ps sorted: 0.001(r1),0.008(r2),0.02(r3),0.04(r4),0.5(r5),0.7(r6), m=6 -> raw q by rank:
+    #   0.006, 0.024, 0.04, 0.06, 0.6, 0.7  (already monotone), mapped back to input order below.
     ps = [0.001, 0.008, 0.02, 0.04, 0.7, 0.5]
-    via_scipy = _fdr_adjust(ps, "bh")
-    via_manual = _fdr_adjust_manual(ps, "bh")
-    assert via_scipy == pytest.approx(via_manual)
+    expected = [0.006, 0.024, 0.04, 0.06, 0.7, 0.6]
+    assert _fdr_adjust(ps, "bh") == pytest.approx(expected)
 
 
 def test_by_is_more_conservative_than_bh() -> None:

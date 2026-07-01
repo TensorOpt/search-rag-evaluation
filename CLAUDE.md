@@ -43,6 +43,10 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 ## Conventions
 
 - Match the style of surrounding code; keep abstractions minimal (favor stdlib/native over deps).
+- **Move with certainty.** Prefer resolving unknowns at build time over runtime. If a dependency's
+  capability/version/behavior is uncertain, pin the version that guarantees it and call it directly —
+  do NOT ship runtime feature-detection (`getattr(mod, "feature", None)` probes) or best-effort
+  fallbacks. Verify and validate up front, not at runtime.
 - **Use logging, not `print()`.** Get a logger via `benchmark.logging_setup.get_logger(__name__)`
   and call `setup_logging()` once at each entry point — it logs to the console and to
   `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.
