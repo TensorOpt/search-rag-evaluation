@@ -214,18 +214,18 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 **Deliverables.**
 - `benchmark/fusion.py` — `fuse_rrf_local(lists, *, rank_constant, rank_window_size)`.
-- `benchmark/rerank.py` — `rerank_local(reranker, query, candidates, *, rank_window_size, doc_text)`.
+- `benchmark/rerank.py` — `rerank_local(query, candidates, *, rank_window_size, doc_text, score_fn)`. (The `Reranker` descriptor (§3.4) exposes only `as_endpoint()` and cannot score locally, so the backend supplies `score_fn(query, doc_texts) -> one score per text`; ES never uses this path.)
 
 **Depends on.** Phase 1.
 
 **Implementation notes (§3.7).**
 - `fuse_rrf_local`: **truncate each input list to its top `rank_window_size` BEFORE fusing**, then `score(d) = Σ 1/(rank_constant + rank_d)`, rank **1-based** within the truncated list; return merged list sorted by fused score **desc, tie-break doc_id** (§9.1). Must mirror ES `rrf` window semantics — dropping the window (fusing full lists) is the explicit v2 bug to avoid.
-- `rerank_local`: take only the top `rank_window_size` candidates, call reranker over `(query.text, doc_text(doc_id))`, re-sort by model score; candidates **beyond the window keep input order, appended after the reranked head** (as ES does).
+- `rerank_local`: take only the top `rank_window_size` candidates, score them via `score_fn(query, [doc_text(doc_id) for each])` (one score per text, higher = more relevant), re-sort by model score; candidates **beyond the window keep input order, appended after the reranked head** (as ES does). The `Reranker` descriptor can't score locally, so the backend supplies `score_fn`.
 
 **Test / acceptance criteria.** *(pure / offline)*
 - **Hand-computed RRF:** two short lists with a known overlap, `rank_constant=10`, small window → assert exact fused scores and order, including the **doc_id tie-break** on equal fused score.
 - **Window truncation:** a doc present only beyond `rank_window_size` in every list is excluded from fusion (proves the truncate-before-fuse rule).
-- **rerank_local:** with a fake reranker returning fixed scores, the top-W head is re-sorted by model score and the tail (> W) retains input order appended after the head.
+- **rerank_local:** with a fake `score_fn` returning fixed scores, the top-W head is re-sorted by model score and the tail (> W) retains input order appended after the head.
 
 **Developer / reviewer responsibilities.** Developer implements both helpers. Reviewer confirms windowing matches ES semantics and the tie-break is on `doc_id`.
 

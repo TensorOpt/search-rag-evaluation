@@ -391,14 +391,16 @@ def fuse_rrf_local(lists: Sequence[Sequence[ScoredDoc]], *,
     Returns merged list sorted by fused score desc, tie-break doc_id.
     Mirrors ES rrf, which fuses over the rank_window_size window of each child."""
 
-def rerank_local(reranker: Reranker, query: Query,
-                 candidates: Sequence[ScoredDoc], *,
+def rerank_local(query: Query, candidates: Sequence[ScoredDoc], *,
                  rank_window_size: int,
-                 doc_text: Callable[[str], str]) -> list[ScoredDoc]:
+                 doc_text: Callable[[str], str],
+                 score_fn: Callable[[Query, Sequence[str]], Sequence[float]]) -> list[ScoredDoc]:
     """Take only the top rank_window_size candidates (matching ES rerank depth),
-    call the reranker over (query.text, doc_text(doc_id)) for each, return
-    re-sorted by model score; candidates beyond the window keep their input order
-    appended after the reranked head (as ES does)."""
+    score them via score_fn(query, [doc_text(doc_id) for each]) -> one relevance
+    score per doc text (higher = more relevant), return re-sorted by model score;
+    candidates beyond the window keep their input order appended after the reranked
+    head (as ES does). The Reranker descriptor (§3.4) exposes only as_endpoint() and
+    CANNOT score locally, so the backend supplies score_fn (ES never uses this path)."""
 ```
 
 ES uses **none** of these (it fuses/reranks server-side); they exist so a Qdrant/FAISS backend implements the same `PipelineSpec` without forking pipeline code, and with the same window semantics.
