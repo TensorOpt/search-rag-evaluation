@@ -247,7 +247,7 @@ def test_idcg_zero_all_irrelevant_yields_ndcg_zero():
     qrels = QrelIndex([Qrel("q1", "p1", 0.0), Qrel("q1", "p2", 0.0)])
     m = Evaluator(qrels).score_run([_rr("q1", ["p1", "p2"])])["q1"]
     assert m.n_scored == 2
-    assert m.ndcg_at_10 == 0.0
+    assert m.ndcg_at_10 == pytest.approx(0.0, abs=1e-12)
     assert m.avg_relevance == pytest.approx(0.0, abs=1e-12)
     assert math.isnan(m.recall_at_10)  # R == 0
 
