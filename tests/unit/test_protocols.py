@@ -1,16 +1,20 @@
 """Phase 1 unit tests for benchmark.protocols (docs/experiment.md §3.2-§3.5).
 
-These verify that trivial in-test classes structurally satisfy each Protocol. mypy provides
-full structural conformance checking (incl. data attributes); the runtime ``isinstance`` checks
-here only verify method presence, since ``@runtime_checkable`` Protocols cannot check attributes.
+Two seam kinds:
+- structural ingest Protocols (``Dataset``, ``EmbeddingModel``, ``Indexer``, ``SearchBackend``):
+  a trivial in-test class satisfies each (mypy checks data attributes; ``@runtime_checkable``
+  ``isinstance`` here only verifies method presence).
+- behavioral ABCs (``Searcher``, ``Fuser``, ``Reranker``): a trivial subclass implementing the
+  abstract method instantiates and works; a subclass that does not is uninstantiable.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Sequence
+from typing import Iterable, Sequence
+
+import pytest
 
 from benchmark.models import (
-    BackendCapabilities,
     Document,
     FieldSchema,
     IndexMapping,
@@ -18,20 +22,17 @@ from benchmark.models import (
     InferenceTaskType,
     Qrel,
     Query,
-    RankedResult,
+    ScoredDoc,
 )
 from benchmark.protocols import (
     Dataset,
     EmbeddingModel,
+    Fuser,
     Indexer,
     Reranker,
-    RetrieverSpec,
+    Searcher,
     SearchBackend,
 )
-
-
-class _Spec:
-    """A trivial opaque backend-native plan."""
 
 
 class _Dataset:
@@ -59,15 +60,9 @@ class _EmbeddingModel:
         return InferenceEndpoint(self.inference_id, self.task_type, "elasticsearch")
 
 
-class _Reranker:
-    inference_id = "cohere-rerank-v3"
-    task_type = InferenceTaskType.RERANK
-
-    def as_endpoint(self) -> InferenceEndpoint:
-        return InferenceEndpoint(self.inference_id, self.task_type, "cohere")
-
-
 class _Backend:
+    """A trivial ingest seam: register_inference / ensure_index / bulk_index only."""
+
     def register_inference(self, ep: InferenceEndpoint) -> str:
         return ep.inference_id
 
@@ -76,37 +71,6 @@ class _Backend:
 
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None:
         return None
-
-    def bm25(self, *, fields: Sequence[str]) -> RetrieverSpec:
-        return _Spec()
-
-    def semantic(self, *, field: str) -> RetrieverSpec:
-        return _Spec()
-
-    def fuse_rrf(
-        self,
-        children: Sequence[RetrieverSpec],
-        *,
-        rank_constant: int,
-        rank_window_size: int,
-    ) -> RetrieverSpec:
-        return _Spec()
-
-    def rerank(
-        self,
-        child: RetrieverSpec,
-        *,
-        inference_id: str,
-        field: str,
-        rank_window_size: int,
-    ) -> RetrieverSpec:
-        return _Spec()
-
-    def execute(self, spec: RetrieverSpec, query: Query, *, top_k: int) -> RankedResult:
-        return RankedResult(query_id=query.query_id, docs=[])
-
-    def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(True, True, True)
 
 
 class _Indexer:
@@ -119,34 +83,47 @@ class _Indexer:
         return IndexMapping("i", "search_text", {}, {})
 
 
-# --- static (mypy) structural conformance: assigning to the Protocol type -----
+# --- trivial ABC subclasses -------------------------------------------------------------------
+
+
+class _Searcher(Searcher):
+    def search(self, query: str, *, top_k: int) -> list[ScoredDoc]:
+        return [ScoredDoc("d1", 1.0)][:top_k]
+
+
+class _Fuser(Fuser):
+    def fuse(
+        self, result_lists: Sequence[Sequence[ScoredDoc]], *, rank_window_size: int
+    ) -> list[ScoredDoc]:
+        return [doc for lst in result_lists for doc in lst]
+
+
+class _Reranker(Reranker):
+    def rerank(self, query: str, candidates: Sequence[ScoredDoc]) -> list[ScoredDoc]:
+        return list(reversed(candidates))
+
+
+# --- static (mypy) structural conformance: assigning to the Protocol type ---------------------
 
 
 def test_static_structural_conformance() -> None:
     dataset: Dataset = _Dataset()
     backend: SearchBackend = _Backend()
     embedding: EmbeddingModel = _EmbeddingModel()
-    reranker: Reranker = _Reranker()
     indexer: Indexer = _Indexer()
-    spec: RetrieverSpec = _Spec()
-    # touch them so the assignments are not flagged as unused.
     assert dataset.name == "fake"
-    assert backend.capabilities().semantic_query is True
+    assert backend.register_inference(embedding.as_endpoint()) == "e5-small"
     assert embedding.as_endpoint().inference_id == "e5-small"
-    assert reranker.task_type is InferenceTaskType.RERANK
     assert isinstance(indexer.build(dataset, backend, [embedding]), IndexMapping)
-    assert spec is not None
 
 
-# --- runtime isinstance checks against @runtime_checkable Protocols -----------
-# Note: isinstance only verifies method presence, not data attributes.
+# --- runtime isinstance checks against @runtime_checkable ingest Protocols ---------------------
 
 
 def test_runtime_isinstance_method_protocols() -> None:
     assert isinstance(_Dataset(), Dataset)
     assert isinstance(_Backend(), SearchBackend)
     assert isinstance(_EmbeddingModel(), EmbeddingModel)
-    assert isinstance(_Reranker(), Reranker)
     assert isinstance(_Indexer(), Indexer)
 
 
@@ -158,8 +135,29 @@ def test_runtime_isinstance_negative() -> None:
     assert not isinstance(_NotABackend(), Dataset)
 
 
-def test_backend_execute_returns_ranked_result() -> None:
-    backend: SearchBackend = _Backend()
-    result: Any = backend.execute(_Spec(), Query("q1", "text"), top_k=10)
-    assert isinstance(result, RankedResult)
-    assert result.query_id == "q1"
+# --- behavioral ABCs: trivial subclasses satisfy them -----------------------------------------
+
+
+def test_searcher_subclass_works() -> None:
+    searcher: Searcher = _Searcher()
+    assert searcher.search("q", top_k=10) == [ScoredDoc("d1", 1.0)]
+
+
+def test_fuser_subclass_works() -> None:
+    fuser: Fuser = _Fuser()
+    fused = fuser.fuse([[ScoredDoc("d1", 1.0)], [ScoredDoc("d2", 2.0)]], rank_window_size=10)
+    assert [d.doc_id for d in fused] == ["d1", "d2"]
+
+
+def test_reranker_subclass_works() -> None:
+    reranker: Reranker = _Reranker()
+    reordered = reranker.rerank("q", [ScoredDoc("d1", 1.0), ScoredDoc("d2", 2.0)])
+    assert [d.doc_id for d in reordered] == ["d2", "d1"]
+
+
+def test_abc_missing_method_is_uninstantiable() -> None:
+    class _Incomplete(Searcher):
+        pass
+
+    with pytest.raises(TypeError):
+        _Incomplete()  # type: ignore[abstract]

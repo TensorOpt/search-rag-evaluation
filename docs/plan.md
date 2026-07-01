@@ -32,9 +32,9 @@ developer implements  →  reviewer reviews  →  USER signs off  →  USER comm
 ## 2. Guiding principles for phasing
 
 1. **Build bottom-up along the §11 import DAG.** §11 fixes the dependency direction: `pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols`; adapters (`datasets/*`, `backends/*`) are selected by `config.py` factories and depended on by nobody upstream. We build leaves first (`models`, `protocols`), then each pure consumer, then adapters, then the wiring. **No phase may depend on a later phase.**
-2. **Each phase is independently testable WITHOUT later phases.** Where a phase needs a collaborator that is not yet built (notably the ES backend), it is tested against a **fake/stub** that implements the relevant Protocol (`FakeBackend`, `FakeReranker`, tiny in-memory dataset fixture). This is exactly the seam the design promises (§1.4(3), §3.7): the pure core never imports an adapter.
-3. **Keep each phase reviewable in one sitting.** One coherent module (or a tightly-coupled pair) plus its tests per phase. The single risky, large module — `backends/elasticsearch.py` — is split into two phases (BM25/execute first, then semantic/RRF/rerank).
-4. **Isolate ES integration risk late and behind the backend adapter.** Everything except the two ES phases and the end-to-end phases is **pure unit-testable offline** (no Docker). Docker-dependent work (compose ES ≥ 8.15, `register_inference`, `ensure_index`, `bulk_index`, retriever execution) lands in Phases 10–12 only. By then the entire pure core is proven against `FakeBackend`, so ES work reduces to making the real backend satisfy the same contract.
+2. **Each phase is independently testable WITHOUT later phases.** Where a phase needs a collaborator that is not yet built (notably the ES adapter), it is tested against a **fake/stub** that satisfies the relevant seam (`FakeSearcher`, `FakeReranker`, tiny in-memory dataset fixture). This is exactly the seam the design promises (§1.4(3), §3.3/§3.7): the pure core never imports an adapter.
+3. **Keep each phase reviewable in one sitting.** One coherent module (or a tightly-coupled pair) plus its tests per phase. The single risky, large module — `backends/elasticsearch.py` — is split into two phases (`LexicalSearcher` + ingest first, then `VectorSearch`/`ESReranker`/`ESIndexer`).
+4. **Isolate ES integration risk late and behind the adapter.** Everything except the two ES phases and the end-to-end phases is **pure unit-testable offline** (no Docker). Docker-dependent work (compose ES ≥ 8.15, `register_inference`, `ensure_index`, `bulk_index`, leaf `Searcher`/`Reranker` execution) lands in Phases 10–12 only. By then the entire pure core is proven against the fakes, so ES work reduces to making the real leaf `Searcher`s/`Reranker` satisfy the same ABCs.
 
 ---
 
@@ -46,16 +46,16 @@ flowchart TB
   P1 --> P2["Phase 2<br/>metrics.py"]
   P1 --> P3["Phase 3<br/>stats.py"]
   P1 --> P4["Phase 4<br/>fusion.py + rerank.py"]
-  P1 --> P5["Phase 5<br/>pipeline.py (SearchPipeline)"]
+  P1 --> P5["Phase 5<br/>pipeline.py (composite model)"]
   P4 --> P5
   P1 --> P6["Phase 6<br/>matrix.py (+ spec_for) + config.py"]
   P1 --> P7["Phase 7<br/>io_csv.py"]
   P2 --> P7
   P3 --> P7
   P1 --> P8["Phase 8<br/>datasets/wands.py"]
-  P5 --> P9["Phase 9<br/>backends/elasticsearch.py — BM25 + execute (Docker ES)"]
+  P5 --> P9["Phase 9<br/>backends/elasticsearch.py — ingest + LexicalSearcher (Docker ES)"]
   P6 --> P9
-  P9 --> P10["Phase 10<br/>backends/elasticsearch.py — semantic + RRF + rerank + indexer (Docker ES)"]
+  P9 --> P10["Phase 10<br/>backends/elasticsearch.py — VectorSearch + ESReranker + ESIndexer (Docker ES)"]
   P2 --> P11["Phase 11<br/>runner.py + hatch CLI scripts (Docker ES)"]
   P3 --> P11
   P5 --> P11
@@ -73,12 +73,12 @@ flowchart TB
 | 2 | `metrics.py` | 1 | no (pure) |
 | 3 | `stats.py` | 1 | no (pure) |
 | 4 | `fusion.py` + `rerank.py` (harness-side fallbacks) | 1 | no (pure) |
-| 5 | `pipeline.py` (`SearchPipeline`, `PipelineSpec`) | 1, 4 | no (FakeBackend) |
+| 5 | `pipeline.py` (`RRFFuser`/`HybridSearch`/`SearchPipeline` composers) | 1, 4 | no (fakes) |
 | 6 | `matrix.py` + `config.py` | 1 | no (pure) |
 | 7 | `io_csv.py` | 1, 2, 3 | no (golden files) |
 | 8 | `datasets/wands.py` | 1 | no (fixture) |
-| 9 | `backends/elasticsearch.py` — BM25 + lifecycle + `execute` + `capabilities` | 5, 6 | **yes** |
-| 10 | `backends/elasticsearch.py` — semantic + RRF + rerank + `ElasticsearchIndexer` | 9 | **yes** |
+| 9 | `backends/elasticsearch.py` — ingest lifecycle + `LexicalSearcher` | 5, 6 | **yes** |
+| 10 | `backends/elasticsearch.py` — `VectorSearch` + `ESReranker` + `ESIndexer` | 9 | **yes** |
 | 11 | `runner.py` + hatch CLI scripts (end-to-end on a small subset) | 2,3,5,6,7,8,10 | **yes** |
 | 12 | Full-WANDS end-to-end validation vs success criteria §1.4 | 11 | **yes** |
 
@@ -128,14 +128,14 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Objective.** Define all pure data models and the Protocol seams the entire harness depends on.
 
 **Deliverables.**
-- `benchmark/models.py` — frozen dataclasses / enums: `Query`, `Document`, `Qrel`, `ScoredDoc`, `RankedResult`, `FieldRole`, `FieldSpec`, `FieldSchema`, `IndexMapping`, `InferenceTaskType`, `InferenceEndpoint`, `BackendCapabilities`. **The pipeline-config types (`StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec`) are NOT here — they live in `pipeline.py` (Phase 5) per §11/§3.6.**
-- `benchmark/protocols.py` — `Dataset`, `SearchBackend`, `RetrieverSpec`, `EmbeddingModel`, `Reranker`, `Indexer` Protocols.
+- `benchmark/models.py` — frozen dataclasses / enums: `Query`, `Document`, `Qrel`, `ScoredDoc`, `RankedResult`, `FieldRole`, `FieldSpec`, `FieldSchema`, `IndexMapping`, `InferenceTaskType`, `InferenceEndpoint`. (No `BackendCapabilities` — the composite model has no `capabilities()` seam, §3.3.) **The composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`) are NOT here — they live in `pipeline.py` (Phase 5) per §11/§3.6.**
+- `benchmark/protocols.py` — the behavioral ABCs `Searcher`/`Fuser`/`Reranker` (§3.3/§3.4) and the structural ingest Protocols `Dataset`, `EmbeddingModel`, `Indexer`, `SearchBackend` (ingest seam only).
 
-> Note: §11 lists `PipelineSpec`/`FuseCfg`/`RerankCfg`/`StageCfg` under `pipeline.py` (Phase 5); `spec_for` lives in `matrix.py` (Phase 6, see §4). Keep them there per §11; only the §3.1 plain data models (`Query`/`Document`/`Qrel`/`ScoredDoc`/`RankedResult`/`FieldSchema`/`InferenceEndpoint`) live in `models.py`. Shared enums/dataclasses referenced by both (`FieldRole`, `InferenceTaskType`, `IndexMapping`, `BackendCapabilities`) go in `models.py`. Reviewer enforces this split against §11's per-module comments.
+> Note: the composers live in `pipeline.py` (Phase 5); `spec_for` lives in `matrix.py` (Phase 6, see §4). Only the §3.1 plain data models (`Query`/`Document`/`Qrel`/`ScoredDoc`/`RankedResult`/`FieldSchema`/`InferenceEndpoint`) + shared enums (`FieldRole`, `InferenceTaskType`, `IndexMapping`) live in `models.py`. Reviewer enforces this split against §11's per-module comments. *(The composite-model refactor — removing `RetrieverSpec`/`BackendCapabilities`/the old `Reranker` descriptor and the `SearchBackend` retrieval methods, adding the `Searcher`/`Fuser`/`Reranker` ABCs — landed with Phase 5; §11 is the current target.)*
 
 **Depends on.** Phase 0.
 
-**Implementation notes.** Exact field names/types per §3.1–§3.6: `Query(query_id, text, query_class=None)`, `Qrel(query_id, doc_id, gain:int)`, `ScoredDoc(doc_id, score)`, `RankedResult(query_id, docs)`. `position` is **not** a field on `ScoredDoc` (§3.1 — derived at CSV write time so it cannot drift). `FieldSchema.search_text_field` and `rerank_field` both default to `"search_text"` (§3.2, §5.1). `IndexMapping.sem_field(model_id)` getter (§3.5). `InferenceEndpoint` carries **separate** `service_settings` and `task_settings` maps (§3.4 — `top_n` lives in `task_settings`). All dataclasses `frozen=True`. Protocols are structural (`typing.Protocol`), no implementation.
+**Implementation notes.** Exact field names/types per §3.1–§3.6: `Query(query_id, text, query_class=None)`, `Qrel(query_id, doc_id, gain:float)`, `ScoredDoc(doc_id, score)`, `RankedResult(query_id, docs)`. `position` is **not** a field on `ScoredDoc` (§3.1 — derived at CSV write time so it cannot drift). `FieldSchema.search_text_field` and `rerank_field` both default to `"search_text"` (§3.2, §5.1). `IndexMapping.sem_field(model_id)` getter (§3.5). `InferenceEndpoint` carries **separate** `service_settings` and `task_settings` maps (§3.4 — `top_n` lives in `task_settings`). All dataclasses `frozen=True`. Protocols are structural (`typing.Protocol`), no implementation.
 
 **Test / acceptance criteria.** *(pure / offline)*
 - Construction + immutability tests for every dataclass (frozen → `FrozenInstanceError` on mutate).
@@ -233,32 +233,35 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 ---
 
-### Phase 5 — `pipeline.py` (`SearchPipeline`, `PipelineSpec`)
+### Phase 5 — `pipeline.py` (composite model: `RRFFuser` / `HybridSearch` / `SearchPipeline`)
 
-**Objective.** Implement the single DRY pipeline, tested entirely against a `FakeBackend`. (`spec_for` moves to Phase 6 / `matrix.py` — it maps `VariantCfg`→`PipelineSpec` and would be a `pipeline`→`matrix` forward dependency here; see §4.)
+**Objective.** Implement the composite retrieval model — the three backend-agnostic composers + the `Searcher`/`Fuser`/`Reranker` ABCs — tested entirely against `FakeSearcher`/`FakeReranker`. (`spec_for` moves to Phase 6 / `matrix.py` — it builds the `SearchPipeline` object graph and would be a `pipeline`→`matrix` forward dependency here; see §4.)
 
 **Deliverables.**
-- `benchmark/pipeline.py` — `StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec` (the pipeline-config dataclasses per §3.6) and `SearchPipeline` (`plan()` + `run()`). **No `spec_for`** (Phase 6).
+- `benchmark/protocols.py` — the behavioral ABCs `Searcher`/`Fuser`/`Reranker` (§3.3/§3.4); the `Reranker` **descriptor** and `RetrieverSpec` are removed, and `SearchBackend` is trimmed to the ingest seam (`register_inference`/`ensure_index`/`bulk_index`). *(These protocol edits accompany the composite-model refactor; they land with this phase.)*
+- `benchmark/models.py` — `BackendCapabilities` **removed**.
+- `benchmark/pipeline.py` — `RRFFuser(Fuser)`, `HybridSearch(Searcher)`, `SearchPipeline(Searcher)` (the composers per §3.6). **No `spec_for`** (Phase 6). **No `StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec`** — the declarative spec layer is gone (variants are object graphs).
 
 **Depends on.** Phases 1, 4.
 
 **Implementation notes (§3.6, §3.7).**
-- `plan()` is **pure composition**: retrieve → [fuse] → [rerank], **no per-variant branching beyond presence/absence** of `fuse`/`rerank`; the retrieval-stage `kind` branch is **exhaustive** and raises on an unknown value. A spec without `fuse` must have exactly one leaf (else `ValueError`).
-- **Fusion fallback wired:** server-side `fuse_rrf` when `capabilities().server_side_rrf`, else `plan()` returns a pipeline-private local fuse plan and `run()` fuses per-query with `fuse_rrf_local` (§3.7) using the **same** `rank_constant`/`rank_window_size`.
-- **Rerank fallback DEFERRED:** rerank is supported **only** fully server-side. If a `rerank` stage is requested but cannot run server-side (`capabilities().server_side_rerank` false, or the upstream is a local fuse plan), `plan()` raises `NotImplementedError` (§3.7/§13). The pipeline does **not** import `rerank_local` — it stays a tested Phase-4 helper for a later non-server-side-rerank backend.
-- `run()` builds the plan once; for a server-side plan it calls `backend.execute(plan, q, top_k=...)` per query (binding happens in the backend, §3.3); for a local fuse plan it executes each leaf at `rank_window_size` and fuses locally.
-- **`FakeBackend`** test double implementing `SearchBackend` (bm25/semantic → leaf spec nodes; fuse_rrf/rerank → nested spec nodes + spy lists; `execute` → canned `RankedResult` derived from the spec; configurable `capabilities()`; lifecycle no-ops) lives in `tests/conftest.py` (§5) for reuse by Phases 8–11.
+- **`RRFFuser`**: `__init__(*, rank_constant)`; `fuse(result_lists, *, rank_window_size)` delegates to `fuse_rrf_local` (client-side, §3.7) — a one-line wrapper.
+- **`HybridSearch`**: `__init__(*, retrievers, fuser, retrieval_window_size)`; `search(query, *, top_k)` queries each retriever at `retrieval_window_size`, fuses the lists, truncates to `top_k`. No per-variant branching.
+- **`SearchPipeline`**: `__init__(*, retriever, reranker=None, rerank_window_size=None)`. **Exhaustive `__init__` validation, no silent default:** reranker set ⇒ `rerank_window_size` **required**; reranker None ⇒ `rerank_window_size` **must be None**; otherwise `ValueError`. `search(query, *, top_k)`: no reranker ⇒ pass-through `retriever.search(top_k)`; else retrieve at `rerank_window_size`, `reranker.rerank(query, candidates)`, truncate to `top_k`.
+- `pipeline.py` imports only `models`/`protocols`/`fusion` + stdlib (§11); it does **not** import `rerank_local` (that is the concrete `Reranker`'s helper, Phase 10).
+- **`FakeSearcher`/`FakeReranker`** test doubles (`FakeSearcher` returns a canned `list[ScoredDoc]` honoring `top_k` and records the `top_k` it was queried at; `FakeReranker` reorders candidates by a canned rule) live in `tests/conftest.py` (§5) for reuse by later phases.
 
-**Test / acceptance criteria.** *(pure / offline, via `FakeBackend`)*
-- **All 6 variant shapes run:** build a `PipelineSpec` for `bm25`, `semantic`, `hybrid`, `bm25_rerank`, `semantic_rerank`, `hybrid_rerank`; `run()` over a couple of queries yields one `RankedResult` per query.
-- **Right combinators, no per-variant branching (caps true):** spy asserts `fuse_rrf` called only for `hybrid*`, `rerank` called only for `*_rerank`.
-- **Fuse fallback (caps false):** with `server_side_rrf=false`, `hybrid` runs the LOCAL path and `run()` output equals `fuse_rrf_local` on the two leaf candidate lists (hand-checkable); `bm25`/`semantic` run as a single leaf.
-- **Rerank raises (caps false):** the three rerank variants raise `NotImplementedError` from `plan()`/`run()`; a local fuse plan under a rerank stage raises even when `server_side_rerank` is true.
-- **Guards:** unknown stage `kind` raises `ValueError`; 2 leaves without `fuse` raises `ValueError`. No float `==`; descriptive names.
+**Test / acceptance criteria.** *(pure / offline, via the fakes)*
+- **`RRFFuser`** fuses two fake lists — output equals `fuse_rrf_local` (hand-checkable).
+- **`HybridSearch`** retrieves each retriever at `retrieval_window_size` (assert the recorded `top_k`), fuses, truncates to `top_k`.
+- **`SearchPipeline` with reranker** retrieves at `rerank_window_size`, then reranks, then truncates to `top_k`.
+- **`SearchPipeline` without reranker** is a pass-through (retrieves directly at `top_k`).
+- **`__init__` misconfig** raises `ValueError`: reranker without `rerank_window_size`, and `rerank_window_size` without reranker.
+- No float `==`; descriptive names.
 
-**Developer / reviewer responsibilities.** Developer implements pipeline + the `FakeBackend` test double (shared fixture, §5). Reviewer confirms zero per-variant branching, the fuse-fallback wiring, and the rerank-raise.
+**Developer / reviewer responsibilities.** Developer implements the composers + ABCs + the fakes (shared fixtures, §5) and the deletions. Reviewer confirms zero per-variant branching, the client-side fusion, the exhaustive `__init__` validation, and that all removed types (`RetrieverSpec`/`BackendCapabilities`/`PipelineSpec`/old `Reranker` descriptor/`SearchBackend` retrieval methods) are gone.
 
-**User sign-off gate.** Inspect the FakeBackend test covering all 6 variants under both capability modes (fuse fallback + rerank raise). Approve → **commit on user consent only.**
+**User sign-off gate.** Inspect the composer tests covering all three composers + the `__init__` misconfig guards, and confirm the removals. Approve → **commit on user consent only.**
 
 ---
 
@@ -267,8 +270,8 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Objective.** Implement deterministic matrix expansion (baseline first), the `best_per_model` selection, and config load/resolve.
 
 **Deliverables.**
-- `benchmark/matrix.py` — `VariantCfg`, `ResolvedConfig`, `expand_matrix(cfg)`, `resolve_hybrid_rerank_best_per_model(cfg, per_query)`, and `spec_for(variant_cfg, mapping)` (§4; moved here from Phase 5 to avoid a `pipeline`→`matrix` forward dependency — it maps `VariantCfg`→`PipelineSpec`).
-- `benchmark/config.py` — YAML/JSON load + resolve, `${VAR}` env substitution, factories `load_dataset`/`make_backend`, and `ConfigInferenceModel` (implements both `EmbeddingModel` and `Reranker` Protocols).
+- `benchmark/matrix.py` — `VariantCfg`, `ResolvedConfig`, `expand_matrix(cfg)`, `resolve_hybrid_rerank_best_per_model(cfg, per_query)`, and `spec_for(variant_cfg, mapping, searcher_factory)` (§4; moved here from Phase 5 to avoid a `pipeline`→`matrix` forward dependency — it builds the `SearchPipeline` object graph).
+- `benchmark/config.py` — YAML/JSON load + resolve, `${VAR}` env substitution, factories `load_dataset`/`make_backend`/`make_searcher_factory` (stubbed/lazily-imported offline this phase), and `ConfigInferenceModel` (implements the `EmbeddingModel` descriptor; it also carries the reranker `InferenceEndpoint` the runner registers at R0 and hands to the ES `searcher_factory` to build an `ESReranker` — `Reranker` is now a behavioral ABC realized by the backend, not a config descriptor).
 
 **Depends on.** Phase 1. *(Factories reference adapters by name only; the adapters themselves arrive in Phases 8/9–10. `make_backend`/`load_dataset` may dispatch on `kind`/`name` with the ES/WANDS branches stubbed/imported lazily so this phase stays offline.)*
 
@@ -277,7 +280,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **`hybrid_rerank` (§10/§8.0a):** if `hybrid_rerank_k` is an **int** (default 60) → emit models × rerankers at that fixed k as static rows; if `best_per_model` → emit **no** `hybrid_rerank` rows (deferred to §8.0a phase).
 - `resolve_hybrid_rerank_best_per_model`: per model, **argmax mean nDCG@10** over that model's `hybrid` rows; **tie-break: smallest k, then lexicographically smallest variant id**; **seed-independent, deterministic** (§1.4(2)); emits one row per `(model, reranker)` at the chosen k. Operates **only on in-memory `Metrics`** passed in — adds **no adapter dependency** (§11).
 - `expand_matrix` is a **pure deterministic function**; the data dependency is confined to the one named selection phase.
-- `spec_for(v, mapping)` matches §4 exactly: `use_bm25` → `StageCfg.bm25(fields=[mapping.search_text_field])`; `embedding_model_id` → `StageCfg.semantic(field=mapping.sem_field(id))`; `fuse` → `FuseCfg(rrf_k, window)`; `reranker_id` → `RerankCfg(reranker_id, mapping.rerank_field, window)`. It imports the config dataclasses from `pipeline.py` and **never performs k-selection** — `v.rrf_k` is already a concrete int (§4, §8.0a).
+- `spec_for(v, mapping, factory)` matches §4 exactly and builds a `SearchPipeline` **object graph** via a `searcher_factory` (the backend-specific builder of leaf `Searcher`s / the `Reranker`, so `matrix.py` stays backend-agnostic and offline): `use_bm25` → `factory.lexical(fields=[mapping.search_text_field])`; `embedding_model_id` → `factory.vector(field=mapping.sem_field(id))`; `fuse` → wrap the leaves in `HybridSearch(retrievers, RRFFuser(rrf_k), retrieval_window_size=window)`, else take the single leaf; `reranker_id` → `SearchPipeline(retriever, reranker=factory.reranker(reranker_id, mapping.rerank_field), rerank_window_size=window)`, else `SearchPipeline(retriever)`. It imports the composers from `pipeline.py` and **never performs k-selection** — `v.rrf_k` is already a concrete int (§4, §8.0a). Tests use a fake factory (the Phase-5 fakes) so no adapter is imported.
 - Variant ids match §9 examples (e.g. `hybrid__e5-small__k60`).
 - `config.py`: `${VAR}` resolved at load (secrets never in file); `ci_level` parsed but is **not** a gate; records correction/test/zero-tie params for run metadata.
 
@@ -285,8 +288,8 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **Expansion counts & order:** from the §10 `config.yaml` (3 embedding models, 2 rerankers, 10-step k-sweep), assert exact variant **count per family** and that **`bm25` is index 0**; order matches §10.
 - **best_per_model deferral:** with `hybrid_rerank_k: best_per_model`, `expand_matrix` emits **zero** `hybrid_rerank` rows; with an int, it emits `models×rerankers` rows at that k.
 - **Deterministic selection:** `resolve_hybrid_rerank_best_per_model` on hand-built `Metrics` returns the argmax-mean-nDCG k with smallest-k then lexicographic tie-break; identical output across runs (seed-independent).
-- **`spec_for` composes the §4 table:** produces the expected `PipelineSpec` (retrievers/fuse/rerank presence) for `bm25`, `semantic`, `hybrid`, `bm25_rerank`, `semantic_rerank`, `hybrid_rerank`; never performs k-selection.
-- **Config:** `${VAR}` substitution from env; missing required key errors clearly; `ConfigInferenceModel` satisfies both Protocols (mypy + structural test).
+- **`spec_for` composes the §4 table:** with a fake `searcher_factory`, produces the expected `SearchPipeline` object graph for `bm25`, `semantic`, `hybrid`, `bm25_rerank`, `semantic_rerank`, `hybrid_rerank` — assert the graph shape (retriever is a leaf vs `HybridSearch`; reranker present iff `*_rerank`; `rerank_window_size` set with the reranker); never performs k-selection.
+- **Config:** `${VAR}` substitution from env; missing required key errors clearly; `ConfigInferenceModel` satisfies the `EmbeddingModel` descriptor (mypy + structural test) and exposes the reranker `InferenceEndpoint` for R0 registration.
 - **Factory dispatch (offline, no adapter import):** assert the `name`→factory registry maps `wands`→the WANDS dataset factory target and `elasticsearch`→the ES backend factory target (as a dotted-path string or lazy importer, **not** by importing the adapter module), and that an unknown `name`/`kind` raises a clear error. The dispatch *logic* is verified here; live resolution (actually importing + constructing the adapter) is deferred to Phase 11.
 
 **Developer / reviewer responsibilities.** Developer implements expander, selector, config loader, factories. Reviewer verifies baseline-first ordering, exact counts, the two-mode `hybrid_rerank` behavior, and the tie-break.
@@ -357,60 +360,55 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 ---
 
-### Phase 9 — `backends/elasticsearch.py` — BM25 + lifecycle + `execute` + `capabilities` (Docker ES)
+### Phase 9 — `backends/elasticsearch.py` — ingest lifecycle + `LexicalSearcher` (Docker ES)
 
-**Objective.** Implement the ES backend skeleton end of the contract: lifecycle, the BM25 retriever primitive, `execute` (query binding + tie-break), and `capabilities`. Semantic/RRF/rerank deferred to Phase 10.
+**Objective.** Implement the ES ingest seam and the first leaf `Searcher`: lifecycle (`register_inference`/`ensure_index`/`bulk_index`) and `LexicalSearcher` (its own `match` query + query binding + tie-break). `VectorSearch`/`ESReranker`/`ESIndexer` deferred to Phase 10.
 
 **Deliverables.**
-- `benchmark/backends/elasticsearch.py` (part 1) — `ElasticsearchBackend` implementing: `register_inference`, `ensure_index`, `bulk_index`, `bm25(...)`, `execute(...)`, `capabilities()`, and the ES `RetrieverSpec` representation. `semantic`/`fuse_rrf`/`rerank` may raise `NotImplementedError` placeholders this phase.
+- `benchmark/backends/elasticsearch.py` (part 1) — `ElasticsearchBackend` implementing the ingest seam (`register_inference`, `ensure_index`, `bulk_index`) and `LexicalSearcher(Searcher)`. A shared ES-client helper that runs a query body and returns `list[ScoredDoc]` (score desc, tie-break `doc_id`) — reused by `VectorSearch` in Phase 10.
 
 **Depends on.** Phases 5, 6.
 
 **Implementation notes (§3.3, §9.1, §5).**
 - **`register_inference` idempotent create-or-get** → `PUT _inference/{task_type}/{inference_id}`, **emitting BOTH `service_settings` and `task_settings`** separately (§3.4); returns `inference_id`.
-- **`bm25`** → `{ "standard": { "query": { "match": { "search_text": "$Q" } } } }` plan (query-independent; `$Q` slot only).
-- **`execute` (§3.3):** binds `query.text` into **every** query slot, runs, returns docs **score desc with deterministic tie-break on `doc_id`** (§9.1); ≤ `top_k`.
-- **`capabilities`** reports `server_side_rrf`/`server_side_rerank`/`semantic_query`; **`semantic_query` is the hard 8.15 gate** (§1.1/§3.3). Optional implicit `match`-on-`semantic_text` form only when cluster ≥ 8.18.
+- **`LexicalSearcher.search(query, top_k)`** → `{ "query": { "match": { "search_text": query } }, "size": top_k }`; the query string is threaded in directly (no separate bind step); returns docs **score desc with deterministic tie-break on `doc_id`** (§9.1); ≤ `top_k`.
 - `ensure_index`/`bulk_index` honor idempotency (`_id = product_id`, §3.5 step 3).
 
 **Test / acceptance criteria.** *(requires dockerized ES ≥ 8.15)*
-- `docker compose up -d` + `eval:wait-for-es`; against the small fixture corpus: `ensure_index` + `bulk_index` then a **BM25 `execute`** returns a `RankedResult` ordered score-desc with **doc_id tie-break** verified on a constructed tie.
-- **Query binding:** the `$Q` slot is filled from `query.text` (assert a query with a distinctive token retrieves the matching doc).
+- `docker compose up -d` + `eval:wait-for-es`; against the small fixture corpus: `ensure_index` + `bulk_index` then `LexicalSearcher.search` returns a `list[ScoredDoc]` ordered score-desc with **doc_id tie-break** verified on a constructed tie; ≤ `top_k`.
+- **Query threading:** a query with a distinctive token retrieves the matching doc.
 - **`register_inference`** emits separate `service_settings`/`task_settings` (assert against the registered endpoint body) and is idempotent (second call no-ops/returns same id).
-- **`capabilities().semantic_query` is true** on the ≥ 8.15 cluster.
-- *(Offline unit slice where feasible: the plan-building of `bm25` and `execute`'s binding/tie-break logic can also be unit-tested without a live cluster via a thin response stub; the live-ES test is the acceptance gate.)*
+- *(Offline unit slice where feasible: the query-body build + score-desc/tie-break sort can be unit-tested via a thin response stub; the live-ES test is the acceptance gate.)*
 
-**Developer / reviewer responsibilities.** Developer implements part 1 against a live ES. Reviewer verifies the tie-break, the `service`/`task` split in registration, and that `capabilities` gates on 8.15.
+**Developer / reviewer responsibilities.** Developer implements part 1 against a live ES. Reviewer verifies the tie-break, the `service`/`task` split in registration, and that `LexicalSearcher` returns a plain `list[ScoredDoc]`.
 
-**User sign-off gate.** Inspect the live BM25 round-trip test output, the tie-break test, and `register_inference` body split. Approve → **commit on user consent only.**
+**User sign-off gate.** Inspect the live `LexicalSearcher` round-trip test output, the tie-break test, and `register_inference` body split. Approve → **commit on user consent only.**
 
 ---
 
-### Phase 10 — `backends/elasticsearch.py` — semantic + RRF + rerank + `ElasticsearchIndexer` (Docker ES)
+### Phase 10 — `backends/elasticsearch.py` — `VectorSearch` + `ESReranker` + `ESIndexer` (Docker ES)
 
-**Objective.** Complete the ES backend: semantic retriever, server-side RRF fuse, `text_similarity_reranker`, and the indexer (semantic_text + copy_to).
+**Objective.** Complete the ES adapter: the semantic leaf `Searcher`, the client-side `Reranker`, and the indexer (semantic_text + copy_to). Fusion is client-side (`RRFFuser`, Phase 5) — no server-side `rrf`/`text_similarity_reranker`.
 
 **Deliverables.**
-- `benchmark/backends/elasticsearch.py` (part 2) — `semantic(field)`, `fuse_rrf(children, rank_constant, rank_window_size)`, `rerank(child, inference_id, field, rank_window_size)`, and `ElasticsearchIndexer` implementing `Indexer.build(...)` → `IndexMapping`.
+- `benchmark/backends/elasticsearch.py` (part 2) — `VectorSearch(Searcher)`, `ESReranker(Reranker)`, and `ESIndexer` implementing `Indexer.build(...)` → `IndexMapping`. A `searcher_factory` (used by `spec_for`, §4) that builds `LexicalSearcher`/`VectorSearch`/`ESReranker` bound to the ES client + `IndexMapping`.
 
 **Depends on.** Phase 9.
 
 **Implementation notes (§3.5, §5.2, §5.3).**
-- **`semantic`** → explicit `{ "semantic": { "field": ..., "query": "$Q" } }` (default, version-robust, ES ≥ 8.15); optional implicit `match` form only when caps ≥ 8.18.
-- **`fuse_rrf`** → `{ "rrf": { "retrievers": [...], "rank_constant": $k, "rank_window_size": $W } }`.
-- **`rerank`** → `{ "text_similarity_reranker": { "retriever": <child>, "field": "search_text", "inference_id": ..., "inference_text": "$Q", "rank_window_size": $W } }`. **`inference_text` is REQUIRED and injected by `execute()`** — not auto-filled from the child query (§3.3 design note, §5.3).
+- **`VectorSearch.search(query, top_k)`** → explicit `{ "query": { "semantic": { "field": ..., "query": query } }, "size": top_k }` (default, version-robust, ES ≥ 8.15); optional implicit `match` form only when cluster ≥ 8.18. Returns `list[ScoredDoc]` via the shared client helper (score desc, tie-break `doc_id`).
+- **`ESReranker.rerank(query, candidates)`** (client-side, §3.7) → fetch each candidate's `search_text` by id (a doc-text lookup), call `POST _inference/rerank/{inference_id}` with `query` + the candidate doc-texts, and reorder via **`rerank_local`** (`score_fn` wraps the inference call; `doc_text` is the by-id fetch; window = `rerank_window_size`). No `text_similarity_reranker` retriever tree.
 - **Indexer lifecycle (§3.5 strict order):** (1) `register_inference` for each `EmbeddingModel` **before** `ensure_index` (a `semantic_text` field can't map before its `inference_id` exists); (2) translate `field_schema` → mapping with `search_text` `text` field carrying **`copy_to` → one `semantic_text` field per model** (`copy_to` lives on the **source `text` field**, §5.2 — not `copy_to_source`); each `semantic_text` field sets `inference_id` explicitly; (3) stream `bulk_index` (ES embeds at ingest); (4) return `IndexMapping` with per-model `sem_field` names. **Rerankers are NOT registered here** (lazy at run, §8 R0).
 
 **Test / acceptance criteria.** *(requires dockerized ES ≥ 8.15)*
 - **Indexer:** `build` registers an embedding endpoint, creates the mapping with `search_text.copy_to` → `semantic_text` field(s), bulk-indexes the fixture, returns an `IndexMapping` whose `sem_field(model)` resolves; assert the **`copy_to` is on the source field** and `inference_id` is set on each semantic field.
-- **semantic execute:** a semantic query returns a `RankedResult` (using a local ES inference model, e.g. ELSER/E5, to avoid external keys).
-- **server-side RRF:** `fuse_rrf` over BM25 + semantic executes and returns fused results; `capabilities().server_side_rrf` true.
-- **rerank:** `text_similarity_reranker` plan carries an injected `inference_text` (assert the bound request body), and `execute` returns reranked results; **`W <= task_settings["top_n"]`** holds for the registered reranker.
-- **Equivalence (cross-check to Phase 4):** for a given `PipelineSpec`, server-side RRF ranking matches `fuse_rrf_local` on the same candidate lists/window (sanity check of §3.7's "identical ranking" claim on a small case).
+- **`VectorSearch.search`:** a semantic query returns a `list[ScoredDoc]` (using a local ES inference model, e.g. ELSER/E5, to avoid external keys).
+- **client-side hybrid:** `HybridSearch([LexicalSearcher, VectorSearch], RRFFuser(k), W)` over the fixture returns fused results; cross-check equals `fuse_rrf_local` on the two leaves' lists at the same window (sanity check of §3.7 on a small case — the fuser IS `fuse_rrf_local`, so this verifies the leaves feed it correctly).
+- **`ESReranker.rerank`:** the `_inference` rerank call receives `query` + the candidate doc-texts (assert the request body), and returns candidates reordered by model score; **`W <= task_settings["top_n"]`** holds for the registered reranker.
 
-**Developer / reviewer responsibilities.** Developer completes the backend + indexer against live ES, preferring local inference models for tests. Reviewer verifies the strict lifecycle order, `copy_to` placement, the required `inference_text` injection, and the semantic-query 8.15 form.
+**Developer / reviewer responsibilities.** Developer completes the leaf searchers, the reranker, and the indexer against live ES, preferring local inference models for tests. Reviewer verifies the strict lifecycle order, `copy_to` placement, the client-side reranker using `rerank_local`, and the semantic-query 8.15 form.
 
-**User sign-off gate.** Inspect the indexer mapping (copy_to + per-model semantic_text), the rerank `inference_text` injection test, and the RRF equivalence cross-check. Approve → **commit on user consent only.**
+**User sign-off gate.** Inspect the indexer mapping (copy_to + per-model semantic_text), the `ESReranker` request-body test, and the client-side hybrid cross-check. Approve → **commit on user consent only.**
 
 ---
 
@@ -421,14 +419,14 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Deliverables.**
 - `benchmark/runner.py` — `ExperimentRunner.run(cfg)` exactly per §8.0 (incl. R0 lazy reranker registration + `W <= top_n` assert, baseline-first, the §8.0a best_per_model phase, in-memory metric vectors, comparator pass, run_config write).
 - Hatch `eval:index` and `eval:run` scripts fully wired (entry points), including `--config` and `--dry-run` (README "Useful invocations").
-- **Factory-to-adapter binding (owned here):** wire `config.py`'s `load_dataset`/`make_backend` factories — stubbed/lazily-imported in Phase 6 to stay offline — to the **real** adapters now that they exist: `dataset.name == "wands"` → `WandsDataset` (Phase 8), `backend.kind == "elasticsearch"` → `ElasticsearchBackend` (Phase 10). This is the concrete moment the §11 factories resolve to live adapters.
+- **Factory-to-adapter binding (owned here):** wire `config.py`'s `load_dataset`/`make_backend`/`make_searcher_factory` factories — stubbed/lazily-imported in Phase 6 to stay offline — to the **real** adapters now that they exist: `dataset.name == "wands"` → `WandsDataset` (Phase 8), `backend.kind == "elasticsearch"` → `ElasticsearchBackend` (ingest) + the ES `searcher_factory` building `LexicalSearcher`/`VectorSearch`/`ESReranker` (Phase 10). This is the concrete moment the §11 factories resolve to live adapters.
 
 **Depends on.** Phases 2, 3, 5, 6, 7, 8, 10.
 
 **Implementation notes (§8.0, §6, §1.4(4)).**
-- **Setup prelude before any `run_one` (first five lines of §8.0):** `runner.run()` must (a) call `ElasticsearchIndexer.build(dataset, backend, cfg.embedding_models)` to obtain the `IndexMapping`, (b) freeze `queries = list(dataset.queries())` as the single shared query set, and (c) build `QrelIndex(dataset.qrels())` once — all before the first `run_one`. Do not under-build this setup phase.
-- **`eval:index` entry point** invokes this same indexer path: `ElasticsearchIndexer.build` in §3.5 strict order — **register embedding endpoints → `ensure_index` (semantic_text + `copy_to`) → `bulk_index`**. (`eval:index` builds/populates the index; `eval:run` consumes it.)
-- **One `run_one` path for every variant — baseline included** (DRY guarantee, §8.0): R0 register reranker if `reranker_id` and `assert v.window <= ep.task_settings["top_n"]`; `spec_for`; `pipeline.run` over the **frozen shared query set**; `write_result_csv`; `Evaluator.score_run`; `write_metrics_csv`; stash per-query vectors keyed by `v.id`.
+- **Setup prelude before any `run_one` (first lines of §8.0):** `runner.run()` must (a) call `ESIndexer.build(dataset, backend, cfg.embedding_models)` to obtain the `IndexMapping`, (b) build the `searcher_factory` (bound to the ES client + `IndexMapping`), (c) freeze `queries = list(dataset.queries())` as the single shared query set, and (d) build `QrelIndex(dataset.qrels())` once — all before the first `run_one`. Do not under-build this setup phase.
+- **`eval:index` entry point** invokes this same indexer path: `ESIndexer.build` in §3.5 strict order — **register embedding endpoints → `ensure_index` (semantic_text + `copy_to`) → `bulk_index`**. (`eval:index` builds/populates the index; `eval:run` consumes it.)
+- **One `run_one` path for every variant — baseline included** (DRY guarantee, §8.0): R0 register reranker if `reranker_id` and `assert v.window <= ep.task_settings["top_n"]`; `pipeline = spec_for(v, mapping, factory)`; call `pipeline.search(q.text, top_k=cfg.top_k)` per query over the **frozen shared query set**, wrapping each into `RankedResult(q.query_id, docs)`; `write_result_csv`; `Evaluator.score_run`; `write_metrics_csv`; stash per-query vectors keyed by `v.id`.
 - **Baseline materialized first** (§6) so every comparison has its paired reference in memory.
 - **§8.0a phase** runs only when `hybrid_rerank_k == "best_per_model"`, after all static variants, feeding selected `VariantCfg`s through the **same** `run_one`.
 - **Comparator pass (family-wide, §8.0/§8.3):** collect the baseline's per-query metric maps and ALL non-baseline variants' maps (adapt `Metrics` → plain `{metric: value}` via `Metrics.as_dict()`, since `stats` consumes maps, not `Metrics`), call `Comparator(cfg.stats).compare(baseline_maps, variant_maps)` **once** so the FDR correction (BH/BY) is applied across the whole `(variant × metric)` family, then group the returned rows by variant and `write_comparison_csv` one `comparison_bm25_{variant}_*` per variant; then `write_run_config`.
@@ -486,7 +484,7 @@ tests/
   unit/                  # Phases 1–8 pure tests (no Docker)
   integration/           # Phases 9–12 live-ES tests (marked, skipped without ES)
 ```
-- **`FakeBackend`** (built in Phase 5, promoted to `conftest.py`): an in-memory `SearchBackend` returning deterministic `RankedResult`s, configurable `capabilities()` (server-side caps on/off) to exercise both the server-side and §3.7 harness-side paths. **`FakeReranker`/`FakeEmbeddingModel`** structurally satisfy the descriptor Protocols.
+- **`FakeSearcher`/`FakeReranker`** (built in Phase 5, in `conftest.py`): `FakeSearcher` is a leaf `Searcher` returning a canned `list[ScoredDoc]` honoring `top_k` (and recording the `top_k` it was queried at); `FakeReranker` reorders candidates by a canned rule. They exercise the composers (§3.6) client-side without a live cluster. **`FakeEmbeddingModel`** structurally satisfies the ingest descriptor.
 - **Tiny WANDS sample fixture** (Phase 8): a handful of rows per file, hand-labeled so metrics are hand-computable; reused by Phases 9–11 as the small live corpus.
 - Integration tests are marked (e.g. `@pytest.mark.integration`) and **skipped when `ES_URL` is unreachable**, so the pure suite (Phases 1–8) runs fully offline in CI.
 
@@ -515,7 +513,7 @@ tests/
 |--------------|:-----:|
 | `models.py` | 1 |
 | `protocols.py` | 1 |
-| `pipeline.py` (incl. `PipelineSpec`/`FuseCfg`/`RerankCfg`/`StageCfg`) | 5 |
+| `pipeline.py` (`RRFFuser`/`HybridSearch`/`SearchPipeline`) | 5 |
 | `spec_for()` (in `matrix.py`) | 6 |
 | `fusion.py` | 4 |
 | `rerank.py` | 4 |
@@ -527,8 +525,8 @@ tests/
 | `config.py` | 6 |
 | `logging_setup.py` | 0 |
 | `datasets/wands.py` | 8 |
-| `backends/elasticsearch.py` (BM25 + lifecycle + execute + capabilities) | 9 |
-| `backends/elasticsearch.py` (semantic + RRF + rerank + `ElasticsearchIndexer`) | 10 |
+| `backends/elasticsearch.py` (ingest lifecycle + `LexicalSearcher`) | 9 |
+| `backends/elasticsearch.py` (`VectorSearch` + `ESReranker` + `ESIndexer`) | 10 |
 | `pyproject.toml`, `docker-compose.yml`, `.gitignore`, `config.yaml`, eval scripts | 0 |
 
 ### §1.4 success criteria → phase
@@ -536,5 +534,5 @@ tests/
 |----------------|----------|--------------|
 | (1) **Correctness** — three CSV types, exact §9 schemas, one §8.3 regime | 2, 3, 7, 11 | 7 (golden), 12 (full schema lint) |
 | (2) **Reproducibility** — config + seed reproduces metrics/stats; `best_per_model` seed-independent | 3, 6, 7 | 3 (seeded determinism), 6 (selection determinism), 12 (two-run diff) |
-| (3) **Generality** — dataset/backend swap = adapter + config only; degenerate metrics defined | 1, 3, 6, 8, 9, 10 | 3 (degenerate sets), 5 (FakeBackend), 12 (import-graph check) |
-| (4) **DRY** — 6 variants = one pipeline + one execution path | 5, 11 | 5 (all 6 specs via one `run()`), 11/12 (single `run_one` inspection) |
+| (3) **Generality** — dataset/backend swap = adapter + config only; degenerate metrics defined | 1, 3, 6, 8, 9, 10 | 3 (degenerate sets), 5 (fakes), 12 (import-graph check) |
+| (4) **DRY** — 6 variants = one set of composers + one execution path | 5, 11 | 5 (composers cover all 6 graphs), 11/12 (single `run_one` inspection) |

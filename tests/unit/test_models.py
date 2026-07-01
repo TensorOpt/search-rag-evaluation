@@ -7,7 +7,6 @@ import dataclasses
 import pytest
 
 from benchmark.models import (
-    BackendCapabilities,
     Document,
     FieldRole,
     FieldSchema,
@@ -69,13 +68,6 @@ def test_inference_endpoint_construction():
     assert ep.task_type is InferenceTaskType.TEXT_EMBEDDING
 
 
-def test_backend_capabilities_construction():
-    caps = BackendCapabilities(server_side_rrf=True, server_side_rerank=False, semantic_query=True)
-    assert caps.server_side_rrf is True
-    assert caps.server_side_rerank is False
-    assert caps.semantic_query is True
-
-
 def test_indexmapping_construction():
     m = IndexMapping(
         index_name="wands_bench",
@@ -105,7 +97,6 @@ def test_indexmapping_construction():
             "service",
             "openai",
         ),
-        (BackendCapabilities(True, True, True), "semantic_query", False),
         (IndexMapping("i", "search_text", {}, {}), "index_name", "j"),
     ],
 )

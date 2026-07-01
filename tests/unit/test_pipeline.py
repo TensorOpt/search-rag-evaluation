@@ -1,138 +1,91 @@
-"""SearchPipeline composition tests via FakeBackend (docs/experiment.md §3.6/§3.7, plan Phase 5)."""
+"""Composite-model composer tests (docs/experiment.md §3.6/§3.7, plan Phase 5).
+
+Exercises the three backend-agnostic composers against ``FakeSearcher``/``FakeReranker``:
+``RRFFuser`` fuses, ``HybridSearch`` retrieves-at-window then fuses then truncates,
+``SearchPipeline`` reranks (or passes through) then truncates, and ``SearchPipeline.__init__``
+rejects misconfiguration.
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from benchmark.fusion import fuse_rrf_local
-from benchmark.models import Query
-from benchmark.pipeline import (
-    FuseCfg,
-    PipelineSpec,
-    RerankCfg,
-    SearchPipeline,
-    StageCfg,
-    _LocalFusePlan,
-)
-from tests.conftest import (
-    _BM25_DOCS,
-    _SEMANTIC_DOCS,
-    Bm25Spec,
-    FakeBackend,
-    FuseSpec,
-    RerankSpec,
-    SemanticSpec,
-)
+from benchmark.pipeline import HybridSearch, RRFFuser, SearchPipeline
+from tests.conftest import _BM25_DOCS, _SEMANTIC_DOCS, FakeReranker, FakeSearcher
 
-BM25 = StageCfg.bm25(fields=["search_text"])
-SEMANTIC = StageCfg.semantic(field="sem__e5")
-FUSE = FuseCfg(rank_constant=10, rank_window_size=50)
-RERANK = RerankCfg(inference_id="rr", field="search_text", rank_window_size=50)
-
-# The six variant shapes (§4 table).
-SPECS = {
-    "bm25": PipelineSpec(retrievers=[BM25]),
-    "semantic": PipelineSpec(retrievers=[SEMANTIC]),
-    "hybrid": PipelineSpec(retrievers=[BM25, SEMANTIC], fuse=FUSE),
-    "bm25_rerank": PipelineSpec(retrievers=[BM25], rerank=RERANK),
-    "semantic_rerank": PipelineSpec(retrievers=[SEMANTIC], rerank=RERANK),
-    "hybrid_rerank": PipelineSpec(retrievers=[BM25, SEMANTIC], fuse=FUSE, rerank=RERANK),
-}
-
-QUERIES = [Query("q1", "sofa"), Query("q2", "lamp")]
+RANK_CONSTANT = 10
+WINDOW = 50
 
 
-# --- caps TRUE: full server-side composition -------------------------------------------------
+# --- RRFFuser ---------------------------------------------------------------------------------
 
 
-def test_all_six_variants_run_one_result_per_query() -> None:
-    backend = FakeBackend()  # both server-side caps true
-    pipeline = SearchPipeline(backend)
-    for spec in SPECS.values():
-        results = list(pipeline.run(spec, QUERIES, top_k=10))
-        assert [r.query_id for r in results] == ["q1", "q2"]
-
-
-def test_server_side_combinators_composed_only_where_expected() -> None:
-    for name, spec in SPECS.items():
-        backend = FakeBackend()
-        plan = SearchPipeline(backend).plan(spec)
-        fused = "hybrid" in name
-        reranked = name.endswith("_rerank")
-        assert bool(backend.fuse_calls) is fused, name
-        assert bool(backend.rerank_calls) is reranked, name
-        if reranked:
-            assert isinstance(plan, RerankSpec), name
-            # rerank wraps the fused plan for hybrid_rerank, else the bare leaf.
-            expected_child = FuseSpec if fused else (Bm25Spec if "bm25" in name else SemanticSpec)
-            assert isinstance(plan.child, expected_child), name
-        elif fused:
-            assert isinstance(plan, FuseSpec), name
-        else:
-            assert isinstance(plan, (Bm25Spec, SemanticSpec)), name
-
-
-def test_bm25_baseline_is_single_leaf() -> None:
-    plan = SearchPipeline(FakeBackend()).plan(SPECS["bm25"])
-    assert plan == Bm25Spec(fields=("search_text",))
-
-
-# --- caps FALSE: harness-side fuse fallback + deferred rerank --------------------------------
-
-
-def test_hybrid_uses_local_fuse_when_no_server_side_rrf() -> None:
-    backend = FakeBackend(server_side_rrf=False, server_side_rerank=False)
-    pipeline = SearchPipeline(backend)
-
-    plan = pipeline.plan(SPECS["hybrid"])
-    assert isinstance(plan, _LocalFusePlan)
-    assert not backend.fuse_calls  # server-side fuse never called
-
-    results = list(pipeline.run(SPECS["hybrid"], QUERIES, top_k=10))
+def test_rrf_fuser_equals_fuse_rrf_local() -> None:
+    fuser = RRFFuser(rank_constant=RANK_CONSTANT)
+    fused = fuser.fuse([_BM25_DOCS, _SEMANTIC_DOCS], rank_window_size=WINDOW)
     expected = fuse_rrf_local(
-        [_BM25_DOCS, _SEMANTIC_DOCS],
-        rank_constant=FUSE.rank_constant,
-        rank_window_size=FUSE.rank_window_size,
+        [_BM25_DOCS, _SEMANTIC_DOCS], rank_constant=RANK_CONSTANT, rank_window_size=WINDOW
     )
-    for result in results:
-        assert result.docs == expected
+    assert fused == expected
 
 
-def test_single_leaf_variants_run_without_caps() -> None:
-    backend = FakeBackend(server_side_rrf=False, server_side_rerank=False)
-    pipeline = SearchPipeline(backend)
-    assert list(pipeline.run(SPECS["bm25"], QUERIES, top_k=10))[0].docs == _BM25_DOCS
-    assert list(pipeline.run(SPECS["semantic"], QUERIES, top_k=10))[0].docs == _SEMANTIC_DOCS
+# --- HybridSearch -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["bm25_rerank", "semantic_rerank", "hybrid_rerank"])
-def test_rerank_variants_raise_when_no_server_side_rerank(name: str) -> None:
-    backend = FakeBackend(server_side_rrf=False, server_side_rerank=False)
-    pipeline = SearchPipeline(backend)
-    with pytest.raises(NotImplementedError, match="rerank fallback is deferred"):
-        pipeline.plan(SPECS[name])
-    with pytest.raises(NotImplementedError):
-        list(pipeline.run(SPECS[name], QUERIES, top_k=10))
+def test_hybrid_search_retrieves_at_window_fuses_and_truncates() -> None:
+    bm25 = FakeSearcher(_BM25_DOCS)
+    semantic = FakeSearcher(_SEMANTIC_DOCS)
+    hybrid = HybridSearch(
+        retrievers=[bm25, semantic],
+        fuser=RRFFuser(rank_constant=RANK_CONSTANT),
+        retrieval_window_size=WINDOW,
+    )
+
+    result = hybrid.search("sofa", top_k=2)
+
+    # each retriever was queried at retrieval_window_size, not top_k
+    assert bm25.top_k_calls == [WINDOW]
+    assert semantic.top_k_calls == [WINDOW]
+
+    expected = fuse_rrf_local(
+        [_BM25_DOCS, _SEMANTIC_DOCS], rank_constant=RANK_CONSTANT, rank_window_size=WINDOW
+    )
+    assert result == expected[:2]
 
 
-def test_rerank_on_local_fuse_plan_raises_even_if_rerank_server_side() -> None:
-    # server_side_rerank true but server_side_rrf false -> base is a local fuse plan, which
-    # cannot be reranked server-side; must raise rather than silently drop the fuse.
-    backend = FakeBackend(server_side_rrf=False, server_side_rerank=True)
-    with pytest.raises(NotImplementedError):
-        SearchPipeline(backend).plan(SPECS["hybrid_rerank"])
+# --- SearchPipeline ---------------------------------------------------------------------------
 
 
-# --- guards ----------------------------------------------------------------------------------
+def test_pipeline_without_reranker_is_pass_through() -> None:
+    retriever = FakeSearcher(_BM25_DOCS)
+    pipeline = SearchPipeline(retriever=retriever)
+
+    assert pipeline.search("sofa", top_k=2) == _BM25_DOCS[:2]
+    assert retriever.top_k_calls == [2]  # retrieved directly at top_k
 
 
-def test_unknown_stage_kind_raises() -> None:
-    bad = PipelineSpec(retrievers=[StageCfg(kind="lexical")])  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="unknown retrieval stage kind"):
-        SearchPipeline(FakeBackend()).plan(bad)
+def test_pipeline_with_reranker_retrieves_window_then_reranks_then_truncates() -> None:
+    retriever = FakeSearcher(_BM25_DOCS)
+    reranker = FakeReranker()
+    pipeline = SearchPipeline(retriever=retriever, reranker=reranker, rerank_window_size=WINDOW)
+
+    result = pipeline.search("sofa", top_k=2)
+
+    assert retriever.top_k_calls == [WINDOW]  # retrieved at rerank_window_size
+    assert reranker.rerank_calls == [("sofa", tuple(d.doc_id for d in _BM25_DOCS))]
+    # FakeReranker reverses the candidates, then truncated to top_k
+    assert result == list(reversed(_BM25_DOCS))[:2]
 
 
-def test_multiple_leaves_without_fuse_raises() -> None:
-    bad = PipelineSpec(retrievers=[BM25, SEMANTIC])  # 2 leaves, no fuse
-    with pytest.raises(ValueError, match="exactly one retriever"):
-        SearchPipeline(FakeBackend()).plan(bad)
+# --- SearchPipeline __init__ misconfig --------------------------------------------------------
+
+
+def test_pipeline_reranker_without_window_raises() -> None:
+    with pytest.raises(ValueError, match="rerank_window_size is required"):
+        SearchPipeline(retriever=FakeSearcher(_BM25_DOCS), reranker=FakeReranker())
+
+
+def test_pipeline_window_without_reranker_raises() -> None:
+    with pytest.raises(ValueError, match="must be None"):
+        SearchPipeline(retriever=FakeSearcher(_BM25_DOCS), rerank_window_size=WINDOW)

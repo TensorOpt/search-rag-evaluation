@@ -1,12 +1,13 @@
-"""Harness-side windowed rerank fallback ``rerank_local`` (docs/experiment.md §3.7). Phase 4.
+"""Windowed client-side rerank helper ``rerank_local`` (docs/experiment.md §3.7). Phase 4.
 
-Pure Python; imports only ``benchmark.models`` + stdlib. Used only when a backend cannot rerank
-server-side (ES reranks via ``text_similarity_reranker`` and never touches this path).
+Pure Python; imports only ``benchmark.models`` + stdlib. This is the reusable score+reorder
+helper a concrete ``Reranker`` (e.g. ES ``ESReranker``, Phase 10) uses to implement ``rerank()``
+client-side: the reranker fetches candidate doc-text by id and calls its inference endpoint,
+passing that as ``score_fn`` + ``doc_text`` here to get the windowed reorder.
 
-Design note (resolves the §3.7 signature gap): the ``Reranker`` Protocol (§3.4) is a pure
-descriptor exposing only ``as_endpoint()`` — it CANNOT score documents locally. So ``rerank_local``
-takes a ``score_fn`` instead of a ``Reranker``: a non-ES backend wraps its reranker inference call
-into ``score_fn(query, doc_texts) -> one relevance score per text`` (higher = more relevant).
+``rerank_local`` takes a ``score_fn`` rather than a ``Reranker`` because scoring is backend-specific:
+the caller wraps its inference call into ``score_fn(query, doc_texts) -> one relevance score per
+text`` (higher = more relevant).
 """
 
 from __future__ import annotations

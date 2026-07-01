@@ -1,8 +1,9 @@
 """Pure frozen data models and shared enums (docs/experiment.md §3.1-§3.5). Phase 1.
 
-Plain frozen dataclasses + enums ONLY. No Protocols and no business logic live here
-(Protocols are in ``protocols.py``; the pipeline-config types ``StageCfg``/``FuseCfg``/
-``RerankCfg``/``PipelineSpec`` live in ``pipeline.py`` per §11).
+Plain frozen dataclasses + enums ONLY. No Protocols/ABCs and no business logic live here
+(the abstraction seams ``Searcher``/``Fuser``/``Reranker`` + the ingest Protocols are in
+``protocols.py``; the concrete composers ``RRFFuser``/``HybridSearch``/``SearchPipeline`` live
+in ``pipeline.py`` per §11).
 """
 
 from __future__ import annotations
@@ -130,18 +131,6 @@ class InferenceEndpoint:
     service: str
     service_settings: Mapping[str, Any] = field(default_factory=dict)
     task_settings: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BackendCapabilities:
-    """What a backend can do server-side (§3.3).
-
-    ``semantic_query`` (explicit ``{"semantic": {...}}`` query) is the hard 8.15 gate.
-    """
-
-    server_side_rrf: bool
-    server_side_rerank: bool
-    semantic_query: bool
 
 
 @dataclass(frozen=True)
