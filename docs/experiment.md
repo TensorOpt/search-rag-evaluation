@@ -357,7 +357,11 @@ class SearchPipeline:
     def plan(self, spec: PipelineSpec) -> RetrieverSpec:
         """Compose retrieve -> [fuse] -> [rerank]. Pure composition; no per-variant
         branching beyond presence/absence of fuse/rerank. Uses server-side combinators
-        when capabilities() allows, else wraps harness-side helpers (§3.7)."""
+        when capabilities() allows, else wraps harness-side helpers (§3.7).
+
+        When capabilities().server_side_rrf is FALSE, plan() returns a harness-side
+        local fuse plan (an internal marker carrying the leaves + FuseCfg) instead of a
+        backend RetrieverSpec; run() then fuses those leaves via fuse_rrf_local (§3.7)."""
 
     def run(self, spec: PipelineSpec, queries: Iterable[Query], *,
             top_k: int) -> Iterator[RankedResult]:
@@ -405,11 +409,15 @@ def rerank_local(query: Query, candidates: Sequence[ScoredDoc], *,
 
 ES uses **none** of these (it fuses/reranks server-side); they exist so a Qdrant/FAISS backend implements the same `PipelineSpec` without forking pipeline code, and with the same window semantics.
 
+> **What `SearchPipeline` wires today (Phase 5).** `plan()`/`run()` WIRE the **fusion** fallback: when `capabilities().server_side_rrf` is false, `run()` materializes each leaf's candidate list per query and fuses them with `fuse_rrf_local` (same `rank_constant`/`rank_window_size`). The harness-side **RERANK** fallback is **DEFERRED** (§13): when a `rerank` stage is requested but cannot run server-side (either `capabilities().server_side_rerank` is false, or the upstream is a harness-side local fuse plan), `SearchPipeline` raises `NotImplementedError` rather than silently degrading. `rerank_local` remains a fully-tested Phase-4 helper, ready to be wired the day a non-server-side-rerank backend is added — the pipeline does not import it yet.
+
 ---
 
 ## 4. Variants as Pure Composition (DRY)
 
 Every variant is a `PipelineSpec`. No variant has bespoke code; the matrix expander (§10) emits these specs.
+
+> `spec_for` lives in **`matrix.py`** (§11) and is built in **Phase 6**, not with the pipeline: it maps a `VariantCfg` → `PipelineSpec`, so keeping it in `matrix.py` avoids a `pipeline`→`matrix` forward dependency. `pipeline.py` (Phase 5) defines only the config dataclasses (`StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec`) and `SearchPipeline`. The code sketch below is illustrative of the mapping.
 
 | Variant | retrievers | fuse | rerank |
 |---------|-----------|------|--------|
@@ -779,12 +787,12 @@ Each expanded row → a `PipelineSpec` (§4) → one `result_*` + `metrics_*` + 
 benchmark/
   models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, InferenceEndpoint
   protocols.py           # Dataset, SearchBackend, EmbeddingModel, Reranker, Indexer, RetrieverSpec Protocols
-  pipeline.py            # SearchPipeline, PipelineSpec, FuseCfg, RerankCfg, spec_for()
+  pipeline.py            # SearchPipeline, StageCfg, PipelineSpec, FuseCfg, RerankCfg
   fusion.py              # fuse_rrf_local (harness-side fallback, windowed)
   rerank.py              # rerank_local (harness-side fallback, windowed)
   metrics.py             # Evaluator, Metrics, QrelIndex (ndcg/recall/precision/avg_relevance)
   stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, FDR/BH-BY; degenerate-set handling)
-  matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), VariantCfg, ResolvedConfig
+  matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), spec_for(), VariantCfg, ResolvedConfig
   runner.py              # ExperimentRunner (the single execution path, §8.0)
   io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
   config.py              # YAML/JSON load + resolve + ConfigInferenceModel (implements EmbeddingModel & Reranker)
@@ -817,6 +825,7 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 ## 13. Open Questions / Deferred
 - `hybrid_rerank` k selection: the default is a **fixed integer** (single-pass, unbiased); `best_per_model` is the opt-in two-pass mode (§8.0a) and is **optimistically biased** (selection on the evaluation set). Whether to ship a built-in train/test query split for `best_per_model` reporting, expose alternative selection metrics (e.g. recall@10), or change the tie-break is deferred.
 - **Matching FDR-adjusted interval regime:** **BH-FDR is now the DEFAULT decision** (§8.3), with an unadjusted descriptive CI (§8.2) that may disagree with the flag. What remains **deferred** is a **matching FDR-adjusted confidence-interval regime** (or a max-statistic simultaneous confidence band) so the reported interval and the FDR decision coincide *by construction* rather than living in separate roles — and, possibly, **switching BY to the default** if PRDS proves doubtful for these correlated retrieval configs.
+- **Harness-side rerank fallback (deferred):** `SearchPipeline` wires the fusion fallback (`fuse_rrf_local`) but **raises `NotImplementedError`** when a rerank stage cannot run server-side (§3.7). Wiring `rerank_local` needs a backend surface it does not have today: a `(query, doc) -> score` scorer plus a doc-text lookup for the candidate ids (the `Reranker` descriptor exposes only `as_endpoint()` and cannot score locally, §3.4). ES reranks server-side and never hits this path. Deferred until a non-server-side-rerank backend (e.g. a pure vector index) is added.
 - **`bm25` as a capability:** currently BM25 is a mandatory `SearchBackend` primitive, not a `BackendCapabilities` flag (§3.3). If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, promote `bm25` to a capability and have the matrix skip `bm25`/`hybrid`/`bm25_rerank` when it is false. Deferred until such a backend exists (no consumer today).
 - Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
 - Pooling-depth / missing-judgement sensitivity analysis (current default: **missing judgements are skipped via condensed-list evaluation**, §7 — NOT scored as gain 0; only judged-irrelevant docs count as a 0).

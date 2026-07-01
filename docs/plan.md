@@ -46,9 +46,9 @@ flowchart TB
   P1 --> P2["Phase 2<br/>metrics.py"]
   P1 --> P3["Phase 3<br/>stats.py"]
   P1 --> P4["Phase 4<br/>fusion.py + rerank.py"]
-  P1 --> P5["Phase 5<br/>pipeline.py + spec_for"]
+  P1 --> P5["Phase 5<br/>pipeline.py (SearchPipeline)"]
   P4 --> P5
-  P1 --> P6["Phase 6<br/>matrix.py + config.py"]
+  P1 --> P6["Phase 6<br/>matrix.py (+ spec_for) + config.py"]
   P1 --> P7["Phase 7<br/>io_csv.py"]
   P2 --> P7
   P3 --> P7
@@ -73,7 +73,7 @@ flowchart TB
 | 2 | `metrics.py` | 1 | no (pure) |
 | 3 | `stats.py` | 1 | no (pure) |
 | 4 | `fusion.py` + `rerank.py` (harness-side fallbacks) | 1 | no (pure) |
-| 5 | `pipeline.py` (`SearchPipeline`, `PipelineSpec`, `spec_for`) | 1, 4 | no (FakeBackend) |
+| 5 | `pipeline.py` (`SearchPipeline`, `PipelineSpec`) | 1, 4 | no (FakeBackend) |
 | 6 | `matrix.py` + `config.py` | 1 | no (pure) |
 | 7 | `io_csv.py` | 1, 2, 3 | no (golden files) |
 | 8 | `datasets/wands.py` | 1 | no (fixture) |
@@ -131,7 +131,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - `benchmark/models.py` — frozen dataclasses / enums: `Query`, `Document`, `Qrel`, `ScoredDoc`, `RankedResult`, `FieldRole`, `FieldSpec`, `FieldSchema`, `IndexMapping`, `InferenceTaskType`, `InferenceEndpoint`, `BackendCapabilities`. **The pipeline-config types (`StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec`) are NOT here — they live in `pipeline.py` (Phase 5) per §11/§3.6.**
 - `benchmark/protocols.py` — `Dataset`, `SearchBackend`, `RetrieverSpec`, `EmbeddingModel`, `Reranker`, `Indexer` Protocols.
 
-> Note: §11 lists `PipelineSpec`/`FuseCfg`/`RerankCfg`/`StageCfg`/`spec_for` under `pipeline.py`. Keep them in `pipeline.py` per §11; only the §3.1 plain data models (`Query`/`Document`/`Qrel`/`ScoredDoc`/`RankedResult`/`FieldSchema`/`InferenceEndpoint`) live in `models.py`. Shared enums/dataclasses referenced by both (`FieldRole`, `InferenceTaskType`, `IndexMapping`, `BackendCapabilities`) go in `models.py`. Reviewer enforces this split against §11's per-module comments.
+> Note: §11 lists `PipelineSpec`/`FuseCfg`/`RerankCfg`/`StageCfg` under `pipeline.py` (Phase 5); `spec_for` lives in `matrix.py` (Phase 6, see §4). Keep them there per §11; only the §3.1 plain data models (`Query`/`Document`/`Qrel`/`ScoredDoc`/`RankedResult`/`FieldSchema`/`InferenceEndpoint`) live in `models.py`. Shared enums/dataclasses referenced by both (`FieldRole`, `InferenceTaskType`, `IndexMapping`, `BackendCapabilities`) go in `models.py`. Reviewer enforces this split against §11's per-module comments.
 
 **Depends on.** Phase 0.
 
@@ -233,29 +233,32 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 ---
 
-### Phase 5 — `pipeline.py` (`SearchPipeline`, `PipelineSpec`, `spec_for`)
+### Phase 5 — `pipeline.py` (`SearchPipeline`, `PipelineSpec`)
 
-**Objective.** Implement the single DRY pipeline and the variant→spec composition, tested entirely against a `FakeBackend`.
+**Objective.** Implement the single DRY pipeline, tested entirely against a `FakeBackend`. (`spec_for` moves to Phase 6 / `matrix.py` — it maps `VariantCfg`→`PipelineSpec` and would be a `pipeline`→`matrix` forward dependency here; see §4.)
 
 **Deliverables.**
-- `benchmark/pipeline.py` — `StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec` (the pipeline-config dataclasses per §3.6), `SearchPipeline` (`plan()` + `run()`), and `spec_for(variant_cfg, mapping)` (§4).
+- `benchmark/pipeline.py` — `StageCfg`/`FuseCfg`/`RerankCfg`/`PipelineSpec` (the pipeline-config dataclasses per §3.6) and `SearchPipeline` (`plan()` + `run()`). **No `spec_for`** (Phase 6).
 
 **Depends on.** Phases 1, 4.
 
-**Implementation notes (§3.6, §3.7, §4).**
-- `plan()` is **pure composition**: retrieve → [fuse] → [rerank], **no per-variant branching beyond presence/absence** of `fuse`/`rerank`. Uses server-side combinators when `capabilities()` allows, else wraps the §3.7 harness-side helpers (Phase 4) with the **same** `rank_constant`/`rank_window_size`.
-- `run()` builds the plan once, then per query calls `backend.execute(plan, q, top_k=...)` (binding happens in the backend, §3.3).
-- `spec_for` matches §4 exactly: `use_bm25` → bm25 stage on `mapping.search_text_field`; `embedding_model_id` → semantic stage on `mapping.sem_field(id)`; `fuse` → `FuseCfg(rrf_k, window)`; `reranker_id` → `RerankCfg(reranker_id, mapping.rerank_field, window)`. **`spec_for` never performs k-selection** — `v.rrf_k` is already a concrete int (§4, §8.0a).
+**Implementation notes (§3.6, §3.7).**
+- `plan()` is **pure composition**: retrieve → [fuse] → [rerank], **no per-variant branching beyond presence/absence** of `fuse`/`rerank`; the retrieval-stage `kind` branch is **exhaustive** and raises on an unknown value. A spec without `fuse` must have exactly one leaf (else `ValueError`).
+- **Fusion fallback wired:** server-side `fuse_rrf` when `capabilities().server_side_rrf`, else `plan()` returns a pipeline-private local fuse plan and `run()` fuses per-query with `fuse_rrf_local` (§3.7) using the **same** `rank_constant`/`rank_window_size`.
+- **Rerank fallback DEFERRED:** rerank is supported **only** fully server-side. If a `rerank` stage is requested but cannot run server-side (`capabilities().server_side_rerank` false, or the upstream is a local fuse plan), `plan()` raises `NotImplementedError` (§3.7/§13). The pipeline does **not** import `rerank_local` — it stays a tested Phase-4 helper for a later non-server-side-rerank backend.
+- `run()` builds the plan once; for a server-side plan it calls `backend.execute(plan, q, top_k=...)` per query (binding happens in the backend, §3.3); for a local fuse plan it executes each leaf at `rank_window_size` and fuses locally.
+- **`FakeBackend`** test double implementing `SearchBackend` (bm25/semantic → leaf spec nodes; fuse_rrf/rerank → nested spec nodes + spy lists; `execute` → canned `RankedResult` derived from the spec; configurable `capabilities()`; lifecycle no-ops) lives in `tests/conftest.py` (§5) for reuse by Phases 8–11.
 
 **Test / acceptance criteria.** *(pure / offline, via `FakeBackend`)*
-- **All 6 variant specs compose:** `spec_for` produces the §4-table `PipelineSpec` for `bm25`, `semantic`, `hybrid`, `bm25_rerank`, `semantic_rerank`, `hybrid_rerank`; assert retrievers/fuse/rerank presence per the table.
-- **DRY proof:** a `FakeBackend` (server-side caps true) and a second fake (caps false → exercises §3.7 fallbacks) both run all 6 specs through the **same** `run()` with no variant branching; outputs are `RankedResult`s.
-- **Capability gating:** with `server_side_rrf=false`/`server_side_rerank=false`, `plan()` routes through `fuse_rrf_local`/`rerank_local` with identical window/constant; with caps true it composes server-side combinators.
-- `run()` yields one `RankedResult` per query in query order.
+- **All 6 variant shapes run:** build a `PipelineSpec` for `bm25`, `semantic`, `hybrid`, `bm25_rerank`, `semantic_rerank`, `hybrid_rerank`; `run()` over a couple of queries yields one `RankedResult` per query.
+- **Right combinators, no per-variant branching (caps true):** spy asserts `fuse_rrf` called only for `hybrid*`, `rerank` called only for `*_rerank`.
+- **Fuse fallback (caps false):** with `server_side_rrf=false`, `hybrid` runs the LOCAL path and `run()` output equals `fuse_rrf_local` on the two leaf candidate lists (hand-checkable); `bm25`/`semantic` run as a single leaf.
+- **Rerank raises (caps false):** the three rerank variants raise `NotImplementedError` from `plan()`/`run()`; a local fuse plan under a rerank stage raises even when `server_side_rerank` is true.
+- **Guards:** unknown stage `kind` raises `ValueError`; 2 leaves without `fuse` raises `ValueError`. No float `==`; descriptive names.
 
-**Developer / reviewer responsibilities.** Developer implements pipeline + `spec_for` and the `FakeBackend` test double (promote to shared fixture, §5). Reviewer confirms zero per-variant branching and that `spec_for` does no selection.
+**Developer / reviewer responsibilities.** Developer implements pipeline + the `FakeBackend` test double (shared fixture, §5). Reviewer confirms zero per-variant branching, the fuse-fallback wiring, and the rerank-raise.
 
-**User sign-off gate.** Inspect `spec_for` against the §4 table and the FakeBackend test covering all 6 variants under both capability modes. Approve → **commit on user consent only.**
+**User sign-off gate.** Inspect the FakeBackend test covering all 6 variants under both capability modes (fuse fallback + rerank raise). Approve → **commit on user consent only.**
 
 ---
 
@@ -264,7 +267,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Objective.** Implement deterministic matrix expansion (baseline first), the `best_per_model` selection, and config load/resolve.
 
 **Deliverables.**
-- `benchmark/matrix.py` — `VariantCfg`, `ResolvedConfig`, `expand_matrix(cfg)`, `resolve_hybrid_rerank_best_per_model(cfg, per_query)`.
+- `benchmark/matrix.py` — `VariantCfg`, `ResolvedConfig`, `expand_matrix(cfg)`, `resolve_hybrid_rerank_best_per_model(cfg, per_query)`, and `spec_for(variant_cfg, mapping)` (§4; moved here from Phase 5 to avoid a `pipeline`→`matrix` forward dependency — it maps `VariantCfg`→`PipelineSpec`).
 - `benchmark/config.py` — YAML/JSON load + resolve, `${VAR}` env substitution, factories `load_dataset`/`make_backend`, and `ConfigInferenceModel` (implements both `EmbeddingModel` and `Reranker` Protocols).
 
 **Depends on.** Phase 1. *(Factories reference adapters by name only; the adapters themselves arrive in Phases 8/9–10. `make_backend`/`load_dataset` may dispatch on `kind`/`name` with the ES/WANDS branches stubbed/imported lazily so this phase stays offline.)*
@@ -274,6 +277,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **`hybrid_rerank` (§10/§8.0a):** if `hybrid_rerank_k` is an **int** (default 60) → emit models × rerankers at that fixed k as static rows; if `best_per_model` → emit **no** `hybrid_rerank` rows (deferred to §8.0a phase).
 - `resolve_hybrid_rerank_best_per_model`: per model, **argmax mean nDCG@10** over that model's `hybrid` rows; **tie-break: smallest k, then lexicographically smallest variant id**; **seed-independent, deterministic** (§1.4(2)); emits one row per `(model, reranker)` at the chosen k. Operates **only on in-memory `Metrics`** passed in — adds **no adapter dependency** (§11).
 - `expand_matrix` is a **pure deterministic function**; the data dependency is confined to the one named selection phase.
+- `spec_for(v, mapping)` matches §4 exactly: `use_bm25` → `StageCfg.bm25(fields=[mapping.search_text_field])`; `embedding_model_id` → `StageCfg.semantic(field=mapping.sem_field(id))`; `fuse` → `FuseCfg(rrf_k, window)`; `reranker_id` → `RerankCfg(reranker_id, mapping.rerank_field, window)`. It imports the config dataclasses from `pipeline.py` and **never performs k-selection** — `v.rrf_k` is already a concrete int (§4, §8.0a).
 - Variant ids match §9 examples (e.g. `hybrid__e5-small__k60`).
 - `config.py`: `${VAR}` resolved at load (secrets never in file); `ci_level` parsed but is **not** a gate; records correction/test/zero-tie params for run metadata.
 
@@ -281,6 +285,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **Expansion counts & order:** from the §10 `config.yaml` (3 embedding models, 2 rerankers, 10-step k-sweep), assert exact variant **count per family** and that **`bm25` is index 0**; order matches §10.
 - **best_per_model deferral:** with `hybrid_rerank_k: best_per_model`, `expand_matrix` emits **zero** `hybrid_rerank` rows; with an int, it emits `models×rerankers` rows at that k.
 - **Deterministic selection:** `resolve_hybrid_rerank_best_per_model` on hand-built `Metrics` returns the argmax-mean-nDCG k with smallest-k then lexicographic tie-break; identical output across runs (seed-independent).
+- **`spec_for` composes the §4 table:** produces the expected `PipelineSpec` (retrievers/fuse/rerank presence) for `bm25`, `semantic`, `hybrid`, `bm25_rerank`, `semantic_rerank`, `hybrid_rerank`; never performs k-selection.
 - **Config:** `${VAR}` substitution from env; missing required key errors clearly; `ConfigInferenceModel` satisfies both Protocols (mypy + structural test).
 - **Factory dispatch (offline, no adapter import):** assert the `name`→factory registry maps `wands`→the WANDS dataset factory target and `elasticsearch`→the ES backend factory target (as a dotted-path string or lazy importer, **not** by importing the adapter module), and that an unknown `name`/`kind` raises a clear error. The dispatch *logic* is verified here; live resolution (actually importing + constructing the adapter) is deferred to Phase 11.
 
@@ -510,7 +515,8 @@ tests/
 |--------------|:-----:|
 | `models.py` | 1 |
 | `protocols.py` | 1 |
-| `pipeline.py` (incl. `PipelineSpec`/`FuseCfg`/`RerankCfg`/`StageCfg`/`spec_for`) | 5 |
+| `pipeline.py` (incl. `PipelineSpec`/`FuseCfg`/`RerankCfg`/`StageCfg`) | 5 |
+| `spec_for()` (in `matrix.py`) | 6 |
 | `fusion.py` | 4 |
 | `rerank.py` | 4 |
 | `metrics.py` | 2 |
