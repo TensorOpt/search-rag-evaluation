@@ -85,7 +85,7 @@ Every variant is a `PipelineSpec` row of a config-driven matrix — there is no 
 │   ├── pipeline.py            # SearchPipeline, PipelineSpec, FuseCfg, RerankCfg, spec_for()
 │   ├── fusion.py              # fuse_rrf_local (harness-side fallback)
 │   ├── rerank.py              # rerank_local (harness-side fallback)
-│   ├── metrics.py             # Evaluator, MetricVector, QrelIndex
+│   ├── metrics.py             # Evaluator, Metrics, QrelIndex
 │   ├── stats.py               # Comparator (bootstrap CI, Wilcoxon/permutation, Holm)
 │   ├── matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), VariantCfg, ResolvedConfig
 │   ├── runner.py              # ExperimentRunner — the single execution path
@@ -283,10 +283,10 @@ One row per returned doc; `position` is the 1-based rank; at most `top_k` rows p
 ### `metrics_{variant}_{timestamp}.csv`
 
 ```
-query_id,avg_relevance,ndcg@10,recall@10,precision@10
+query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
 ```
 
-One row per query. When a query has no relevant judged docs (`R=0`), `recall@10` is written as an **empty field** (two adjacent commas) — meaning "excluded from recall aggregation", not zero.
+One row per query. Metrics use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. `n_scored` = judged docs the metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; both are non-negative integers, always present. Any of the four metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, `recall@10` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
 
 ### `comparison_{baseline}_{variant}_{timestamp}.csv`
 

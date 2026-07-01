@@ -31,10 +31,12 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   new adapter + config only — never edits to pipeline/evaluator/stats. ES + WANDS are adapters
   behind Protocols.
 - **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. Binary-relevance
-  threshold for precision/recall is `gain >= 0.5` (Partial or Exact).
+  threshold for precision/recall is `gain >= 0.5` (Partial or Exact). A **MISSING** judgement (no
+  qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (§7) — **NOT** treated
+  as irrelevant; only a **judged** `0.0` is irrelevant. Per-query `n_scored`/`n_missing` are recorded.
 - **Exact CSV artifact schemas (do not rename/reorder fields):**
   - `result_{variant}_{timestamp}.csv` — `query_id, product_id, score, position`
-  - `metrics_{variant}_{timestamp}.csv` — `query_id, avg_relevance, ndcg@10, recall@10, precision@10`
+  - `metrics_{variant}_{timestamp}.csv` — `query_id, avg_relevance, ndcg@10, recall@10, precision@10, n_scored, n_missing`
   - `comparison_{baseline}_{variant}_{timestamp}.csv` — `variant, metric, delta, delta_ci_lo, delta_ci_high, significant, p_value`
 - **RRF k-sweep** is over `rank_constant` ∈ {10,20,…,100}.
 

@@ -154,26 +154,27 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Objective.** Implement the four per-query metrics and the qrel index, exactly per §7.
 
 **Deliverables.**
-- `benchmark/metrics.py` — `QrelIndex` (`dict[query_id, dict[doc_id, gain]]`), `MetricVector`, `Evaluator` with `score_run(results) -> per-query MetricVectors` (joining each `RankedResult` to qrels by `query_id`).
+- `benchmark/metrics.py` — `QrelIndex` (`dict[query_id, dict[doc_id, gain]]`; `gain()` returns `NaN` for a MISSING pair), `Metrics` (four float metrics + int `n_scored`/`n_missing`), `Evaluator` with `score_run(results) -> per-query Metrics` (joining each `RankedResult` to qrels by `query_id`).
 
 **Depends on.** Phase 1.
 
-**Implementation notes (§7).**
-- **avg_relevance** = `(1/10)·Σ_{i=1..10} gain(d_i)`; lists shorter than 10 zero-padded at gain level, **denominator stays 10**.
-- **ndcg@10 (graded):** `DCG@10 = Σ (2^{gain}−1)/log2(i+1)`; **IDCG truncated to top-10 of the ideal ordering** (`Σ_{i=1..min(10,#judged)}`), not over all judged gains; `nDCG=0` when `IDCG=0`.
+**Implementation notes (§7 — condensed-list, missing = `NaN`).**
+- **Missing = `NaN`, skipped (condensed list).** `QrelIndex.gain()` returns the judged float gain, or **`math.nan` when there is NO qrel entry** (a MISSING pair — NOT `0.0`). A judged `0.0` is a real judgement (kept). Metrics stay **stdlib-only** (`math.nan` == `np.nan`; do NOT add numpy).
+- **Condensed top-10.** Scan the ranked list keeping JUDGED docs in rank order and SKIPPING MISSING (`NaN`) docs; the evaluation set is the first `min(10, #judged-in-list)` judged docs (**may reach past original rank 10**). `n_scored` = size of that condensed top-10 (`<= 10`); `n_missing` = MISSING docs skipped in the scanned prefix (up to and incl. the 10th judged doc, else whole list).
+- **avg_relevance** = `(1/m)·Σ_{i=1..m} g_i` over the `m = n_scored` condensed gains; **`NaN` if `m == 0`**.
+- **ndcg@10 (graded):** `DCG = Σ_{i=1..m} (2^{g_i}−1)/log2(i+1)` on **condensed positions**; **IDCG truncated to top-10 of the ideal ordering** (`Σ_{i=1..min(10,#judged)}`, over ALL judged gains — unaffected by skipping); `nDCG=0` when `IDCG=0`; **`NaN` if `m == 0`**.
 - **relevant iff gain ≥ 0.5** (Partial or Exact; WANDS grades `{0, 0.5, 1}`).
-- **precision@10** = `|relevant ∩ top10| / 10` (denominator fixed at 10).
-- **recall@10** = `|relevant ∩ top10| / R`, `R = #relevant judged over all of label.csv`. **`R=0` → `recall = NaN`** in the in-memory `MetricVector` (excluded from aggregation/deltas, §8.1). The empty-cell serialization is Phase 7's concern, not here.
-- Unjudged docs treated as `gain=0` (§7).
+- **precision@10** = `|relevant ∩ condensed-top-10| / m` (**denominator = `n_scored`, NOT 10**); **`NaN` if `m == 0`**.
+- **recall@10** = `|relevant ∩ condensed-top-10| / R`, `R = #relevant judged over all of label.csv`. **`R=0` → `recall = NaN`**. (Any of the four metrics may be `NaN`; excluded per-metric from aggregation/deltas, §8.1.) The empty-cell serialization is Phase 7's concern, not here.
 
 **Test / acceptance criteria.** *(pure / offline)*
-- **Hand-computed** values on tiny fixtures for all four metrics, including: a perfect ranking (nDCG=1.0); a short list (< 10 docs) confirming zero-padding and fixed-10 denominators; **R=0 → recall is `NaN`**; a query with **> 10 relevant docs** confirming IDCG truncation to 10 (not deflated); `IDCG=0 → nDCG=0`.
-- A graded case with mixed `{0, 0.5, 1}` gains where DCG/IDCG are computed by hand in the test and asserted to a tight tolerance.
-- Unjudged doc in the ranked list scored as gain 0.
+- **Hand-computed** values on tiny fixtures for all four metrics, including: a perfect ranking (nDCG=1.0); a MISSING doc is SKIPPED (condensed), NOT scored 0.0, while a JUDGED-irrelevant (`0.0`) doc is KEPT and counts toward `n_scored`/DCG; the condensed list reaching **past original rank 10** to fill 10 judged docs; `n_scored`/`n_missing` correct on a mixed judged/missing list (arithmetic written out); precision/avg denominators are `n_scored` (proven with `n_scored < 10`); `n_scored=0` → avg/ndcg/precision `NaN` and recall `0.0` (if `R>0`) else `NaN`; `R=0 → recall NaN`; a query with **> 10 relevant docs** confirming IDCG truncation to 10; `IDCG=0 → nDCG=0`.
+- A graded case with mixed `{0, 0.5, 1}` judged gains **and missing docs** where DCG/IDCG are computed by hand in the test and asserted to a tight tolerance (`2^0.5-1 ≈ 0.41421356`).
+- `as_dict()` keys are EXACTLY `{avg_relevance, ndcg@10, recall@10, precision@10}`; `n_scored`/`n_missing` are int fields on `Metrics` (not in `as_dict()`).
 
-**Developer / reviewer responsibilities.** Developer implements per §7. Reviewer recomputes at least the nDCG and IDCG-truncation cases independently and confirms the NaN policy.
+**Developer / reviewer responsibilities.** Developer implements per §7. Reviewer recomputes at least the nDCG and IDCG-truncation cases independently and confirms the condensed-list / missing-`NaN` / per-metric-`NaN` policy.
 
-**User sign-off gate.** Inspect the hand-computed test table (especially IDCG truncation and recall-NaN). Approve → **commit on user consent only.**
+**User sign-off gate.** Inspect the hand-computed test table (especially condensed-list skipping, `n_scored`/`n_missing`, IDCG truncation, and per-metric `NaN`). Approve → **commit on user consent only.**
 
 ---
 
@@ -187,7 +188,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Depends on.** Phase 1.
 
 **Implementation notes (§8).**
-- **Pairing (§8.1):** paired by `query_id`; recall@10 pairs further restricted to non-`NaN` queries; detection is by in-memory `NaN`, **never** by re-reading CSV.
+- **Pairing (§8.1):** paired by `query_id`; **per-metric** `NaN` exclusion — for EACH metric independently, restrict the paired set to queries whose in-memory `Metrics` value for that metric is non-`NaN` in either run (recall@10 is just the `R==0` case; `avg_relevance`/`ndcg@10`/`precision@10` can be `NaN` when `n_scored==0`, §7). Detection is by in-memory `NaN`, **never** by re-reading CSV.
 - **Degenerate sets (§8.1 table), short-circuited before any scipy/bootstrap call:** *empty paired set* → `delta`/CI empty, `p_value=1.0`, `significant=false`, `note=empty_paired_set`; *all-zero deltas* → `delta=0.0`, CI `0.0/0.0`, `p_value=1.0`, `significant=false`, `note=all_zero_delta`.
 - **CI (§8.2):** percentile bootstrap, **B=10000**, seeded `numpy.random.default_rng(seed)`, resample **paired query indices** (preserve pairing), recompute mean δ, take **2.5/97.5** percentiles. This CI is **effect-size context only, not a gate**.
 - **p_value (§8.2):** two-sided **Wilcoxon signed-rank**, `zero_method="wilcox"`, `correction=True` (both recorded); seeded **paired-permutation** test selectable as primary via `stats.test`. Raw p written to CSV.
@@ -198,7 +199,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - **Degenerate sets:** empty paired set and all-zero deltas each produce the exact §8.1-table outputs **without** calling scipy (assert via monkeypatch/spy that the bootstrap/test is never invoked).
 - **Holm:** a hand-constructed family of raw p-values verifies step-down reject/retain (including the "first failure stops the sequence" behavior) and that `significant` matches.
 - **CI vs significant may disagree:** a constructed case where an unadjusted CI excludes 0 but Holm retains (and vice versa) — assert no exception, both reported as designed.
-- Recall pairing excludes `NaN` queries; Wilcoxon zero/tie params are passed through and recorded.
+- Per-metric pairing excludes `NaN` queries (recall on `R==0`; avg/ndcg/precision on `n_scored==0`); Wilcoxon zero/tie params are passed through and recorded.
 
 **Developer / reviewer responsibilities.** Developer implements per §8.1–§8.3. Reviewer verifies the short-circuits fire *before* scipy, the seeded RNG is `default_rng(seed)`, Holm is on raw p, and that no "adjusted alpha" or CI-as-gate logic sneaks in.
 
@@ -270,7 +271,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Implementation notes (§8.0a, §10, §11).**
 - **Expansion order (§10), `bm25` emitted FIRST:** `bm25`(1) → `semantic`(per model) → `hybrid`(models × `rrf_k_sweep`) → `bm25_rerank`(per reranker) → `semantic_rerank`(models × rerankers) → `hybrid_rerank`.
 - **`hybrid_rerank` (§10/§8.0a):** if `hybrid_rerank_k` is an **int** (default 60) → emit models × rerankers at that fixed k as static rows; if `best_per_model` → emit **no** `hybrid_rerank` rows (deferred to §8.0a phase).
-- `resolve_hybrid_rerank_best_per_model`: per model, **argmax mean nDCG@10** over that model's `hybrid` rows; **tie-break: smallest k, then lexicographically smallest variant id**; **seed-independent, deterministic** (§1.4(2)); emits one row per `(model, reranker)` at the chosen k. Operates **only on in-memory `MetricVector`s** passed in — adds **no adapter dependency** (§11).
+- `resolve_hybrid_rerank_best_per_model`: per model, **argmax mean nDCG@10** over that model's `hybrid` rows; **tie-break: smallest k, then lexicographically smallest variant id**; **seed-independent, deterministic** (§1.4(2)); emits one row per `(model, reranker)` at the chosen k. Operates **only on in-memory `Metrics`** passed in — adds **no adapter dependency** (§11).
 - `expand_matrix` is a **pure deterministic function**; the data dependency is confined to the one named selection phase.
 - Variant ids match §9 examples (e.g. `hybrid__e5-small__k60`).
 - `config.py`: `${VAR}` resolved at load (secrets never in file); `ci_level` parsed but is **not** a gate; records correction/test/zero-tie params for run metadata.
@@ -278,7 +279,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Test / acceptance criteria.** *(pure / offline)*
 - **Expansion counts & order:** from the §10 `config.yaml` (3 embedding models, 2 rerankers, 10-step k-sweep), assert exact variant **count per family** and that **`bm25` is index 0**; order matches §10.
 - **best_per_model deferral:** with `hybrid_rerank_k: best_per_model`, `expand_matrix` emits **zero** `hybrid_rerank` rows; with an int, it emits `models×rerankers` rows at that k.
-- **Deterministic selection:** `resolve_hybrid_rerank_best_per_model` on hand-built `MetricVector`s returns the argmax-mean-nDCG k with smallest-k then lexicographic tie-break; identical output across runs (seed-independent).
+- **Deterministic selection:** `resolve_hybrid_rerank_best_per_model` on hand-built `Metrics` returns the argmax-mean-nDCG k with smallest-k then lexicographic tie-break; identical output across runs (seed-independent).
 - **Config:** `${VAR}` substitution from env; missing required key errors clearly; `ConfigInferenceModel` satisfies both Protocols (mypy + structural test).
 - **Factory dispatch (offline, no adapter import):** assert the `name`→factory registry maps `wands`→the WANDS dataset factory target and `elasticsearch`→the ES backend factory target (as a dotted-path string or lazy importer, **not** by importing the adapter module), and that an unknown `name`/`kind` raises a clear error. The dispatch *logic* is verified here; live resolution (actually importing + constructing the adapter) is deferred to Phase 11.
 
@@ -295,23 +296,23 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Deliverables.**
 - `benchmark/io_csv.py` — `write_result_csv`, `write_metrics_csv`, `write_comparison_csv`, `write_run_config`.
 
-**Depends on.** Phases 1, 2, 3 (consumes `RankedResult`, `MetricVector`, comparator rows).
+**Depends on.** Phases 1, 2, 3 (consumes `RankedResult`, `Metrics`, comparator rows).
 
 **Implementation notes (§9, CLAUDE.md invariants).**
 - Filenames: `result_{variant}_{timestamp}.csv`, `metrics_{variant}_{timestamp}.csv`, `comparison_{baseline}_{variant}_{timestamp}.csv`, `run_config_{timestamp}.json`; `{timestamp}` = single per-run UTC `YYYYMMDDTHHMMSSZ`.
 - **Exact headers / field order (do not rename/reorder):**
   - result → `query_id,product_id,score,position`
-  - metrics → `query_id,avg_relevance,ndcg@10,recall@10,precision@10`
+  - metrics → `query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing`
   - comparison → `variant,metric,delta,delta_ci_lo,delta_ci_high,significant,p_value`
 - **`position` derived** as the 1-based index into `RankedResult.docs` at write time (§3.1, §9); ≤ `top_k` rows/query.
-- **recall@10 `NaN` → empty field** (two adjacent commas, no quoting) per §7/§9. `significant` ∈ {`true`,`false`} lowercase.
+- **Any of the FOUR metric cells `NaN` → empty field** (two adjacent commas, no quoting) per §7/§9: `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored==0`, `recall@10` empty when `R==0`. `n_scored`/`n_missing` are non-negative ints, **ALWAYS present** (never empty). `significant` ∈ {`true`,`false`} lowercase.
 - **Degenerate comparison rows (§8.1/§9):** empty paired set → `delta`/CI cells empty, `p_value=1.0`, `significant=false`; all-zero → `0.0`/`0.0`/`0.0`, `p_value=1.0`.
 - `write_run_config` serializes the fully-resolved config + seed per §9.1 (expanded variants incl. any selected k, selection metric + `hybrid_rerank_selection_bias` flag, B, fixed CI level 2.5/97.5, α, family size m, correction, test + zero/tie params, degenerate notes, dataset/ES/endpoint versions, cutoff, seed). **No per-test adjusted alpha** (Holm defines none).
 
 **Test / acceptance criteria.** *(pure / offline, golden files)*
-- **Exact headers** for all three CSVs asserted byte-for-byte against committed golden files.
+- **Exact headers** for all three CSVs asserted byte-for-byte against committed golden files (the metrics header includes the trailing `n_scored,n_missing` columns).
 - **position derivation:** `docs[0]` → `position=1`, ascending; ≤ `top_k` rows.
-- **recall empty cell:** a `NaN` recall serializes as an empty field (golden row shows two adjacent commas).
+- **NaN metric empty cells:** a `NaN` value in ANY of the four metric columns serializes as an empty field (golden row shows two adjacent commas); `n_scored`/`n_missing` are always written as integers.
 - **Degenerate rows** serialize exactly per the §8.1 table.
 - **run_config JSON** round-trips and contains every §9.1 field (and omits any "adjusted alpha").
 

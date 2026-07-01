@@ -544,25 +544,35 @@ The baseline (`bm25`) is always materialized first so every later comparison has
 
 ## 7. Metrics
 
-All metrics are per query at cutoff **k=10**, then aggregated (mean across queries) for reporting; the per-query vectors are retained for §8 statistics. Let the ranked list be `d_1..d_n` (position 1 = top) and `gain(d)` the qrel gain (0 if unjudged), a float graded per dataset (WANDS: `{0, 0.5, 1}` for Irrelevant/Partial/Exact).
+All metrics are per query at cutoff **k=10**, then aggregated (mean across queries) for reporting; the per-query `Metrics` are retained for §8 statistics. Let the query's ranked returned list be `d_1..d_n` (position 1 = top). For each returned doc, `gain(d)` is the **qrel gain if a judgement exists** (a float graded per dataset — WANDS: `{0, 0.5, 1}` for Irrelevant/Partial/Exact) or **`MISSING` (`NaN`) if no qrel entry exists** for that `(query, doc)` pair.
 
-- **avg_relevance** (per query): mean graded gain over the top-10 returned docs:
-  `avg_relevance = (1/10) · Σ_{i=1..10} gain(d_i)`. Lists shorter than 10 are zero-padded at the gain level; denominator stays 10.
+**Condensed-list evaluation (Sakai).** A `MISSING` judgement is **not** irrelevant — it is **skipped**. Form the **condensed list**: the ranked returned docs with the `MISSING` ones dropped, judged docs kept in original rank order. Metrics are computed over the **condensed top-10** = the first `min(10, #judged-in-list)` **judged** docs. Because missing docs are dropped, the condensed top-10 **may reach past original rank 10** to fill up to 10 judged docs. Let `g_1..g_m` be the condensed-top-10 gains in condensed rank order, `m = n_scored`, all judged.
+
+> **CRUCIAL — judged-irrelevant vs missing:** a **judged-irrelevant** doc (`gain == 0.0`, present in qrels) is **KEPT** in the condensed list — it counts toward `n_scored`, contributes `2^0 − 1 = 0` to DCG, and is not relevant. Only a doc with **no qrel entry** is `MISSING` and skipped. "Labeled irrelevant" (gain 0.0) and "no judgement" are distinct.
+
+Two per-query counts are recorded:
+- **`n_scored`** = size of the condensed top-10 (the judged docs the metrics were computed over, `<= 10`) — "total number this was calculated from".
+- **`n_missing`** = number of `MISSING` docs skipped while scanning the ranked list to collect that condensed top-10 (count of `NaN`-gain docs in the scanned prefix: from rank 1 up to and including the 10th judged doc, or the whole returned list if fewer than 10 judged docs exist) — "number where the judgement was missing".
+
+- **avg_relevance** (per query): mean graded gain over the condensed top-10:
+  `avg_relevance = (1/m) · Σ_{i=1..m} g_i`. **`NaN` if `m == 0`.**
 
 - **ndcg@10** (graded gains):
-  `DCG@10 = Σ_{i=1..10} (2^{gain(d_i)} − 1) / log2(i+1)`.
-  Let `g_(1) >= g_(2) >= …` be this query's **judged** gains sorted descending (the ideal ordering). Then
-  `IDCG@10 = DCG@10 of the top-10 of that ideal ordering = Σ_{i=1..min(10, #judged)} (2^{g_(i)} − 1) / log2(i+1)`.
+  `DCG@10 = Σ_{i=1..m} (2^{g_i} − 1) / log2(i+1)` using **condensed positions** `1..m`.
+  Let `g_(1) >= g_(2) >= …` be this query's **judged** gains sorted descending (the ideal ordering, over **all** the query's qrels — unaffected by skipping). Then
+  `IDCG@10 = Σ_{i=1..min(10, #judged)} (2^{g_(i)} − 1) / log2(i+1)`.
   IDCG is explicitly **truncated to the top 10** of the ideal ordering (not summed over all judged gains), so queries with more than 10 relevant docs are not deflated.
-  `nDCG@10 = DCG@10 / IDCG@10`, defined `0` if `IDCG@10 = 0`.
+  `nDCG@10 = DCG@10 / IDCG@10`, defined `0` if `IDCG@10 = 0`. **`NaN` if `m == 0`.**
 
 - **Binary relevance threshold:** a doc is **relevant** iff `gain >= 0.5` (`Partial` or `Exact`). (Threshold tracks the grade set: with WANDS grades `{0, 0.5, 1}`, `0.5` keeps "Partial or Exact" relevant, as before the regrade from `{0,1,2}`.)
 
-- **precision@10:** `|relevant ∩ top-10| / 10` (denominator fixed at 10).
+- **precision@10:** `|relevant ∩ condensed-top-10| / m` — the **denominator is `m = n_scored`, NOT 10**. **`NaN` if `m == 0`.**
 
-- **recall@10:** `|relevant ∩ top-10| / R`, where `R = #relevant judged docs for that query` over all of `label.csv`. If `R = 0`, recall is **`NaN` in the in-memory `MetricVector`**, the query is **excluded** from recall aggregation and from recall deltas (§8.1). On disk the cell is written as an **empty field** (§9) — the comparator never re-parses the CSV; it excludes by the in-memory `NaN` (§8.1), so the empty-vs-NaN distinction is a pure serialization choice with no decision impact.
+- **recall@10:** `|relevant ∩ condensed-top-10| / R`, where `R = #relevant judged docs for that query` over all of `label.csv` (relevant iff `gain >= 0.5`; `R` uses qrels directly and is unaffected by skipping). If `R = 0`, recall is **`NaN`**.
 
-> **Unjudged-document policy:** WANDS qrels are pooled; unjudged docs are treated as `gain=0` (TREC condensed-list assumption). Recorded in run metadata so it can be revisited (§13).
+**Per-query NaN summary (each metric independent):** `avg_relevance`/`ndcg@10`/`precision@10` are `NaN` when `n_scored == 0`; `recall@10` is `NaN` when `R == 0`. **Any** of the four metrics may be `NaN` for a given query. A `NaN` metric excludes that query from that metric's aggregation and deltas (§8.1). On disk any `NaN` metric cell is written as an **empty field** (§9) — the comparator never re-parses the CSV; it excludes by the in-memory `NaN` (§8.1), so the empty-vs-NaN distinction is a pure serialization choice with no decision impact. The per-query `n_scored` and `n_missing` are recorded (§9).
+
+> **Missing-judgement policy:** WANDS qrels are pooled. A **missing** judgement (no qrel entry) is **NOT treated as irrelevant** — it is **skipped** via **condensed-list evaluation** (Sakai): only **judged-irrelevant** docs (`gain == 0.0`, actually labeled) count as a `0`. Per-query `n_scored` (judged docs scored) and `n_missing` (missing docs skipped) are recorded in the metrics CSV (§9) so the missing-judgement ratio can be inspected and revisited (§13).
 
 ---
 
@@ -582,7 +592,7 @@ class ExperimentRunner:
         # (bm25, semantic, hybrid, bm25_rerank, semantic_rerank, and hybrid_rerank
         #  IFF hybrid_rerank_k is a fixed literal). baseline first (§10).
         static_variants = expand_matrix(cfg)
-        per_query: dict[str, dict[str, MetricVector]] = {}
+        per_query: dict[str, dict[str, Metrics]] = {}
 
         def run_one(v: VariantCfg) -> None:
             if v.reranker_id:                        # R0: lazy reranker endpoint
@@ -634,14 +644,14 @@ This makes the previously-implicit selection an explicit phase with a defined me
 Comparisons are **paired by `query_id`** between a variant and the baseline (`bm25`). For metric `m` and query `q`: `δ_q = m_variant(q) − m_baseline(q)`.
 
 - The paired set is the queries present for **both** runs (always identical — the same frozen `queries` list drives every run, §8.0).
-- For **recall@10 only**, the paired set is further restricted to queries whose in-memory `MetricVector.recall@10` is **not `NaN`** (i.e. `R>0`; identical across variants by construction, §7). The comparator detects exclusions by the in-memory `NaN`, never by re-reading the CSV, so recall deltas remain comparable and aligned with the on-disk empty cell.
+- **Per-metric `NaN` exclusion (general rule).** For **each** metric independently, the paired set is further restricted to queries whose in-memory `Metrics` value **for that metric** is **not `NaN`** in **either** run. Because any metric can now be `NaN` (`avg_relevance`/`ndcg@10`/`precision@10` when `n_scored == 0`; `recall@10` when `R == 0`, §7), this replaces the old recall-only restriction — recall is simply the `R == 0` case of the general rule. The `NaN` mask is identical across variants by construction (`R` and `n_scored` come from the shared qrels/query set, §7). The comparator detects exclusions by the in-memory `NaN`, never by re-reading the CSV, so per-metric deltas remain comparable and aligned with the on-disk empty cell.
 - **delta** = mean over the (possibly restricted) paired set of `δ_q`.
 
 **Degenerate paired sets (dataset-general, defined for *every* metric).** Because the harness sells dataset-agnosticism (§1.4(3)), a swapped-in dataset can produce a paired set that is empty or all-zero for *any* metric — not just recall. The comparator handles two degenerate cases uniformly, before any bootstrap/test call, mirroring the all-zero short-circuit of §8.2:
 
 | Case | Trigger | Comparator output for that `(variant, metric)` row |
 |------|---------|----------------------------------------------------|
-| **Empty paired set** | 0 paired queries (e.g. recall with `R=0` on every query for a swapped dataset) | `delta` = empty, `delta_ci_lo`/`delta_ci_high` = empty, `p_value = 1.0`, `significant = false`, and a recorded note `note=empty_paired_set` |
+| **Empty paired set** | 0 paired queries (the metric is `NaN` on every query for a swapped dataset — e.g. recall with `R=0` everywhere, or `avg_relevance`/`ndcg`/`precision` with `n_scored=0` everywhere) | `delta` = empty, `delta_ci_lo`/`delta_ci_high` = empty, `p_value = 1.0`, `significant = false`, and a recorded note `note=empty_paired_set` |
 | **All-zero deltas** | ≥1 paired query but every `δ_q == 0` | `delta = 0.0`, `delta_ci_lo = delta_ci_high = 0.0`, `p_value = 1.0`, `significant = false`, note `note=all_zero_delta` (§8.2) |
 
 In both cases the comparator never calls scipy/the bootstrap, so `mean of empty set` and a bootstrap over zero indices are never evaluated. The note is recorded in `run_config_*.json` per affected `(variant, metric)`. For WANDS the empty case does not arise, but the behavior is defined so a different dataset cannot produce an undefined metric or crash.
@@ -676,9 +686,9 @@ One row per returned doc; `position` 1-based ascending; ≤ top_k rows per query
 
 **`metrics_{variant}_{timestamp}.csv`**
 ```
-query_id,avg_relevance,ndcg@10,recall@10,precision@10
+query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
 ```
-One row per query. When `R=0`, the `recall@10` cell is written as an **empty field** (two adjacent commas, no quoting), corresponding to the in-memory `MetricVector` value of `NaN` (§7). This empty-vs-NaN mapping is fixed so a reader never guesses; consumers must treat an empty `recall@10` as "excluded", and the comparator does this from the in-memory `NaN`, not by re-parsing this file (§8.1).
+One row per query. `n_scored` and `n_missing` are **non-negative integers, ALWAYS present** (never empty): the condensed-list counts of §7 (`n_scored` = judged docs scored, `n_missing` = missing docs skipped). Any of the **four metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when its in-memory `Metrics` value is `NaN` (§7): `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored == 0`, `recall@10` empty when `R == 0`. This empty↔`NaN` mapping is fixed so a reader never guesses; consumers must treat an empty metric cell as "excluded", and the comparator does this from the in-memory `NaN`, not by re-parsing this file (§8.1).
 
 **`comparison_{baseline}_{variant}_{timestamp}.csv`**
 ```
@@ -751,7 +761,7 @@ benchmark/
   pipeline.py            # SearchPipeline, PipelineSpec, FuseCfg, RerankCfg, spec_for()
   fusion.py              # fuse_rrf_local (harness-side fallback, windowed)
   rerank.py              # rerank_local (harness-side fallback, windowed)
-  metrics.py             # Evaluator, MetricVector, QrelIndex (ndcg/recall/precision/avg_relevance)
+  metrics.py             # Evaluator, Metrics, QrelIndex (ndcg/recall/precision/avg_relevance)
   stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, Holm; degenerate-set handling)
   matrix.py              # expand_matrix(), resolve_hybrid_rerank_best_per_model(), VariantCfg, ResolvedConfig
   runner.py              # ExperimentRunner (the single execution path, §8.0)
@@ -765,7 +775,7 @@ benchmark/
 docs/experiment.md
 dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
 ```
-`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib) — never `datasets/*` or `backends/*`. Adapters are selected by `config.py` factories (`load_dataset`, `make_backend`). This enforces success criterion §1.4(3). `resolve_hybrid_rerank_best_per_model` lives in `matrix.py` and operates only on in-memory `MetricVector`s passed in by `runner.py`, so it adds no adapter dependency. The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
+`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib) — never `datasets/*` or `backends/*`. Adapters are selected by `config.py` factories (`load_dataset`, `make_backend`). This enforces success criterion §1.4(3). `resolve_hybrid_rerank_best_per_model` lives in `matrix.py` and operates only on in-memory `Metrics` passed in by `runner.py`, so it adds no adapter dependency. The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
 
 ---
 
@@ -788,6 +798,7 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 - **Joint CI/decision regime:** an optional `correction: max_stat | bh_fdr` mode (§8.3) that yields a multiplicity-controlled decision *with* a provably consistent simultaneous/FDR-adjusted interval, so the CI and `significant` flag coincide by construction. Deferred; the default is Holm-on-raw-p with an unadjusted descriptive CI that may disagree with the flag (this is normal under FWER control).
 - **`bm25` as a capability:** currently BM25 is a mandatory `SearchBackend` primitive, not a `BackendCapabilities` flag (§3.3). If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, promote `bm25` to a capability and have the matrix skip `bm25`/`hybrid`/`bm25_rerank` when it is false. Deferred until such a backend exists (no consumer today).
 - Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
-- Pooling-depth / unjudged-doc sensitivity analysis (current default: unjudged = gain 0).
+- Pooling-depth / missing-judgement sensitivity analysis (current default: **missing judgements are skipped via condensed-list evaluation**, §7 — NOT scored as gain 0; only judged-irrelevant docs count as a 0).
+- **Missing-judgement ratio → LLM-as-a-judge backfill.** After the first full-pass run, inspect the aggregate missing-judgement ratio `n_missing / (n_scored + n_missing)` (summed over queries, from the §9 metrics CSVs). If judgements are missing **> 10%** of the time, run a separate measurement: compute **Cohen's kappa** agreement between the original WANDS labels and an **LLM-as-a-judge** evaluator on the judged pairs; then **backfill** the missing judgements with the LLM judge into `dataset/wands/label_augmented.csv` and re-run against the augmented labels.
 - `search_text` concatenation vs per-field semantic embedding (chunking behavior of long concatenations on small-context embedding models).
 - Whether to chunk `text_similarity_reranker` over field snippets vs whole `search_text` for long documents.
