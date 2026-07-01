@@ -53,8 +53,11 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 - **Exhaustive branching on enumerated values.** When behavior branches on an enumerated/config
   value, handle every valid value explicitly and `raise` a clear error on no match. Never fall
   through to a silent default when the configuration is invalid.
-- **Descriptive names, no cryptic abbreviations.** Prefer `mean_delta`/`baseline_value` over
-  `obs`/`b_val`. A reader should not have to guess what a variable holds.
+- **Descriptive names, no cryptic abbreviations — but don't overdo it.** Prefer `mean_delta`/
+  `baseline_value` over `obs`/`b_val`; a reader should not have to guess what a variable holds.
+  Equally, don't pad obvious names: a short/idiomatic name is fine when context makes it plain
+  (`idx`/`rank` for a loop counter, `k` for the RRF rank constant inside `fuse_rrf_local`). Avoid
+  both extremes — cryptic (`obs`) and needlessly verbose (`zero_based_index`).
 - **Use logging, not `print()`.** Get a logger via `benchmark.logging_setup.get_logger(__name__)`
   and call `setup_logging()` once at each entry point — it logs to the console and to
   `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.

@@ -28,8 +28,7 @@ def fuse_rrf_local(
     """
     fused_scores: dict[str, float] = {}
     for ranked_list in lists:
-        for zero_based_index, scored_doc in enumerate(ranked_list[:rank_window_size]):
-            rank = zero_based_index + 1
+        for rank, scored_doc in enumerate(ranked_list[:rank_window_size], start=1):
             contribution = 1.0 / (rank_constant + rank)
             fused_scores[scored_doc.doc_id] = fused_scores.get(scored_doc.doc_id, 0.0) + contribution
     return [
