@@ -49,6 +49,18 @@ class Searcher(ABC):
         """Return up to ``top_k`` docs ranked best-first (score desc, tie-break doc_id, §9.1)."""
         ...
 
+    def bulk_search(self, queries: Sequence[str], *, top_k: int) -> list[list[ScoredDoc]]:
+        """Search several queries at once; results are ALIGNED to ``queries`` by index (§3.3).
+
+        The default implementation loops :meth:`search` (correct — one round trip per query) so any
+        ``Searcher`` (e.g. a fake) works without extra code. Efficient backends OVERRIDE this to
+        batch the round trips: the ES leaf searchers (``LexicalSearcher``/``VectorSearch``) override
+        it via the Multi-Search API (``_msearch``), and the composers (``HybridSearch``/
+        ``SearchPipeline``) override it to propagate batching to their leaves. This default is the
+        correctness fallback.
+        """
+        return [self.search(query, top_k=top_k) for query in queries]
+
 
 class Fuser(ABC):
     """Combines several ranked lists into one, client-side (§3.7)."""

@@ -65,6 +65,24 @@ class HybridSearch(Searcher):
         fused = self.fuser.fuse(result_lists, rank_window_size=self.retrieval_window_size)
         return fused[:top_k]
 
+    def bulk_search(self, queries: Sequence[str], *, top_k: int) -> list[list[ScoredDoc]]:
+        """Batch each retriever's whole query set, then fuse+truncate per query (aligned, §3.6).
+
+        Calls ``retriever.bulk_search`` ONCE per retriever (so ES leaves batch via ``_msearch``
+        instead of one round trip per query), then for query ``i`` fuses that query's list from each
+        retriever and truncates to ``top_k``. Results are aligned to ``queries`` by index.
+        """
+        per_retriever = [
+            retriever.bulk_search(queries, top_k=self.retrieval_window_size)
+            for retriever in self.retrievers
+        ]
+        results: list[list[ScoredDoc]] = []
+        for query_index in range(len(queries)):
+            result_lists = [lists[query_index] for lists in per_retriever]
+            fused = self.fuser.fuse(result_lists, rank_window_size=self.retrieval_window_size)
+            results.append(fused[:top_k])
+        return results
+
 
 class SearchPipeline(Searcher):
     """The top-level variant graph: a retriever with an optional rerank pass (§3.6).
@@ -96,3 +114,20 @@ class SearchPipeline(Searcher):
         assert self.rerank_window_size is not None  # __init__ invariant
         candidates = self.retriever.search(query, top_k=self.rerank_window_size)
         return self.reranker.rerank(query, candidates)[:top_k]
+
+    def bulk_search(self, queries: Sequence[str], *, top_k: int) -> list[list[ScoredDoc]]:
+        """Batch retrieval over the whole query set; rerank per query (aligned, §3.6/§8.0).
+
+        Retrieval is batched via ``retriever.bulk_search`` (so ES leaves batch via ``_msearch``).
+        Reranking stays PER QUERY: the ES ``_inference`` rerank call is per-query, so batching it is
+        a future optimization (§5.3). Without a reranker this is a pass-through to
+        ``retriever.bulk_search``. Results are aligned to ``queries`` by index.
+        """
+        if self.reranker is None:
+            return self.retriever.bulk_search(queries, top_k=top_k)
+        assert self.rerank_window_size is not None  # __init__ invariant
+        candidates_all = self.retriever.bulk_search(queries, top_k=self.rerank_window_size)
+        return [
+            self.reranker.rerank(query, candidates)[:top_k]
+            for query, candidates in zip(queries, candidates_all)
+        ]

@@ -68,6 +68,39 @@ class FakeSearcher(Searcher):
         return self.docs[:top_k]
 
 
+class RecordingBulkSearcher(Searcher):
+    """A leaf ``Searcher`` that OVERRIDES ``bulk_search`` and records how it was called.
+
+    Lets composer tests prove ``HybridSearch``/``SearchPipeline`` call ``bulk_search`` ONCE per
+    retriever (batched) rather than looping ``search`` per query. ``search`` still works (records a
+    per-query call) so a wrong path is observable. Both honor ``top_k`` on the canned list.
+    """
+
+    def __init__(self, docs: Sequence[ScoredDoc]) -> None:
+        self.docs = list(docs)
+        self.search_calls: list[tuple[str, int]] = []
+        self.bulk_calls: list[tuple[tuple[str, ...], int]] = []
+
+    def search(self, query: str, *, top_k: int) -> list[ScoredDoc]:
+        self.search_calls.append((query, top_k))
+        return self.docs[:top_k]
+
+    def bulk_search(self, queries: Sequence[str], *, top_k: int) -> list[list[ScoredDoc]]:
+        self.bulk_calls.append((tuple(queries), top_k))
+        return [self.docs[:top_k] for _ in queries]
+
+
+class RecordingBulkReranker(Reranker):
+    """A ``Reranker`` (reverse rule) recording each per-query ``rerank`` call (plan §5)."""
+
+    def __init__(self) -> None:
+        self.rerank_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def rerank(self, query: str, candidates: Sequence[ScoredDoc]) -> list[ScoredDoc]:
+        self.rerank_calls.append((query, tuple(c.doc_id for c in candidates)))
+        return list(reversed(candidates))
+
+
 class FakeReranker(Reranker):
     """A ``Reranker`` whose canned rule is 'reverse the candidate list' (plan §5)."""
 

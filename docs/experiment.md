@@ -238,6 +238,13 @@ class Searcher(ABC):
     def search(self, query: str, *, top_k: int) -> list[ScoredDoc]:
         """Return up to top_k docs ranked best-first (score desc, tie-break doc_id, §9.1)."""
 
+    def bulk_search(self, queries: Sequence[str], *, top_k: int) -> list[list[ScoredDoc]]:
+        """Search several queries at once; results ALIGNED to queries by index. CONCRETE default
+        loops search (correct — one round trip per query) so any Searcher (e.g. a fake) works.
+        Efficient backends OVERRIDE it: ES leaf searchers via the Multi-Search API (_msearch),
+        the composers (HybridSearch/SearchPipeline) to propagate batching to their leaves."""
+        return [self.search(q, top_k=top_k) for q in queries]
+
 class Fuser(ABC):
     @abstractmethod
     def fuse(self, result_lists: Sequence[Sequence[ScoredDoc]], *,
@@ -347,7 +354,7 @@ So the `semantic` variant for model `elser` uses `VectorSearch(field=mapping.sem
 **Lifecycle (strict order — this is the ES `_inference`↔index seam the v1 draft left implicit):**
 1. **Register inference endpoints first.** For each `EmbeddingModel`, call `backend.register_inference(m.as_endpoint())`. A `semantic_text` field cannot be mapped before its `inference_id` exists, so this must precede `ensure_index`. (Rerankers are **not** registered here — they touch no mapping; they are registered lazily at run time in §8, step R0.)
 2. **Translate schema → `IndexMapping`.** From `dataset.field_schema()`: BM25 fields → `text`; the canonical `search_text` field → `text` with `copy_to` to **one `semantic_text` field per embedding model**; numeric → `integer`/`float`; ids → doc `_id`. See §5.
-3. **Stream documents** through `bulk_index`. ES auto-chunks + embeds each `semantic_text` field at ingest. Indexing is idempotent: doc `_id = product_id`.
+3. **Stream documents** through `bulk_index`. ES auto-chunks + embeds each `semantic_text` field at ingest. Indexing is idempotent: doc `_id = product_id`. `bulk_index` **streams + batches** the corpus via `elasticsearch.helpers.streaming_bulk(chunk_size=...)` over a **lazy** actions generator — it never materializes the whole corpus, so 43K (WANDS) / 1M (ESCI) docs index without a single giant `bulk()` body. `raise_on_error=True` so any failed item surfaces a `BulkIndexError` (not swallowed); the index is refreshed once at the end.
 4. **Return `IndexMapping`** (carries the index name, the `search_text` field name, and the per-model `sem_field` names) so the pipeline can name fields without re-deriving them.
 
 The indexer is **dataset- and model-agnostic**: everything specific arrives via `field_schema()` + endpoint descriptors.
@@ -369,6 +376,12 @@ class HybridSearch(Searcher):
     def search(self, query, *, top_k):
         lists = [r.search(query, top_k=self.retrieval_window_size) for r in self.retrievers]
         return self.fuser.fuse(lists, rank_window_size=self.retrieval_window_size)[:top_k]
+    def bulk_search(self, queries, *, top_k):                    # propagate batching to the leaves
+        per_r = [r.bulk_search(queries, top_k=self.retrieval_window_size)  # each leaf ONCE (_msearch)
+                 for r in self.retrievers]
+        return [self.fuser.fuse([per_r[j][i] for j in range(len(self.retrievers))],
+                                rank_window_size=self.retrieval_window_size)[:top_k]
+                for i in range(len(queries))]                    # fuse per query, aligned
 
 class SearchPipeline(Searcher):
     def __init__(self, *, retriever: Searcher, reranker: Reranker | None = None,
@@ -382,6 +395,11 @@ class SearchPipeline(Searcher):
             return self.retriever.search(query, top_k=top_k)
         candidates = self.retriever.search(query, top_k=self.rerank_window_size)
         return self.reranker.rerank(query, candidates)[:top_k]
+    def bulk_search(self, queries, *, top_k):                    # retrieval batches; rerank per query
+        if self.reranker is None:
+            return self.retriever.bulk_search(queries, top_k=top_k)
+        cands = self.retriever.bulk_search(queries, top_k=self.rerank_window_size)
+        return [self.reranker.rerank(q, c)[:top_k] for q, c in zip(queries, cands)]
 ```
 
 **The six strategies as object graphs** (built by `build_pipeline` in Phase 6, §4):
@@ -407,6 +425,8 @@ flowchart LR
 ```
 
 `SearchPipeline` retrieves **`rerank_window_size` candidates** when a reranker is present (the candidate depth fed to rerank), reranks, then truncates to `top_k`; with no reranker it is a pass-through retrieving directly at `top_k`. There is exactly **one** `SearchPipeline` class; all six variants are object graphs of the same composers (§4), searched via the single `pipeline.search(query, top_k)` path (§8).
+
+**`bulk_search` propagates batching to the leaves.** Both composers **override** `Searcher.bulk_search` (§3.3) so the runner can search the whole frozen query set with far fewer round trips (§8.0): `HybridSearch.bulk_search` calls each retriever's `bulk_search` **once** (so ES leaves batch via `_msearch`, §5.3) then **fuses per query** and truncates; `SearchPipeline.bulk_search` batches retrieval via `retriever.bulk_search` then **reranks per query** (the ES `_inference` rerank is per-query — **bulk rerank is not batched; a future optimization**, §5.3/§13). Both return a `list[list[ScoredDoc]]` aligned to `queries` by index. A leaf that does not override `bulk_search` (e.g. a fake) still works via the ABC's default per-query loop.
 
 ### 3.7 Client-side fusion & rerank helpers
 
@@ -526,6 +546,8 @@ With ElasticSearch there is exactly **ONE index** (`indexer.index`, e.g. `wands_
 
 `inference_id` is set explicitly on every `semantic_text` field (recommended; avoids accidental default-model drift). Adding an embedding model = register one endpoint + add one `semantic_text` field + add it to `search_text.copy_to` + reindex. A full reindex is the clean path for an existing corpus and is recorded in run metadata.
 
+**Bulk ingest is streamed + chunked.** `ElasticsearchBackend.bulk_index` writes via `elasticsearch.helpers.streaming_bulk(client, actions, chunk_size=...)` over a **lazy** actions generator (each `{"_op_type": "index", "_index": …, "_id": doc.doc_id, "_source": dict(doc.fields)}`), so the corpus streams through in fixed-size chunks and is never fully materialized — required for 43K-doc (WANDS) / ~1M-doc (ESCI) corpora that would break a single `bulk()` body. `chunk_size` is a module constant (the ES helpers default, 500) overridable via `indexer.settings.bulk_chunk_size`. `raise_on_error=True` so a failed item surfaces a `BulkIndexError` (**errors surface, not swallowed**); the index is refreshed once at the end; empty input is a logged no-op.
+
 ### 5.3 ES `Searcher` / `Reranker` implementations
 Each retriever is realized as its **own ES query** and returns a materialized `list[ScoredDoc]`; hybrid fusion and rerank happen **client-side** in the harness (§3.6/§3.7). There are no nested `rrf` / `text_similarity_reranker` retriever trees, and no `server_side` capability. (Change from the v4 draft: ES server-side `rrf` and `text_similarity_reranker` are dropped in favor of client-side composition; one-round-trip server-side fusion is noted as a deferred performance optimization in §13.)
 
@@ -533,6 +555,8 @@ Each retriever is realized as its **own ES query** and returns a materialized `l
   ```jsonc
   { "query": { "match": { "search_text": "$Q" } }, "size": $top_k }
   ```
+- **`LexicalSearcher.bulk_search(queries, top_k)`** (and `VectorSearch.bulk_search`, Phase 10) → the whole query set via the ES **Multi-Search API** (`_msearch`), **chunked** into groups of `msearch_chunk_size` (a module constant, default 100, overridable via `indexer.settings.msearch_chunk_size`): per chunk the payload alternates a per-search header `{}` then the body, and `response["responses"]` is parsed **in order** into an ALIGNED `list[list[ScoredDoc]]`. A shared `_msearch(client, index, bodies, *, chunk_size)` helper does the chunking + parsing (reused by `VectorSearch`); each per-search response is checked for an `"error"` key and **raises** if present (**not** silently emptied). Hits map to `ScoredDoc` through the same `_hits_to_scored` helper as `search`, so the **client-side (score desc, doc_id asc) tie-break (§9.1)** is identical. This cuts the ~480 (WANDS) / ~48K (ESCI) per-query round trips to a handful of `_msearch` calls (§8.0).
+  > **Bulk rerank is NOT batched (future optimization).** `SearchPipeline.bulk_search` batches only *retrieval* via `_msearch`; the `_inference` rerank call is per-query, so `ESReranker.rerank` is still invoked once per query. Batching rerank is deferred (§13).
 - **`VectorSearch.search(query, top_k)`** → the explicit, version-robust `semantic` query (default):
   ```jsonc
   { "query": { "semantic": { "field": "sem__$m", "query": "$Q" } }, "size": $top_k }
@@ -635,9 +659,12 @@ class ExperimentRunner:
                 indexer.register_inference(ep)       # emits service_settings + task_settings
                 assert pcfg.rerank_window_size <= ep.task_settings["top_n"]   # W <= top_n (§5.3)
             pipeline = build_pipeline(pcfg, cfg.services, mapping, factory)   # a SearchPipeline graph (§4)
+            # Batch the frozen query set through one pipeline.bulk_search — retrieval leaves batch
+            # via _msearch (§5.3) instead of one round trip per query; result[i] aligns to queries[i].
+            query_texts = [q.text for q in queries]
+            ranked = pipeline.bulk_search(query_texts, top_k=cfg.top_k)
             results = [
-                RankedResult(q.query_id, pipeline.search(q.text, top_k=cfg.top_k))
-                for q in queries
+                RankedResult(q.query_id, docs) for q, docs in zip(queries, ranked)
             ]
             write_result_csv(pcfg, results, cfg.timestamp)
             metrics = Evaluator(qrels).score_run(results)   # per-query vectors

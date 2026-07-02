@@ -99,3 +99,37 @@ def test_lexical_respects_top_k(
     result = searcher.search("common term", top_k=2)
 
     assert len(result) <= 2
+
+
+def test_lexical_bulk_search_aligned_over_several_queries(
+    backend: ElasticsearchBackend, mapping: IndexMapping
+) -> None:
+    # Distinctive tokens so each query has exactly one obvious match; a small msearch chunk size so
+    # the query set spans more than one _msearch round trip.
+    docs = [
+        Document(doc_id="p1", fields={"search_text": "blue velvet sofa"}),
+        Document(doc_id="p2", fields={"search_text": "wooden dining table"}),
+        Document(doc_id="p3", fields={"search_text": "kitchen stool"}),
+    ]
+    backend.bulk_index(docs, mapping=mapping)
+
+    searcher = LexicalSearcher(backend.client, backend.index, ["search_text"], msearch_chunk_size=2)
+    results = searcher.bulk_search(["velvet", "dining", "stool"], top_k=10)
+
+    assert len(results) == 3  # aligned to the query list by index
+    assert results[0][0].doc_id == "p1"
+    assert results[1][0].doc_id == "p2"
+    assert results[2][0].doc_id == "p3"
+
+
+def test_bulk_index_more_than_one_chunk_indexes_all_docs(
+    backend: ElasticsearchBackend, mapping: IndexMapping
+) -> None:
+    # Small chunk size + more docs than one chunk -> multiple streaming_bulk chunks; assert ALL land.
+    backend.bulk_chunk_size = 3
+    n = 10
+    docs = [Document(doc_id=f"p{i}", fields={"search_text": f"widget {i}"}) for i in range(n)]
+    backend.bulk_index(docs, mapping=mapping)
+
+    count = backend.client.count(index=backend.index)["count"]
+    assert count == n

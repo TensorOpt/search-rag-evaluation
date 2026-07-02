@@ -42,6 +42,7 @@ def _backend_with(client: MagicMock) -> es.ElasticsearchBackend:
     backend = es.ElasticsearchBackend.__new__(es.ElasticsearchBackend)
     backend.index = INDEXER_CFG["index"]
     backend.client = client
+    backend.bulk_chunk_size = es._BULK_CHUNK_SIZE
     return backend
 
 
@@ -147,7 +148,33 @@ def test_ensure_index_idempotent_when_index_exists() -> None:
 # --- bulk_index -------------------------------------------------------------------------------
 
 
-def test_bulk_index_uses_doc_id_and_fields_then_refreshes() -> None:
+def _capture_bulk_actions(
+    monkeypatch: pytest.MonkeyPatch, *, fail_on: str | None = None
+) -> list[dict[str, Any]]:
+    """Patch ``streaming_bulk`` to record the actions it is fed and simulate its (ok, info) yield.
+
+    Consumes the LAZY actions iterable, appending each into ``captured`` so a test can assert the
+    action shape. If ``fail_on`` names a ``_id``, that item's ``streaming_bulk`` raise is simulated
+    (``raise_on_error=True`` surfaces a failed item) so the caller does not swallow it.
+    """
+    captured: list[dict[str, Any]] = []
+
+    def fake_streaming_bulk(client: Any, actions: Any, **kwargs: Any) -> Any:
+        assert kwargs["chunk_size"] == es._BULK_CHUNK_SIZE  # module-constant default used
+        for action in actions:  # drive the LAZY generator
+            captured.append(action)
+            if fail_on is not None and action["_id"] == fail_on:
+                raise RuntimeError(f"simulated failed item {fail_on}")
+            yield (True, {"index": {"_id": action["_id"], "status": 201}})
+
+    monkeypatch.setattr(es, "streaming_bulk", fake_streaming_bulk)
+    return captured
+
+
+def test_bulk_index_streams_chunked_actions_then_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _capture_bulk_actions(monkeypatch)
     client = _fake_client()
     backend = _backend_with(client)
 
@@ -157,24 +184,58 @@ def test_bulk_index_uses_doc_id_and_fields_then_refreshes() -> None:
     ]
     backend.bulk_index(docs, mapping=_mapping())
 
-    kwargs = client.bulk.call_args.kwargs
-    assert kwargs["index"] == "wands_bench"
-    ops = kwargs["operations"]
-    assert ops[0] == {"index": {"_id": "p1"}}  # _id == doc.doc_id
-    assert ops[1] == {"search_text": "sofa"}  # _source == doc.fields
-    assert ops[2] == {"index": {"_id": "p2"}}
-    assert ops[3] == {"search_text": "table"}
+    # one action per doc: {"_op_type": "index", "_index": idx, "_id": doc_id, "_source": fields}
+    assert captured == [
+        {"_op_type": "index", "_index": "wands_bench", "_id": "p1", "_source": {"search_text": "sofa"}},
+        {"_op_type": "index", "_index": "wands_bench", "_id": "p2", "_source": {"search_text": "table"}},
+    ]
     client.indices.refresh.assert_called_once_with(index="wands_bench")
 
 
-def test_bulk_index_no_docs_is_noop() -> None:
+def test_bulk_index_actions_iterable_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # streaming_bulk receives a generator, not a materialized list (corpus must stream, not
+    # accumulate — 43K/1M docs). Assert the actions arg is an iterator, not a sequence.
+    seen_type: dict[str, bool] = {}
+
+    def fake_streaming_bulk(client: Any, actions: Any, **kwargs: Any) -> Any:
+        import collections.abc
+
+        seen_type["is_iterator"] = isinstance(actions, collections.abc.Iterator)
+        seen_type["is_list"] = isinstance(actions, list)
+        for action in actions:
+            yield (True, {"index": {"_id": action["_id"]}})
+
+    monkeypatch.setattr(es, "streaming_bulk", fake_streaming_bulk)
+    backend = _backend_with(_fake_client())
+    backend.bulk_index([Document(doc_id="p1", fields={"t": "x"})], mapping=_mapping())
+
+    assert seen_type["is_iterator"] is True
+    assert seen_type["is_list"] is False
+
+
+def test_bulk_index_failed_item_raises_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capture_bulk_actions(monkeypatch, fail_on="p2")
+    client = _fake_client()
+    backend = _backend_with(client)
+
+    docs = [
+        Document(doc_id="p1", fields={"search_text": "sofa"}),
+        Document(doc_id="p2", fields={"search_text": "table"}),
+    ]
+    with pytest.raises(RuntimeError, match="simulated failed item p2"):
+        backend.bulk_index(docs, mapping=_mapping())
+    # a failed item aborts before refresh (the error surfaces, exception convention)
+    client.indices.refresh.assert_not_called()
+
+
+def test_bulk_index_no_docs_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capture_bulk_actions(monkeypatch)
     client = _fake_client()
     backend = _backend_with(client)
 
     backend.bulk_index([], mapping=_mapping())
 
-    client.bulk.assert_not_called()
-    client.indices.refresh.assert_not_called()
+    client.indices.refresh.assert_not_called()  # nothing indexed -> no refresh
 
 
 # --- _search + LexicalSearcher ----------------------------------------------------------------
@@ -219,6 +280,69 @@ def test_lexical_searcher_rejects_multiple_fields() -> None:
     client = _fake_client()
     with pytest.raises(ValueError):
         es.LexicalSearcher(client, "wands_bench", ["search_text", "other"])
+
+
+# --- _msearch + LexicalSearcher.bulk_search ---------------------------------------------------
+
+
+def _msearch_response(*per_search_hits: dict[str, Any]) -> dict[str, Any]:
+    """A canned ``_msearch`` response wrapping one hits payload per sub-search, in order."""
+    return {"responses": list(per_search_hits)}
+
+
+def test_lexical_bulk_search_chunks_and_aligns(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _fake_client()
+    # chunk size 2, three queries -> TWO msearch calls (chunks of [q0,q1] then [q2]).
+    searcher = es.LexicalSearcher(client, "wands_bench", ["search_text"], msearch_chunk_size=2)
+
+    # per-query canned hits; q1 is deliberately unsorted + a score TIE to prove client-side sort.
+    client.msearch.side_effect = [
+        _msearch_response(_hits(("a", 1.0)), _hits(("d_b", 2.0), ("d_c", 3.0), ("d_a", 2.0))),
+        _msearch_response(_hits(("z", 9.0))),
+    ]
+
+    result = searcher.bulk_search(["q0", "q1", "q2"], top_k=5)
+
+    # TWO chunked msearch round trips (not one per query, not a single call)
+    assert client.msearch.call_count == 2
+
+    # per-chunk payload: alternating {} header then the match body with size=top_k
+    first_searches = client.msearch.call_args_list[0].kwargs["searches"]
+    assert client.msearch.call_args_list[0].kwargs["index"] == "wands_bench"
+    assert first_searches[0] == {}  # header
+    assert first_searches[1] == {"query": {"match": {"search_text": "q0"}}, "size": 5}
+    assert first_searches[2] == {}
+    assert first_searches[3] == {"query": {"match": {"search_text": "q1"}}, "size": 5}
+
+    # aligned list[list[ScoredDoc]] with client-side (score desc, doc_id asc) tie-break on q1
+    assert [(d.doc_id, d.score) for d in result[0]] == [("a", 1.0)]
+    assert [(d.doc_id, d.score) for d in result[1]] == [
+        ("d_c", 3.0),
+        ("d_a", 2.0),  # tie broken by doc_id asc: d_a before d_b
+        ("d_b", 2.0),
+    ]
+    assert [(d.doc_id, d.score) for d in result[2]] == [("z", 9.0)]
+
+
+def test_msearch_per_response_error_raises() -> None:
+    client = _fake_client()
+    client.msearch.return_value = _msearch_response(
+        _hits(("a", 1.0)),
+        {"error": {"type": "search_phase_execution_exception", "reason": "boom"}},
+    )
+    bodies = [
+        {"query": {"match": {"search_text": "q0"}}, "size": 5},
+        {"query": {"match": {"search_text": "q1"}}, "size": 5},
+    ]
+    with pytest.raises(RuntimeError, match="sub-request 1 failed"):
+        es._msearch(client, "wands_bench", bodies, chunk_size=10)
+
+
+def test_lexical_bulk_search_empty_queries_no_round_trip() -> None:
+    client = _fake_client()
+    searcher = es.LexicalSearcher(client, "wands_bench", ["search_text"])
+    assert searcher.bulk_search([], top_k=5) == []
+    client.msearch.assert_not_called()
 
 
 # --- make_searcher_factory --------------------------------------------------------------------
