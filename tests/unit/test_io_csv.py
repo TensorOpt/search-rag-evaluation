@@ -1,0 +1,318 @@
+"""Phase 7 — golden-file + behavioral tests for benchmark.io_csv (docs/experiment.md §9, §9.1).
+
+The three CSV writers are asserted BYTE-FOR-BYTE against committed golden files (exact headers +
+field order + the NaN->empty and degenerate serializations). ``write_run_config`` is asserted by
+JSON round-trip + presence of the §9.1 fields (its content depends on the resolved config, not a
+fixed schema, so it is not a byte-for-byte golden).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import pytest
+
+from benchmark.config import (
+    EmbedderCfg,
+    FuserCfg,
+    PipelineCfg,
+    RerankerCfg,
+    ResolvedConfig,
+    SearcherCfg,
+    Services,
+)
+from benchmark.io_csv import (
+    write_comparison_csv,
+    write_metrics_csv,
+    write_result_csv,
+    write_run_config,
+)
+from benchmark.metrics import Metrics
+from benchmark.models import EmbeddingType, RankedResult, ScoredDoc
+from benchmark.stats import ComparisonResult, StatsCfg
+
+TIMESTAMP = "20260101T000000Z"
+
+
+def _pcfg(pipeline_id: str) -> PipelineCfg:
+    return PipelineCfg(
+        id=pipeline_id, retrievers=(pipeline_id,), fuser=None, reranker=None, rerank_window_size=None
+    )
+
+
+# --- result CSV -------------------------------------------------------------------------------
+
+
+def test_result_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
+    """result CSV: docs[0] -> position 1 ascending, product_id/score correct, byte-for-byte golden."""
+    results = [
+        RankedResult(
+            "q1",
+            [ScoredDoc("d1", 5.0), ScoredDoc("d2", 4.5), ScoredDoc("d3", 3.25)],
+        ),
+        RankedResult("q2", [ScoredDoc("d9", 1.0)]),
+    ]
+    path = write_result_csv(_pcfg("bm25"), results, TIMESTAMP, output_dir=tmp_path)
+    assert path.name == f"result_bm25_{TIMESTAMP}.csv"
+    golden = (golden_dir / f"result_bm25_{TIMESTAMP}.csv").read_bytes()
+    assert path.read_bytes() == golden
+
+
+def test_result_csv_header_and_position(tmp_path: Path) -> None:
+    """Header is exactly query_id,product_id,score,position; positions are 1-based ascending."""
+    results = [RankedResult("q1", [ScoredDoc("a", 2.0), ScoredDoc("b", 1.0)])]
+    path = write_result_csv(_pcfg("bm25"), results, TIMESTAMP, output_dir=tmp_path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "query_id,product_id,score,position"
+    assert lines[1].endswith(",1")
+    assert lines[2].endswith(",2")
+
+
+def test_result_csv_respects_returned_length(tmp_path: Path) -> None:
+    """Rows per query equal the returned doc count (pipeline already truncates to top_k, §8.0)."""
+    docs = [ScoredDoc(f"d{i}", float(i)) for i in range(5)]
+    path = write_result_csv(_pcfg("bm25"), [RankedResult("q1", docs)], TIMESTAMP, output_dir=tmp_path)
+    data_rows = path.read_text(encoding="utf-8").splitlines()[1:]
+    assert len(data_rows) == 5
+
+
+# --- metrics CSV ------------------------------------------------------------------------------
+
+
+def test_metrics_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
+    """metrics CSV: NaN metric cells EMPTY, ints always present, byte-for-byte golden.
+
+    q_full is fully judged (all four numeric); q_noscore has n_scored==0 (avg/ndcg/precision NaN)
+    with R>0 so recall is the finite 0.0; q_norel has judged-irrelevant docs (avg/ndcg/precision
+    finite) but R==0 so recall is NaN -> empty.
+    """
+    metrics = {
+        "q_full": Metrics(0.75, 0.9, 0.5, 1.0, n_scored=4, n_missing=2),
+        "q_noscore": Metrics(math.nan, math.nan, 0.0, math.nan, n_scored=0, n_missing=3),
+        "q_norel": Metrics(0.0, 0.0, math.nan, 0.0, n_scored=2, n_missing=0),
+    }
+    path = write_metrics_csv(_pcfg("bm25"), metrics, TIMESTAMP, output_dir=tmp_path)
+    assert path.name == f"metrics_bm25_{TIMESTAMP}.csv"
+    golden = (golden_dir / f"metrics_bm25_{TIMESTAMP}.csv").read_bytes()
+    assert path.read_bytes() == golden
+
+
+def test_metrics_header_ends_with_counts(tmp_path: Path) -> None:
+    """The metrics header ends with the two int count columns (§9)."""
+    path = write_metrics_csv(
+        _pcfg("bm25"),
+        {"q1": Metrics(1.0, 1.0, 1.0, 1.0, n_scored=1, n_missing=0)},
+        TIMESTAMP,
+        output_dir=tmp_path,
+    )
+    header = path.read_text(encoding="utf-8").splitlines()[0]
+    assert header == "query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing"
+
+
+def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None:
+    """A NaN metric cell is two adjacent commas (empty field), while counts stay integers."""
+    path = write_metrics_csv(
+        _pcfg("bm25"),
+        {"q0": Metrics(math.nan, math.nan, math.nan, math.nan, n_scored=0, n_missing=0)},
+        TIMESTAMP,
+        output_dir=tmp_path,
+    )
+    row = path.read_text(encoding="utf-8").splitlines()[1]
+    # query_id + four empty metric cells + two int counts.
+    assert row == "q0,,,,,0,0"
+
+
+# --- comparison CSV ---------------------------------------------------------------------------
+
+
+def test_comparison_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
+    """comparison CSV: a normal row + empty_paired_set + all_zero_delta, byte-for-byte golden (§8.1)."""
+    rows = [
+        ComparisonResult(
+            variant="semantic_e5",
+            metric="avg_relevance",
+            delta=0.125,
+            delta_ci_lo=0.05,
+            delta_ci_high=0.2,
+            p_value=0.01,
+            significant_raw=True,
+            p_value_adjusted=0.02,
+            significant=True,
+            note=None,
+        ),
+        ComparisonResult(
+            variant="semantic_e5",
+            metric="ndcg@10",
+            delta=None,
+            delta_ci_lo=None,
+            delta_ci_high=None,
+            p_value=1.0,
+            significant_raw=False,
+            p_value_adjusted=1.0,
+            significant=False,
+            note="empty_paired_set",
+        ),
+        ComparisonResult(
+            variant="semantic_e5",
+            metric="recall@10",
+            delta=0.0,
+            delta_ci_lo=0.0,
+            delta_ci_high=0.0,
+            p_value=1.0,
+            significant_raw=False,
+            p_value_adjusted=1.0,
+            significant=False,
+            note="all_zero_delta",
+        ),
+    ]
+    path = write_comparison_csv("bm25", "semantic_e5", rows, TIMESTAMP, output_dir=tmp_path)
+    assert path.name == f"comparison_bm25_semantic_e5_{TIMESTAMP}.csv"
+    golden = (golden_dir / f"comparison_bm25_semantic_e5_{TIMESTAMP}.csv").read_bytes()
+    assert path.read_bytes() == golden
+
+
+def test_comparison_header_is_nine_columns(tmp_path: Path) -> None:
+    """The comparison header is exactly the 9-column §9 header."""
+    path = write_comparison_csv("bm25", "v", [], TIMESTAMP, output_dir=tmp_path)
+    header = path.read_text(encoding="utf-8").splitlines()[0]
+    assert header == (
+        "variant,metric,delta,delta_ci_lo,delta_ci_high,"
+        "p_value,significant_raw,p_value_adjusted,significant"
+    )
+
+
+def test_comparison_empty_paired_set_row(tmp_path: Path) -> None:
+    """empty_paired_set: delta/CI empty, p=1.0, flags false, q=1.0 (§8.1)."""
+    row = ComparisonResult(
+        variant="v", metric="recall@10", delta=None, delta_ci_lo=None, delta_ci_high=None,
+        p_value=1.0, significant_raw=False, p_value_adjusted=1.0, significant=False,
+        note="empty_paired_set",
+    )
+    path = write_comparison_csv("bm25", "v", [row], TIMESTAMP, output_dir=tmp_path)
+    data = path.read_text(encoding="utf-8").splitlines()[1]
+    assert data == "v,recall@10,,,,1.0,false,1.0,false"
+
+
+def test_comparison_all_zero_delta_row(tmp_path: Path) -> None:
+    """all_zero_delta: delta=0.0, CI 0.0/0.0, p=1.0, flags false, q=1.0 (§8.1)."""
+    row = ComparisonResult(
+        variant="v", metric="ndcg@10", delta=0.0, delta_ci_lo=0.0, delta_ci_high=0.0,
+        p_value=1.0, significant_raw=False, p_value_adjusted=1.0, significant=False,
+        note="all_zero_delta",
+    )
+    path = write_comparison_csv("bm25", "v", [row], TIMESTAMP, output_dir=tmp_path)
+    data = path.read_text(encoding="utf-8").splitlines()[1]
+    assert data == "v,ndcg@10,0.0,0.0,0.0,1.0,false,1.0,false"
+
+
+# --- run_config JSON --------------------------------------------------------------------------
+
+
+def _resolved_config() -> ResolvedConfig:
+    services = Services(
+        embedders={
+            "e5": EmbedderCfg(
+                name="e5", provider="elasticsearch",
+                embedding_type=EmbeddingType.TEXT_EMBEDDING,
+                settings={"model_id": ".multilingual-e5-small"},
+            )
+        },
+        rerankers={
+            "co-rr": RerankerCfg(
+                name="co-rr", provider="cohere",
+                settings={"model_id": "rerank-v3.5", "top_n": 100},
+            )
+        },
+        searchers={
+            "bm25": SearcherCfg(name="bm25", provider="elasticsearch", kind="lexical", embedder=None),
+            "semantic_e5": SearcherCfg(
+                name="semantic_e5", provider="elasticsearch", kind="vector", embedder="e5"
+            ),
+        },
+    )
+    baseline = PipelineCfg(
+        id="baseline", retrievers=("bm25",), fuser=None, reranker=None, rerank_window_size=None
+    )
+    variants = [
+        PipelineCfg(
+            id="hybrid_e5",
+            retrievers=("bm25", "semantic_e5"),
+            fuser=FuserCfg(type="rrf", rank_constant=60, window=100),
+            reranker="co-rr",
+            rerank_window_size=100,
+        )
+    ]
+    return ResolvedConfig(
+        dataset={"name": "wands", "path": "./dataset/wands"},
+        indexer={"provider": "elasticsearch", "index": "wands_bench"},
+        services=services,
+        baseline=baseline,
+        variants=variants,
+        stats=StatsCfg(),
+        cutoff=10,
+        top_k=100,
+        baseline_id="baseline",
+        timestamp=TIMESTAMP,
+        seed=1234,
+    )
+
+
+def test_run_config_round_trips_and_has_section_9_1_fields(tmp_path: Path) -> None:
+    """run_config JSON round-trips and carries the §9.1 fields (services, pipelines, stats, ...)."""
+    cfg = _resolved_config()
+    path = write_run_config(cfg, output_dir=tmp_path)
+    assert path.name == f"run_config_{TIMESTAMP}.json"
+
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+
+    # Top-level §9.1 fields.
+    assert loaded["timestamp"] == TIMESTAMP
+    assert loaded["seed"] == 1234
+    assert loaded["cutoff"] == 10
+    assert loaded["top_k"] == 100
+
+    # Resolved services registry — embedders/rerankers/searchers by name.
+    services = loaded["services"]
+    assert set(services["embedders"]) == {"e5"}
+    # StrEnum serialized as its string value.
+    assert services["embedders"]["e5"]["embedding_type"] == "text_embedding"
+    assert set(services["rerankers"]) == {"co-rr"}
+    assert set(services["searchers"]) == {"bm25", "semantic_e5"}
+
+    # Resolved pipelines — baseline + every named variant with retrievers/fuser/reranker/window.
+    assert loaded["baseline"]["id"] == "baseline"
+    variant = loaded["variants"][0]
+    assert variant["id"] == "hybrid_e5"
+    assert variant["retrievers"] == ["bm25", "semantic_e5"]
+    assert variant["fuser"] == {"type": "rrf", "rank_constant": 60, "window": 100}
+    assert variant["reranker"] == "co-rr"
+    assert variant["rerank_window_size"] == 100
+
+    # Stats block: alpha as raw+q (one number), correction, bootstrap, ci level, test + zero/tie, seed.
+    stats = loaded["stats"]
+    assert stats["alpha"] == 0.05
+    assert stats["correction"] == "bh"
+    assert stats["bootstrap_B"] == 10000
+    assert stats["ci_level"] == 0.95
+    assert stats["test"] == "wilcoxon"
+    assert stats["wilcoxon_zero_method"] == "wilcox"
+    assert stats["wilcoxon_correction"] is True
+    assert stats["seed"] == 1234
+
+
+def test_run_config_from_full_config_yaml(tmp_path: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The §10 config.yaml resolves and its run_config JSON round-trips (services + all pipelines)."""
+    from benchmark.config import load_config
+
+    monkeypatch.setenv("COHERE_KEY", "test-key")
+    monkeypatch.setenv("ES_URL", "http://localhost:9200")
+    cfg = load_config(repo_root / "config.yaml")
+    path = write_run_config(cfg, output_dir=tmp_path)
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+
+    assert loaded["baseline"]["id"] == "baseline"
+    variant_ids = {v["id"] for v in loaded["variants"]}
+    assert {"semantic_e5", "semantic_co", "hybrid_e5_k60", "bm25_rerank", "hybrid_e5_rerank"} == variant_ids
+    assert loaded["stats"]["correction"] == "bh"

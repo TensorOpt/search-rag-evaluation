@@ -1,0 +1,4 @@
+query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
+q_full,0.75,0.9,0.5,1.0,4,2
+q_noscore,,,0.0,,0,3
+q_norel,0.0,0.0,,0.0,2,0
