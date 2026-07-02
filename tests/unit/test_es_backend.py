@@ -507,6 +507,8 @@ def test_reranker_maps_scores_by_index_and_reorders_desc() -> None:
     assert infer_kwargs["inference_id"] == "cohere-rerank"
     assert infer_kwargs["query"] == "a query"
     assert infer_kwargs["input"] == ["text one", "text two", "text three"]
+    # a generous server-side timeout rides out a cold/slow rerank deployment (ES default is 30s).
+    assert infer_kwargs["timeout"] == es._RERANK_INFERENCE_TIMEOUT
 
 
 def test_reranker_missing_candidate_raises() -> None:

@@ -52,6 +52,11 @@ _MSEARCH_CHUNK_SIZE = 100
 #: Log an ingest progress line every this many successfully-indexed docs.
 _BULK_PROGRESS_EVERY = 10_000
 
+#: Server-side wait for a rerank ``_inference`` call (ES default is 30s). A cold/slow rerank model
+#: (e.g. a deployment still scaling up) can exceed 30s on the first call and return a 408; a generous
+#: bound rides that out. Duration string per the ES inference API ``timeout`` param.
+_RERANK_INFERENCE_TIMEOUT = "120s"
+
 
 def _make_client(indexer_cfg: Mapping[str, Any]) -> Elasticsearch:
     """Build an :class:`Elasticsearch` client from ``indexer.settings.url`` (§10)."""
@@ -321,7 +326,10 @@ class ESReranker(Reranker):
         so the returned list aligns with ``doc_texts`` for ``rerank_local``.
         """
         response = self.client.inference.rerank(
-            inference_id=self.inference_id, query=query, input=list(doc_texts)
+            inference_id=self.inference_id,
+            query=query,
+            input=list(doc_texts),
+            timeout=_RERANK_INFERENCE_TIMEOUT,  # ride out a cold/slow rerank deployment (ES default 30s)
         )
         scores: list[float] = [0.0] * len(doc_texts)
         for item in response["rerank"]:

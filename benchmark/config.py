@@ -66,6 +66,11 @@ DATASET_TARGETS: Mapping[str, str] = {
 INDEXER_TARGETS: Mapping[str, str] = {
     "elasticsearch": "benchmark.backends.elasticsearch:ElasticsearchBackend",
 }
+#: The concrete ``Indexer`` (§3.5 ``build``) per provider — resolved LAZILY like the others so the
+#: runner names no adapter and swapping the backend is a config-only edit (§1.4(3), §11).
+INDEX_BUILDER_TARGETS: Mapping[str, str] = {
+    "elasticsearch": "benchmark.backends.elasticsearch:ESIndexer",
+}
 SEARCHER_FACTORY_TARGETS: Mapping[str, str] = {
     "elasticsearch": "benchmark.backends.elasticsearch:make_searcher_factory",
 }
@@ -645,6 +650,23 @@ def make_indexer(indexer_cfg: Mapping[str, Any]) -> Any:
     if target is None:
         raise ConfigError(f"unknown indexer provider {provider!r}; known: {sorted(INDEXER_TARGETS)}")
     return _resolve_target(target)(indexer_cfg)
+
+
+def make_index_builder(indexer_cfg: Mapping[str, Any]) -> Any:
+    """Dispatch ``indexer.provider`` -> the concrete ``Indexer`` (§3.5), lazily imported (§11).
+
+    Mirrors :func:`make_indexer`/:func:`make_searcher_factory`: resolves the dotted target at CALL
+    time so ``config`` imports no adapter at import time. The returned object exposes
+    ``build(dataset, backend, embedders) -> IndexMapping`` — the single register→ensure→bulk path
+    the runner drives (so the backend is swappable via config alone, §1.4(3)).
+    """
+    provider = _require(indexer_cfg, "provider", "indexer")
+    target = INDEX_BUILDER_TARGETS.get(provider)
+    if target is None:
+        raise ConfigError(
+            f"unknown indexer provider {provider!r}; known: {sorted(INDEX_BUILDER_TARGETS)}"
+        )
+    return _resolve_target(target)()
 
 
 def make_searcher_factory(indexer_cfg: Mapping[str, Any], *args: Any, **kwargs: Any) -> Any:

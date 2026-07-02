@@ -181,14 +181,29 @@ def _config(
     )
 
 
-@pytest.fixture
-def patched_factories(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
-    """Point the runner's ``config`` factories at the in-memory fakes; return the fake backend."""
+def patch_runner_factories(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
+    """Point the runner's ``config`` factories at the in-memory fakes; return the fake backend.
+
+    Reused by the ``patched_factories`` fixture AND the schema-lint / reproducibility tests (one
+    patching path). ``make_index_builder`` returns the REAL :class:`ESIndexer` (run against the fake
+    backend), so the §3.5 register→ensure→bulk sequence is exercised, not stubbed — matching the
+    pre-Phase-12 flow where the runner imported ``ESIndexer`` directly. All four factories are patched
+    on ``config`` so no adapter is imported/instantiated live.
+    """
+    from benchmark.backends.elasticsearch import ESIndexer
+
     backend = FakeBackend()
     monkeypatch.setattr(config, "load_dataset", lambda dataset_cfg: FakeDataset())
     monkeypatch.setattr(config, "make_indexer", lambda indexer_cfg: backend)
+    monkeypatch.setattr(config, "make_index_builder", lambda indexer_cfg: ESIndexer())
     monkeypatch.setattr(config, "make_searcher_factory", lambda indexer_cfg: FakeFactory())
     return backend
+
+
+@pytest.fixture
+def patched_factories(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
+    """Fixture wrapper over :func:`patch_runner_factories` (return the fake ingest backend)."""
+    return patch_runner_factories(monkeypatch)
 
 
 def _artifacts(output_dir: Path, prefix: str, timestamp: str) -> list[str]:

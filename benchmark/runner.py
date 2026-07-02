@@ -6,16 +6,18 @@ guarantee, §8.0). The runner is a flat loop over the explicit config pipelines 
 there is NO matrix expansion, NO sweep, and NO selection phase.
 
 Setup prelude (§8.0), before any per-pipeline work: load the dataset, build the index (register
-embedder endpoints → ensure_index → bulk_index via :class:`ESIndexer`), build the searcher factory,
-freeze the shared query set, and build the :class:`QrelIndex` + :class:`Evaluator` once. The
-index-build sequence lives in ONE place — :meth:`ExperimentRunner.build_index` — reused by both
-:meth:`ExperimentRunner.run`'s setup and the ``eval:index`` entry point (``scripts/index.py``), so
-there is a single register/ensure/bulk path (DRY).
+embedder endpoints → ensure_index → bulk_index via the lazily-resolved ``Indexer``), build the
+searcher factory, freeze the shared query set, and build the :class:`QrelIndex` + :class:`Evaluator`
+once. The index-build sequence lives in ONE place — :meth:`ExperimentRunner.build_index` — reused by
+both :meth:`ExperimentRunner.run`'s setup and the ``eval:index`` entry point (``scripts/index.py``),
+so there is a single register/ensure/bulk path (DRY).
 
-Imports the pure consumers (``config``/``metrics``/``stats``/``io_csv``) + the ES ``ESIndexer``
-adapter (the concrete indexer §8.0 names as ``Indexer().build(...)``). The lazy ``config`` factories
-(``load_dataset``/``make_indexer``/``make_searcher_factory``) are referenced through the ``config``
-module so tests can monkeypatch them with in-memory fakes (no ES, no network).
+Imports ONLY the pure consumers (``config``/``metrics``/``stats``/``io_csv``/``models``) — NEVER an
+adapter at import time (§11). The concrete indexer §8.0 names as ``Indexer().build(...)`` arrives
+through the lazy ``config.make_index_builder`` factory, symmetric with
+``load_dataset``/``make_indexer``/``make_searcher_factory``; all four are referenced through the
+``config`` module so tests can monkeypatch them with in-memory fakes (no ES, no network). Because the
+runner names no backend, swapping the backend is a config-only edit (the §1.4(3) Generality criterion).
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ from __future__ import annotations
 from typing import Any
 
 import benchmark.config as config
-from benchmark.backends.elasticsearch import ESIndexer
 from benchmark.config import PipelineCfg, ResolvedConfig
 from benchmark.io_csv import (
     DEFAULT_OUTPUT_DIR,
@@ -47,11 +48,11 @@ class ExperimentRunner:
         """Build the index (§3.5 register→ensure_index→bulk_index); return (dataset, backend, mapping).
 
         The ONE index-build path (DRY): reused by :meth:`run`'s setup prelude AND the ``eval:index``
-        entry point. Loads the dataset, builds the ingest backend, and drives ``ESIndexer.build``
-        over EVERY configured embedder (§8.0 passes ``cfg.services.embedders.values()`` — every
-        embedder gets a ``semantic_text`` field). Returns the dataset (reused by :meth:`run` for the
-        shared query set + qrels), the backend (so the caller can register a reranker endpoint at
-        R0), and the resulting :class:`IndexMapping`.
+        entry point. Loads the dataset, builds the ingest backend, and drives the lazily-resolved
+        ``Indexer.build`` (``config.make_index_builder``) over EVERY configured embedder (§8.0 passes
+        ``cfg.services.embedders.values()`` — every embedder gets a ``semantic_text`` field). Returns
+        the dataset (reused by :meth:`run` for the shared query set + qrels), the backend (so the
+        caller can register a reranker endpoint at R0), and the resulting :class:`IndexMapping`.
         """
         dataset = config.load_dataset(cfg.dataset)
         backend = config.make_indexer(cfg.indexer)  # ingest seam (register/ensure_index/bulk_index)
@@ -62,7 +63,7 @@ class ExperimentRunner:
             len(embedders),
             [e.name for e in embedders],
         )
-        mapping = ESIndexer().build(dataset, backend, embedders)
+        mapping = config.make_index_builder(cfg.indexer).build(dataset, backend, embedders)
         return dataset, backend, mapping
 
     def run(self, cfg: ResolvedConfig, *, output_dir: str = DEFAULT_OUTPUT_DIR) -> None:

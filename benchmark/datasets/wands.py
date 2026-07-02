@@ -69,6 +69,24 @@ def _read_rows(path: Path) -> Iterator[dict[str, str]]:
         yield from csv.DictReader(handle, delimiter="\t")
 
 
+def _parse_numeric(raw: str | None, numeric_type: type[int] | type[float]) -> int | float | None:
+    """Parse a WANDS numeric cell; ``None`` for an empty cell (the field is then omitted).
+
+    The full WANDS ``product.csv`` formats integer counts as floats (``"15.0"``) and leaves many
+    cells empty, so a bare ``int("15.0")`` fails: parse via ``float`` first, then narrow ``int``
+    columns. Exhaustive on the declared type — an unsupported type raises rather than defaulting.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None  # missing numeric (empty cell) — omit the field; numerics are stored, never ranked
+    number = float(text)
+    if numeric_type is int:
+        return int(number)
+    if numeric_type is float:
+        return number
+    raise ValueError(f"unsupported numeric type {numeric_type!r} for a WANDS column")
+
+
 class WandsDataset(Dataset):
     """WANDS dataset adapter deriving from the ``Dataset`` ABC (§3.2)."""
 
@@ -91,8 +109,10 @@ class WandsDataset(Dataset):
         """Stream one ``Document`` per product row; fields carry the computed ``search_text`` (§5.1)."""
         for row in _read_rows(self._dir / "product.csv"):
             fields: dict[str, Any] = {name: row[name] for name in _TEXT_COLUMNS}
-            for name, parse in _NUMERIC_COLUMNS.items():
-                fields[name] = parse(row[name])
+            for name, numeric_type in _NUMERIC_COLUMNS.items():
+                value = _parse_numeric(row.get(name), numeric_type)
+                if value is not None:  # empty cell -> omit the field entirely (§3.2 stored numerics)
+                    fields[name] = value
             fields["search_text"] = self.build_search_text(row, _FIELD_SCHEMA)
             yield Document(doc_id=row["product_id"], fields=fields)
 

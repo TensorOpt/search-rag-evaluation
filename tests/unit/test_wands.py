@@ -59,6 +59,31 @@ def test_documents_roundtrip_and_numeric_parsing(dataset: WandsDataset) -> None:
     assert isinstance(salon.fields["average_rating"], float)
 
 
+def test_documents_numeric_float_formatted_and_empty_cells(tmp_path: Path) -> None:
+    # Full WANDS formats integer counts as floats ("15.0") and leaves many numeric cells empty;
+    # both must parse (int columns narrowed via float; empty cells omitted, not 0/None).
+    header = (
+        "product_id\tproduct_name\tproduct_class\tcategory hierarchy\t"
+        "product_description\tproduct_features\trating_count\taverage_rating\treview_count"
+    )
+    rows = [
+        "1\tChair\tSeating\tFurniture\tA chair\tcomfy\t15.0\t4.5\t12.0",  # float-formatted ints
+        "2\tTable\tSurfaces\tFurniture\tA table\tsturdy\t\t\t",  # all-empty numeric cells
+    ]
+    (tmp_path / "product.csv").write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+    docs = {d.doc_id: d for d in WandsDataset({"path": str(tmp_path)}).documents()}
+
+    chair = docs["1"]
+    assert chair.fields["rating_count"] == 15 and isinstance(chair.fields["rating_count"], int)
+    assert chair.fields["review_count"] == 12 and isinstance(chair.fields["review_count"], int)
+    assert chair.fields["average_rating"] == pytest.approx(4.5)
+    # Empty numeric cells are omitted entirely (not stored as 0 or None).
+    table = docs["2"]
+    assert "rating_count" not in table.fields
+    assert "average_rating" not in table.fields
+    assert "review_count" not in table.fields
+
+
 def test_documents_is_a_streaming_generator(dataset: WandsDataset) -> None:
     stream = dataset.documents()
     assert isinstance(stream, types.GeneratorType)
