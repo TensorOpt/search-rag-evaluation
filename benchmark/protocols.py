@@ -2,10 +2,12 @@
 
 Two kinds of seam live here:
 
-- **Behavioral ABCs** (``abc.ABC`` + ``@abstractmethod``): ``Searcher``, ``Fuser``, ``Reranker``.
-  These are the composite retrieval model (§3.3/§3.6): everything that produces a ranked list is
-  a ``Searcher``; composition (client-side fusion, reranking) mirrors a real search pipeline.
-- **Structural Protocols** for the ingest side: ``Dataset``, ``EmbeddingModel`` (a descriptor),
+- **ABCs** (``abc.ABC`` + ``@abstractmethod``): the behavioral retrieval seams ``Searcher``,
+  ``Fuser``, ``Reranker`` (§3.3/§3.6 — everything that produces a ranked list is a ``Searcher``;
+  composition mirrors a real search pipeline), plus the ``Dataset`` base every dataset adapter
+  derives from (§3.2). ``Dataset`` is an ABC (not a Protocol) so it can carry the two shared
+  concrete helpers (``build_search_text``, ``map_label``) every adapter reuses.
+- **Structural Protocols** for the rest of the ingest side: ``EmbeddingModel`` (a descriptor),
   ``Indexer``, and ``SearchBackend`` (the index-writer/ingest seam used by ``Indexer.build``).
 
 Data models are imported from ``benchmark.models``. Structural Protocols are ``@runtime_checkable``
@@ -16,10 +18,11 @@ attributes — rely on mypy for full structural conformance).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Iterable, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 from benchmark.models import (
     Document,
+    FieldRole,
     FieldSchema,
     IndexMapping,
     InferenceEndpoint,
@@ -28,6 +31,9 @@ from benchmark.models import (
     Query,
     ScoredDoc,
 )
+
+#: Text roles whose values are concatenated (in schema order) into the canonical search_text (§5.1).
+_SEARCH_TEXT_ROLES = frozenset({FieldRole.BM25, FieldRole.SEMANTIC_SOURCE})
 
 
 class Searcher(ABC):
@@ -68,17 +74,76 @@ class Reranker(ABC):
         ...
 
 
-@runtime_checkable
-class Dataset(Protocol):
-    """A dataset adapter (§3.2)."""
+class Dataset(ABC):
+    """The base every dataset adapter derives from (§3.2).
 
+    The single, format-agnostic dataset seam: a concrete adapter (``WandsDataset``; future
+    Amazon ESCI, BEIR) implements the four abstract methods below and owns its own file parsing,
+    label->gain mapping, and field roles. ``queries``/``documents``/``qrels``/``field_schema`` +
+    ``Qrel(gain: float)`` are enough to describe any graded-relevance IR dataset regardless of
+    on-disk format (TSV, parquet, JSONL, …). Nothing dataset-specific lives on this base.
+
+    Subclasses MUST set two attributes in ``__init__``:
+
+    - ``name``: the dataset's config-dispatch name (e.g. ``"wands"``).
+    - ``version``: the dataset version string (e.g. ``"2022.0"``).
+
+    Two concrete helpers are shared by all adapters (the reason this is an ABC, not a Protocol):
+    :meth:`build_search_text` (the §5.1 search_text concatenation) and :meth:`map_label` (a
+    string-label -> gain mapper for datasets whose qrels use string labels).
+    """
+
+    #: Config-dispatch name; a subclass sets this in ``__init__`` (e.g. ``"wands"``).
     name: str
+    #: Dataset version string; a subclass sets this in ``__init__`` (e.g. ``"2022.0"``).
     version: str
 
-    def queries(self) -> Iterable[Query]: ...
-    def documents(self) -> Iterable[Document]: ...
-    def qrels(self) -> Iterable[Qrel]: ...
-    def field_schema(self) -> FieldSchema: ...
+    @abstractmethod
+    def queries(self) -> Iterable[Query]:
+        """Yield every :class:`Query` in the dataset."""
+        ...
+
+    @abstractmethod
+    def documents(self) -> Iterable[Document]:
+        """Yield every :class:`Document` (streamed for large corpora)."""
+        ...
+
+    @abstractmethod
+    def qrels(self) -> Iterable[Qrel]:
+        """Yield every graded relevance judgement as a :class:`Qrel` (``gain`` is a float)."""
+        ...
+
+    @abstractmethod
+    def field_schema(self) -> FieldSchema:
+        """Declare this dataset's field roles + canonical text fields (§3.2/§5.1)."""
+        ...
+
+    @staticmethod
+    def build_search_text(field_values: Mapping[str, Any], schema: FieldSchema) -> str:
+        """Concatenate the BM25- and SEMANTIC_SOURCE-role field values into search_text (§5.1).
+
+        Joins the values of every ``BM25``- and ``SEMANTIC_SOURCE``-role field, in ``schema``
+        (``FieldSpec``) order, by ``"\\n"`` — the single canonical text used as BOTH the BM25
+        target and the semantic source, so every variant ranks the same input. A search-text
+        field missing from ``field_values`` raises ``KeyError`` (never silently emits empty).
+        """
+        return "\n".join(
+            str(field_values[spec.name])
+            for spec in schema.fields
+            if spec.role in _SEARCH_TEXT_ROLES
+        )
+
+    @staticmethod
+    def map_label(label: str, mapping: Mapping[str, float]) -> float:
+        """Map a string relevance label to a float gain via ``mapping`` (§7). Exhaustive.
+
+        Convenience for string-labeled datasets (WANDS Exact/Partial/Irrelevant, ESCI E/S/C/I).
+        A label not in ``mapping`` raises ``ValueError`` — no silent default. Numeric-qrel
+        datasets (BEIR) skip this and set ``gain = float(rel)`` directly.
+        """
+        if label not in mapping:
+            raise ValueError(f"unknown label {label!r}; expected one of {sorted(mapping)}")
+        return mapping[label]
 
 
 @runtime_checkable

@@ -1,12 +1,14 @@
 """WandsDataset adapter: label->gain, search_text concat (docs/experiment.md §3.2, §5.1, §7). Phase 8.
 
-Adapter behind the ``Dataset`` protocol (§3.2): reads the WANDS ``query.csv`` / ``product.csv`` /
+Adapter deriving from the ``Dataset`` ABC (§3.2): reads the WANDS ``query.csv`` / ``product.csv`` /
 ``label.csv`` (all **tab-separated** despite the ``.csv`` extension — product descriptions contain
 commas, so a comma parser would corrupt them) and yields ``Query`` / ``Document`` / ``Qrel``. The
-label->gain mapping (§7) and the ``search_text`` concatenation (§5.1) are applied here so the rest of
-the harness only ever sees float gains and a single canonical text field.
+label->gain mapping (§7, via ``Dataset.map_label``) and the ``search_text`` concatenation (§5.1, via
+``Dataset.build_search_text``) are applied here so the rest of the harness only ever sees float gains
+and a single canonical text field.
 
-Imports only ``benchmark.models`` + stdlib (``csv``/``pathlib``); no backend/pipeline (§11).
+Imports ``benchmark.models`` + ``benchmark.protocols`` (the ``Dataset`` ABC) + stdlib
+(``csv``/``pathlib``); no backend/pipeline (§11).
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ from benchmark.models import (
     Qrel,
     Query,
 )
+from benchmark.protocols import Dataset
 
 #: label.csv string label -> float relevance gain (§7). Exhaustive; unknown -> ValueError.
-_LABEL_TO_GAIN: Mapping[str, float] = {"Exact": 1.0, "Partial": 0.5, "Irrelevant": 0.0}
+WANDS_GAINS: Mapping[str, float] = {"Exact": 1.0, "Partial": 0.5, "Irrelevant": 0.0}
 
 #: product.csv text columns kept as-is in the field bag.
 _TEXT_COLUMNS = (
@@ -41,13 +44,6 @@ _NUMERIC_COLUMNS: Mapping[str, type[int] | type[float]] = {
     "average_rating": float,
     "review_count": int,
 }
-#: The BM25/SEMANTIC_SOURCE fields joined (newline) into search_text, in §5.1 schema order.
-_SEARCH_TEXT_COLUMNS = (
-    "product_name",
-    "product_description",
-    "product_features",
-    "product_class",
-)
 
 #: WANDS field roles (§5.1). category hierarchy is a STORED facet, NOT in search_text.
 _FIELD_SCHEMA = FieldSchema(
@@ -73,8 +69,8 @@ def _read_rows(path: Path) -> Iterator[dict[str, str]]:
         yield from csv.DictReader(handle, delimiter="\t")
 
 
-class WandsDataset:
-    """WANDS dataset adapter implementing the ``Dataset`` protocol (§3.2)."""
+class WandsDataset(Dataset):
+    """WANDS dataset adapter deriving from the ``Dataset`` ABC (§3.2)."""
 
     def __init__(self, dataset_cfg: Mapping[str, Any]) -> None:
         if "path" not in dataset_cfg:
@@ -97,20 +93,15 @@ class WandsDataset:
             fields: dict[str, Any] = {name: row[name] for name in _TEXT_COLUMNS}
             for name, parse in _NUMERIC_COLUMNS.items():
                 fields[name] = parse(row[name])
-            fields["search_text"] = "\n".join(row[name] for name in _SEARCH_TEXT_COLUMNS)
+            fields["search_text"] = self.build_search_text(row, _FIELD_SCHEMA)
             yield Document(doc_id=row["product_id"], fields=fields)
 
     def qrels(self) -> Iterable[Qrel]:
         for row in _read_rows(self._dir / "label.csv"):
-            label = row["label"]
-            if label not in _LABEL_TO_GAIN:
-                raise ValueError(
-                    f"unknown WANDS label {label!r}; expected one of {sorted(_LABEL_TO_GAIN)}"
-                )
             yield Qrel(
                 query_id=row["query_id"],
                 doc_id=row["product_id"],
-                gain=_LABEL_TO_GAIN[label],
+                gain=self.map_label(row["label"], WANDS_GAINS),
             )
 
     def field_schema(self) -> FieldSchema:

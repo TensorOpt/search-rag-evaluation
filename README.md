@@ -81,7 +81,7 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 .
 ├── benchmark/                 # the harness package
 │   ├── models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, InferenceEndpoint
-│   ├── protocols.py           # Searcher/Fuser/Reranker ABCs; Dataset, EmbeddingModel, Indexer, SearchBackend, SearcherFactory
+│   ├── protocols.py           # Searcher/Fuser/Reranker + Dataset ABCs; EmbeddingModel, Indexer, SearchBackend, SearcherFactory
 │   ├── pipeline.py            # RRFFuser, HybridSearch, SearchPipeline (the composers)
 │   ├── fusion.py              # fuse_rrf_local (client-side RRF, windowed)
 │   ├── rerank.py              # rerank_local (client-side score+reorder helper, windowed)

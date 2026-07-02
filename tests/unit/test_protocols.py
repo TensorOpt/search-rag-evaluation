@@ -1,11 +1,12 @@
 """Phase 1 unit tests for benchmark.protocols (docs/experiment.md §3.2-§3.5).
 
 Two seam kinds:
-- structural ingest Protocols (``Dataset``, ``EmbeddingModel``, ``Indexer``, ``SearchBackend``):
+- structural ingest Protocols (``EmbeddingModel``, ``Indexer``, ``SearchBackend``):
   a trivial in-test class satisfies each (mypy checks data attributes; ``@runtime_checkable``
   ``isinstance`` here only verifies method presence).
-- behavioral ABCs (``Searcher``, ``Fuser``, ``Reranker``): a trivial subclass implementing the
-  abstract method instantiates and works; a subclass that does not is uninstantiable.
+- ABCs (``Searcher``, ``Fuser``, ``Reranker``, ``Dataset``): a trivial subclass implementing the
+  abstract methods instantiates and works; a subclass that does not is uninstantiable. (The
+  ``Dataset`` ABC's shared helpers are covered in ``test_wands.py``.)
 """
 
 from __future__ import annotations
@@ -35,9 +36,10 @@ from benchmark.protocols import (
 )
 
 
-class _Dataset:
-    name = "fake"
-    version = "1.0"
+class _Dataset(Dataset):
+    def __init__(self) -> None:
+        self.name = "fake"
+        self.version = "1.0"
 
     def queries(self) -> Iterable[Query]:
         return []

@@ -81,7 +81,8 @@ flowchart LR
 The harness is built around small Python ABCs / `Protocol`s that pin the seams where **datasets**, **backends**, and **models** plug in. There are two kinds of seam:
 
 - **Behavioral ABCs for retrieval** — `Searcher`, `Fuser`, `Reranker` (§3.3/§3.4). Everything that produces a ranked list is a `Searcher`; a variant is an **object graph** of these (a natural OOP composite that mirrors a real search pipeline). Fusion is **client-side** (`RRFFuser` over materialized result lists); reranking is a client-side `rerank()` pass.
-- **Structural ingest Protocols** — `Dataset`, `EmbeddingModel`, `Indexer`, and `SearchBackend` (the index-writer/ingest seam used by `Indexer.build`).
+- **The `Dataset` ABC** (§3.2) — the base every dataset adapter derives from; it carries two shared concrete helpers (`build_search_text`, `map_label`) over the four abstract methods.
+- **Structural ingest Protocols** — `EmbeddingModel`, `Indexer`, and `SearchBackend` (the index-writer/ingest seam used by `Indexer.build`).
 
 Concrete adapters (WANDS, ElasticSearch) implement these and live behind the boundary; the composers, evaluator, and comparator depend **only** on the abstractions.
 
@@ -148,17 +149,35 @@ class RankedResult:                        # one query's ranked list
 
 ### 3.2 Dataset
 
+`Dataset` is an **ABC** (`abc.ABC`, in `protocols.py`) — the single, format-agnostic base every dataset adapter derives from. A concrete adapter (`WandsDataset`; future Amazon ESCI, BEIR) implements the four abstract methods and owns its own **file parsing**, **label→gain mapping**, and **field roles**; it sets `name`/`version` in `__init__`.
+
 ```python
-class Dataset(Protocol):
-    name: str
-    version: str
+class Dataset(ABC):
+    name: str        # config-dispatch name, set by the subclass (e.g. "wands")
+    version: str     # dataset version string, set by the subclass (e.g. "2022.0")
+
+    @abstractmethod
     def queries(self) -> Iterable[Query]: ...
+    @abstractmethod
     def documents(self) -> Iterable[Document]: ...      # streamed for large corpora
+    @abstractmethod
     def qrels(self) -> Iterable[Qrel]: ...
+    @abstractmethod
     def field_schema(self) -> "FieldSchema": ...        # declares field roles (§5)
+
+    # --- concrete shared helpers (the reason this is an ABC, not a Protocol) ---
+    @staticmethod
+    def build_search_text(field_values: Mapping[str, Any], schema: FieldSchema) -> str:
+        """§5.1: join every BM25- and SEMANTIC_SOURCE-role field value, in schema order,
+        by "\n". A missing search-text key raises (never silently emits empty)."""
+    @staticmethod
+    def map_label(label: str, mapping: Mapping[str, float]) -> float:
+        """Map a string label to a float gain via `mapping`; exhaustive, raises ValueError
+        on an unknown label (no silent default). BEIR-style numeric qrels skip this and set
+        gain = float(rel) directly."""
 ```
 
-`field_schema()` is the seam that lets the indexer build a backend mapping without knowing about WANDS. The label→gain mapping is the dataset adapter's responsibility and is applied while emitting `qrels()` (so the rest of the harness only ever sees float gains).
+`field_schema()` is the seam that lets the indexer build a backend mapping without knowing about WANDS. The label→gain mapping is the dataset adapter's responsibility and is applied while emitting `qrels()` (so the rest of the harness only ever sees float gains). `queries`/`documents`/`qrels`/`field_schema` + `Qrel(gain: float)` describe any graded-relevance IR dataset regardless of on-disk format (TSV, parquet, JSONL); **nothing dataset-specific leaks into the base**. The two concrete helpers are the only shared machinery: `build_search_text` (the §5.1 concatenation, reused verbatim by every adapter) and `map_label` (a convenience string-label→gain mapper for WANDS/ESCI). File-format handling stays per-adapter — TSV/parquet/JSONL differ too much to share.
 
 ```python
 class FieldRole(StrEnum):
@@ -478,7 +497,7 @@ For WANDS `product.csv`:
 | category hierarchy | stored (facet) | `keyword` — kept for faceting; **not** in `search_text` |
 | `rating_count`, `average_rating`, `review_count` | numeric (stored) | `integer`/`float` |
 
-A canonical **`search_text`** field is built by concatenating the values of every `BM25`- and `SEMANTIC_SOURCE`-role field (§3.2) — for WANDS: `product_name`, `product_description`, `product_features`, `product_class` — **in schema order, joined by newlines (`"\n"`)**. It is **both** the BM25 target and the semantic source — so every variant ranks the same input text (fair comparison; isolates the ranker, not the field selection). The dataset adapter performs this concatenation when emitting each `Document`'s field bag.
+A canonical **`search_text`** field is built by concatenating the values of every `BM25`- and `SEMANTIC_SOURCE`-role field (§3.2) — for WANDS: `product_name`, `product_description`, `product_features`, `product_class` — **in schema order, joined by newlines (`"\n"`)**. It is **both** the BM25 target and the semantic source — so every variant ranks the same input text (fair comparison; isolates the ranker, not the field selection). The dataset adapter performs this concatenation when emitting each `Document`'s field bag, via the shared `Dataset.build_search_text(field_values, schema)` helper (§3.2) — the rule is factored onto the ABC so every adapter reuses it.
 
 ### 5.2 One `semantic_text` field per embedding model (verified shape)
 With ElasticSearch there is exactly **ONE index** (`indexer.index`, e.g. `wands_bench`) — **not** one index per embedder. Inside that single index live a single **`search_text`** field (the BM25 target, §5.1) **plus one `semantic_text` field per embedder** that a **vector searcher** references. So in the §10 config, `semantic_e5` / `semantic_co` are **two fields in the same index, not two indices**: each is a `semantic_text` field bound to that embedder's endpoint, and the source `search_text` field uses **`copy_to`** to populate every semantic field so ES computes each embedding at ingest. Per ES docs, `copy_to` lives on the **source `text` field** and points **to** the `semantic_text` field(s) — the v1 draft's `copy_to_source` key does not exist and is corrected here.
@@ -818,7 +837,7 @@ from axes is a possible future convenience, deliberately omitted here for config
 ```
 benchmark/
   models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, InferenceEndpoint
-  protocols.py           # Searcher/Fuser/Reranker ABCs; Dataset, EmbeddingModel, Indexer, SearchBackend (ingest), SearcherFactory Protocols
+  protocols.py           # Searcher/Fuser/Reranker ABCs; Dataset ABC (abstract queries/documents/qrels/field_schema + shared build_search_text/map_label helpers); EmbeddingModel, Indexer, SearchBackend (ingest), SearcherFactory Protocols
   pipeline.py            # RRFFuser, HybridSearch, SearchPipeline (the composers)
   fusion.py              # fuse_rrf_local (client-side RRF, windowed)
   rerank.py              # rerank_local (client-side score+reorder helper, windowed)
@@ -843,7 +862,15 @@ dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
 
 Each extension is an *adapter + config* change; pipeline, metrics, stats, runner stay untouched.
 
-**Add a dataset:** implement `Dataset` (`queries/documents/qrels/field_schema`, incl. label→gain and `search_text` concat) in `datasets/`, register in `config.py`, set `dataset.name`. The stats layer already defines empty/all-zero paired-set behavior for every metric (§8.1), so a new dataset cannot produce an undefined metric or crash even if some metric is degenerate on every query.
+**Add a dataset:** **derive from the `Dataset` ABC** (§3.2) in `datasets/`, implement the four abstract methods (`queries`/`documents`/`qrels`/`field_schema`), set `self.name`/`self.version` in `__init__`, register the adapter in `config.py`'s `DATASET_TARGETS`, and set `dataset.name` in the config. The adapter owns three things: **file parsing** (TSV/parquet/JSONL — per-adapter, nothing shared), **label→gain** (a string mapping via `map_label`, or a numeric passthrough), and **field roles** (its own `field_schema`). Reuse the ABC's `build_search_text(row_fields, schema)` to build the canonical `search_text` — do not re-implement the §5.1 concatenation. The stats layer already defines empty/all-zero paired-set behavior for every metric (§8.1), so a new dataset cannot produce an undefined metric or crash even if some metric is degenerate on every query.
+
+The abstract interface is deliberately format-agnostic; the intended next targets confirm it:
+
+- **WANDS** (shipped): TSV files; string labels `Exact`/`Partial`/`Irrelevant` → `1.0`/`0.5`/`0.0` via `map_label(label, {"Exact":1.0,"Partial":0.5,"Irrelevant":0.0})`.
+- **Amazon ESCI:** parquet/CSV; string labels `E`/`S`/`C`/`I` (Exact/Substitute/Complement/Irrelevant) → a per-dataset gain mapping via `map_label` (e.g. `{"E":1.0,"S":0.5,"C":0.25,"I":0.0}` — the exact grades are a modeling choice); product `title`/`description`/`bullets`/`brand` as text fields in its own `field_schema` (title/description/bullets `SEMANTIC_SOURCE` or `BM25`, brand likely `STORED`).
+- **BEIR:** JSONL `corpus`/`queries` + a **numeric** qrels TSV → **no `map_label`**; set `gain = float(rel)` directly. Generic `title`+`text` fields, both marked `SEMANTIC_SOURCE` in `field_schema` so `build_search_text` concatenates them into `search_text`.
+
+None of these touch the pipeline/indexer/evaluator/stats — each is an adapter + config change, and `build_search_text` is reused across all three.
 
 **Add a backend (Vespa, OpenSearch, Qdrant, FAISS, …):** implement (a) the ingest `SearchBackend` (`register_inference`, `ensure_index`, `bulk_index`) + an `Indexer`, and (b) the leaf retrieval seams — a lexical `Searcher`, a vector `Searcher`, and a `Reranker` — in `backends/`, wired through the `searcher_factory`. `HybridSearch` + `RRFFuser` + `SearchPipeline` (client-side, §3.6/§3.7) compose those leaves into `hybrid`/`*_rerank` with no new code, reproducing ES's `rank_window_size` semantics. The `Reranker` uses the `rerank_local` helper. Set `indexer.provider`.
 
