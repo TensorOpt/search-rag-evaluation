@@ -8,11 +8,11 @@ dataset:
   name: wands
   path: ./dataset/wands
 services:                       # named, typed, reusable building blocks
-  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+#  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
   - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
-  - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100 } }
+  - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 25 } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
-  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
+#  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
 # ONE index for everything (ES): a single search_text (BM25) field plus one semantic_text field per
 # embedder referenced by a vector searcher above (via copy_to, §5.2) — semantic_e5/semantic_co are
@@ -27,26 +27,26 @@ pipelines:
   baseline:                     # the reference every variant is compared against
     retriever: bm25
   variants:                     # each is one explicit run; the map key is its id
-    semantic_e5:   { retriever: semantic_e5 }
+#    semantic_e5:   { retriever: semantic_e5 }
     semantic_co:   { retriever: semantic_co }
-    hybrid_e5_k60:
-      retrievers: [bm25, semantic_e5]
-      fuser: { type: rrf, rank_constant: 60, window: 100 }
+    hybrid_co_k60:
+      retrievers: [bm25, semantic_co]
+      fuser: { type: rrf, rank_constant: 60, window: 25 }
     bm25_rerank:
       retriever: bm25
       reranker: co-rr
-      rerank_window_size: 100
-    hybrid_e5_rerank:
-      retrievers: [bm25, semantic_e5]
-      fuser: { type: rrf, rank_constant: 60, window: 100 }
+      rerank_window_size: 25
+    hybrid_co_rerank:
+      retrievers: [bm25, semantic_co]
+      fuser: { type: rrf, rank_constant: 60, window: 25 }
       reranker: co-rr
-      rerank_window_size: 100
+      rerank_window_size: 25
 stats:
   test: wilcoxon
   correction: bh                # Benjamini-Hochberg FDR (§8.3, default); by = Benjamini-Yekutieli
   alpha: 0.05                   # BOTH the raw per-test threshold AND the FDR target level q
-  bootstrap_B: 10000
+  bootstrap_B: 1000
   ci_level: 0.95                # UNADJUSTED per-comparison effect-size CI (§8.2); NOT a gate
   seed: 1234
 cutoff: 10                      # metrics @10
-top_k: 100                      # results retrieved per query
+top_k: 50                       # results retrieved per query
