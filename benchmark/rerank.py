@@ -14,16 +14,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from benchmark.models import Query, ScoredDoc
+from benchmark.models import ScoredDoc
 
 
 def rerank_local(
-    query: Query,
+    query: str,
     candidates: Sequence[ScoredDoc],
     *,
     rank_window_size: int,
     doc_text: Callable[[str], str],
-    score_fn: Callable[[Query, Sequence[str]], Sequence[float]],
+    score_fn: Callable[[str, Sequence[str]], Sequence[float]],
 ) -> list[ScoredDoc]:
     """Re-rank the top ``rank_window_size`` candidates with ``score_fn`` (§3.7).
 

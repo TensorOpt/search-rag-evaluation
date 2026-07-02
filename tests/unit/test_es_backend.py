@@ -1,8 +1,12 @@
-"""Offline unit tests for the ES adapter (Phase 9) — the ES client is MOCKED (no network).
+"""Offline unit tests for the ES adapter — the ES client is MOCKED (no network).
 
-Covers the ingest seam (``register_inference``/``ensure_index``/``bulk_index``), the shared
-``_search`` helper's client-side score-desc/doc_id-asc tie-break, ``LexicalSearcher``'s match body,
-and the factory's Phase-10 ``vector``/``reranker`` guards. See docs/experiment.md §3.3, §3.4, §5.
+Covers the whole ES adapter surface: the ingest seam (``register_inference``/``ensure_index``/
+``bulk_index``); the searchers — ``LexicalSearcher``'s match body and ``VectorSearch``'s semantic
+body, both over the shared ``_search``/``_msearch`` helpers' client-side score-desc/doc_id-asc
+tie-break; ``ESReranker`` (``mget`` doc-text + ``_inference`` rerank parsed BY ``index`` +
+``rerank_local`` reorder); ``ESIndexer.build`` (register→ensure→index order, ``copy_to`` + dot-free
+sem fields); the ``make_searcher_factory`` builders; and a client-side ``HybridSearch`` ==
+``fuse_rrf_local`` cross-check. See docs/experiment.md §3.3-§3.7, §5.
 """
 
 from __future__ import annotations
@@ -14,12 +18,19 @@ import pytest
 from elasticsearch import NotFoundError
 
 from benchmark.backends import elasticsearch as es
+from benchmark.fusion import fuse_rrf_local
 from benchmark.models import (
     Document,
+    FieldRole,
+    FieldSchema,
+    FieldSpec,
     IndexMapping,
     InferenceEndpoint,
     InferenceTaskType,
+    ScoredDoc,
 )
+from benchmark.pipeline import HybridSearch, RRFFuser
+from benchmark.protocols import Dataset, Searcher
 
 INDEXER_CFG = {"index": "wands_bench", "settings": {"url": "http://localhost:9200"}}
 
@@ -360,14 +371,308 @@ def test_factory_lexical_builds_lexical_searcher(monkeypatch: pytest.MonkeyPatch
     assert searcher.field == "search_text"
 
 
-def test_factory_vector_and_reranker_raise_not_implemented(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_factory_vector_builds_vector_search(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _fake_client()
     monkeypatch.setattr(es, "_make_client", lambda cfg: fake)
     factory = es.make_searcher_factory(INDEXER_CFG)
 
-    with pytest.raises(NotImplementedError, match="Phase 10"):
-        factory.vector(field="sem__e5")
-    with pytest.raises(NotImplementedError, match="Phase 10"):
-        factory.reranker("cohere-rerank", "search_text")
+    searcher = factory.vector(field="sem__e5")
+
+    assert isinstance(searcher, es.VectorSearch)
+    assert searcher.index == "wands_bench"
+    assert searcher.field == "sem__e5"
+
+
+def test_factory_reranker_builds_es_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _fake_client()
+    monkeypatch.setattr(es, "_make_client", lambda cfg: fake)
+    factory = es.make_searcher_factory(INDEXER_CFG)
+
+    reranker = factory.reranker("cohere-rerank", "search_text")
+
+    assert isinstance(reranker, es.ESReranker)
+    assert reranker.index == "wands_bench"
+    assert reranker.inference_id == "cohere-rerank"
+    assert reranker.field == "search_text"
+
+
+# --- VectorSearch -----------------------------------------------------------------------------
+
+
+def test_vector_search_builds_explicit_semantic_body() -> None:
+    client = _fake_client()
+    client.search.return_value = _hits(("p1", 5.0), ("p2", 4.0))
+
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5")
+    docs = searcher.search("comfy sofa", top_k=2)
+
+    kwargs = client.search.call_args.kwargs
+    assert kwargs["index"] == "wands_bench"
+    # explicit semantic query (version-robust ES >= 8.15) — NOT the implicit match form
+    assert kwargs["query"] == {"semantic": {"field": "sem__e5", "query": "comfy sofa"}}
+    assert kwargs["size"] == 2
+    assert "sort" not in kwargs  # no server-side _id sort (§9.1)
+    assert [d.doc_id for d in docs] == ["p1", "p2"]
+
+
+def test_vector_search_sorts_score_desc_then_doc_id_asc() -> None:
+    client = _fake_client()
+    client.search.return_value = _hits(("d_b", 2.0), ("d_c", 3.0), ("d_a", 2.0))
+
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5")
+    result = searcher.search("x", top_k=10)
+
+    assert [(d.doc_id, d.score) for d in result] == [
+        ("d_c", 3.0),
+        ("d_a", 2.0),  # tie broken by doc_id asc
+        ("d_b", 2.0),
+    ]
+
+
+def test_vector_bulk_search_chunks_and_aligns_via_msearch() -> None:
+    client = _fake_client()
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5", msearch_chunk_size=2)
+    client.msearch.side_effect = [
+        _msearch_response(_hits(("a", 1.0)), _hits(("d_b", 2.0), ("d_c", 3.0), ("d_a", 2.0))),
+        _msearch_response(_hits(("z", 9.0))),
+    ]
+
+    result = searcher.bulk_search(["q0", "q1", "q2"], top_k=5)
+
+    # two chunked _msearch round trips (chunk size 2 over three queries)
+    assert client.msearch.call_count == 2
+    first_searches = client.msearch.call_args_list[0].kwargs["searches"]
+    assert client.msearch.call_args_list[0].kwargs["index"] == "wands_bench"
+    assert first_searches[0] == {}  # per-search header
+    assert first_searches[1] == {
+        "query": {"semantic": {"field": "sem__e5", "query": "q0"}},
+        "size": 5,
+    }
+    assert first_searches[3] == {
+        "query": {"semantic": {"field": "sem__e5", "query": "q1"}},
+        "size": 5,
+    }
+    # aligned + client-side tie-break identical to LexicalSearcher
+    assert [(d.doc_id, d.score) for d in result[1]] == [
+        ("d_c", 3.0),
+        ("d_a", 2.0),
+        ("d_b", 2.0),
+    ]
+    assert [d.doc_id for d in result[2]] == ["z"]
+
+
+# --- ESReranker -------------------------------------------------------------------------------
+
+
+def _mget_response(field: str, *pairs: tuple[str, str]) -> dict[str, Any]:
+    """A canned ``mget`` response: one found doc per (id, text) pair carrying ``field``."""
+    return {
+        "docs": [
+            {"_id": doc_id, "found": True, "_source": {field: text}} for doc_id, text in pairs
+        ]
+    }
+
+
+def test_reranker_maps_scores_by_index_and_reorders_desc() -> None:
+    client = _fake_client()
+    # candidate INPUT order c1,c2,c3 (retrieval order) — different from the model's score order.
+    candidates = [ScoredDoc("c1", 5.0), ScoredDoc("c2", 4.0), ScoredDoc("c3", 3.0)]
+    client.mget.return_value = _mget_response(
+        "search_text", ("c1", "text one"), ("c2", "text two"), ("c3", "text three")
+    )
+    # response NOT in input order + a NEGATIVE score (cross-encoder logit); map BY "index".
+    client.inference.rerank.return_value = {
+        "rerank": [
+            {"index": 1, "relevance_score": 2.95},  # c2 highest
+            {"index": 0, "relevance_score": -6.25},  # c1 lowest (negative)
+            {"index": 2, "relevance_score": 0.5},  # c3 middle
+        ]
+    }
+
+    reranker = es.ESReranker(client, "wands_bench", "cohere-rerank", "search_text")
+    result = reranker.rerank("a query", candidates)
+
+    # reordered by model score DESC: c2(2.95) > c3(0.5) > c1(-6.25)
+    assert [d.doc_id for d in result] == ["c2", "c3", "c1"]
+    assert [d.score for d in result] == [2.95, 0.5, -6.25]
+
+    # mget fetched the candidate ids + only the rerank field
+    mget_kwargs = client.mget.call_args.kwargs
+    assert mget_kwargs["index"] == "wands_bench"
+    assert mget_kwargs["ids"] == ["c1", "c2", "c3"]
+    assert mget_kwargs["source"] == ["search_text"]
+
+    # the inference call received the query + the candidate doc-texts IN INPUT ORDER
+    infer_kwargs = client.inference.rerank.call_args.kwargs
+    assert infer_kwargs["inference_id"] == "cohere-rerank"
+    assert infer_kwargs["query"] == "a query"
+    assert infer_kwargs["input"] == ["text one", "text two", "text three"]
+
+
+def test_reranker_missing_candidate_raises() -> None:
+    client = _fake_client()
+    candidates = [ScoredDoc("c1", 5.0), ScoredDoc("c2", 4.0)]
+    # c2 not found in the index -> raise, not silently drop.
+    client.mget.return_value = {
+        "docs": [
+            {"_id": "c1", "found": True, "_source": {"search_text": "text one"}},
+            {"_id": "c2", "found": False},
+        ]
+    }
+
+    reranker = es.ESReranker(client, "wands_bench", "cohere-rerank", "search_text")
+    with pytest.raises(KeyError, match="c2"):
+        reranker.rerank("a query", candidates)
+    client.inference.rerank.assert_not_called()  # aborted before scoring
+
+
+# --- ESIndexer.build --------------------------------------------------------------------------
+
+
+class _FakeEmbedder:
+    """Minimal ``EmbeddingModel`` descriptor for the indexer test."""
+
+    def __init__(self, inference_id: str, model_id: str) -> None:
+        self.inference_id = inference_id
+        self.task_type = InferenceTaskType.TEXT_EMBEDDING
+        self._model_id = model_id
+
+    def as_endpoint(self) -> InferenceEndpoint:
+        return InferenceEndpoint(
+            inference_id=self.inference_id,
+            task_type=self.task_type,
+            service="elasticsearch",
+            service_settings={"model_id": self._model_id},
+        )
+
+
+class _FakeDataset(Dataset):
+    """A tiny in-memory ``Dataset`` with one text + one numeric + one id + one stored field."""
+
+    name = "fake"
+    version = "0"
+
+    def queries(self) -> Any:
+        return []
+
+    def documents(self) -> Any:
+        return iter([Document(doc_id="p1", fields={"search_text": "sofa"})])
+
+    def qrels(self) -> Any:
+        return []
+
+    def field_schema(self) -> FieldSchema:
+        return FieldSchema(
+            fields=[
+                FieldSpec("product_id", FieldRole.ID),
+                FieldSpec("product_name", FieldRole.BM25),
+                FieldSpec("product_description", FieldRole.SEMANTIC_SOURCE),
+                FieldSpec("rating", FieldRole.NUMERIC),
+                FieldSpec("product_class", FieldRole.STORED),
+            ]
+        )
+
+
+class _RecordingBackend:
+    """A fake ``SearchBackend`` recording call order + the mapping it was handed."""
+
+    def __init__(self) -> None:
+        self.index = "wands_bench"
+        self.calls: list[str] = []
+        self.registered: list[str] = []
+        self.ensured_mapping: Any = None
+        self.indexed_docs: list[Document] = []
+
+    def register_inference(self, ep: InferenceEndpoint) -> str:
+        self.calls.append("register")
+        self.registered.append(ep.inference_id)
+        return ep.inference_id
+
+    def ensure_index(self, mapping: Any) -> None:
+        self.calls.append("ensure")
+        self.ensured_mapping = mapping
+
+    def bulk_index(self, docs: Any, *, mapping: Any) -> None:
+        self.calls.append("index")
+        self.indexed_docs = list(docs)  # drive the streamed generator
+
+
+def test_indexer_registers_before_ensure_and_builds_mapping() -> None:
+    backend = _RecordingBackend()
+    # embedder id carries dots -> the sem field name must be dot-free.
+    embedders = [_FakeEmbedder("e5.small.v1", ".multilingual-e5-small")]
+
+    mapping = es.ESIndexer().build(_FakeDataset(), backend, embedders)
+
+    # register happens for every embedder BEFORE ensure_index (a semantic field can't map first)
+    assert backend.calls == ["register", "ensure", "index"]
+    assert backend.registered == ["e5.small.v1"]
+
+    props = mapping.backend_mapping["properties"]
+    sem_field = "sem__e5_small_v1"  # dots -> "_", prefixed
+    # copy_to lives on the SOURCE search_text field and points at the sem field (§5.2)
+    assert props["search_text"]["type"] == "text"
+    assert props["search_text"]["copy_to"] == [sem_field]
+    assert "copy_to_source" not in props["search_text"]
+    # the semantic_text field carries its inference_id explicitly and its name is dot-free
+    assert props[sem_field] == {"type": "semantic_text", "inference_id": "e5.small.v1"}
+    assert "." not in sem_field
+    # non-text roles mapped; id/bm25/semantic_source are NOT own mapped fields
+    assert props["rating"] == {"type": "float"}
+    assert props["product_class"] == {"type": "keyword"}
+    assert "product_id" not in props
+    assert "product_name" not in props
+    assert "product_description" not in props
+
+    # sem_fields resolves via IndexMapping.sem_field(embedder_id)
+    assert mapping.sem_field("e5.small.v1") == sem_field
+    assert mapping.search_text_field == "search_text"
+    assert mapping.index_name == "wands_bench"
+
+    # documents() were streamed to bulk_index; the SAME mapping was handed to ensure + index
+    assert [d.doc_id for d in backend.indexed_docs] == ["p1"]
+    assert backend.ensured_mapping is mapping
+
+
+def test_indexer_multiple_embedders_copy_to_all_sem_fields() -> None:
+    backend = _RecordingBackend()
+    embedders = [
+        _FakeEmbedder("e5-small", ".e5"),
+        _FakeEmbedder("elser", ".elser"),
+    ]
+
+    mapping = es.ESIndexer().build(_FakeDataset(), backend, embedders)
+
+    props = mapping.backend_mapping["properties"]
+    assert props["search_text"]["copy_to"] == ["sem__e5_small", "sem__elser"]
+    assert props["sem__e5_small"]["inference_id"] == "e5-small"
+    assert props["sem__elser"]["inference_id"] == "elser"
+    assert mapping.sem_field("elser") == "sem__elser"
+
+
+# --- client-side hybrid cross-check (fakes, no live models) -----------------------------------
+
+
+class _FixedSearcher(Searcher):
+    def __init__(self, docs: list[ScoredDoc]) -> None:
+        self._docs = docs
+
+    def search(self, query: str, *, top_k: int) -> list[ScoredDoc]:
+        return self._docs[:top_k]
+
+
+def test_hybrid_over_fakes_equals_fuse_rrf_local() -> None:
+    lexical_list = [ScoredDoc("d1", 5.0), ScoredDoc("d2", 4.0), ScoredDoc("d3", 3.0)]
+    vector_list = [ScoredDoc("d2", 0.9), ScoredDoc("d3", 0.8), ScoredDoc("d4", 0.7)]
+    window = 3
+    hybrid = HybridSearch(
+        retrievers=[_FixedSearcher(lexical_list), _FixedSearcher(vector_list)],
+        fuser=RRFFuser(rank_constant=60),
+        retrieval_window_size=window,
+    )
+
+    fused = hybrid.search("q", top_k=10)
+    expected = fuse_rrf_local(
+        [lexical_list, vector_list], rank_constant=60, rank_window_size=window
+    )
+    assert [(d.doc_id, d.score) for d in fused] == [(d.doc_id, d.score) for d in expected]
