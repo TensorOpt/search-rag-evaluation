@@ -1,0 +1,5 @@
+id	query_id	product_id	label
+0	0	100	Exact
+1	0	102	Partial
+2	0	101	Irrelevant
+3	1	101	Exact

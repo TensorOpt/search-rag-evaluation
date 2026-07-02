@@ -196,6 +196,8 @@ FieldSchema(
         FieldSpec("product_description",  FieldRole.SEMANTIC_SOURCE),
         FieldSpec("product_features",     FieldRole.BM25),
         FieldSpec("product_class",        FieldRole.BM25),
+        FieldSpec("category hierarchy",   FieldRole.STORED),   # facet; NOT in search_text (§5.1)
+        FieldSpec("rating_count",         FieldRole.NUMERIC),
         FieldSpec("average_rating",       FieldRole.NUMERIC),
         FieldSpec("review_count",         FieldRole.NUMERIC),
     ],
@@ -472,7 +474,8 @@ For WANDS `product.csv`:
 | `product_name` | bm25 + semantic_source | feeds `search_text` |
 | `product_description` | bm25 + semantic_source | feeds `search_text` |
 | `product_features` | bm25 | feeds `search_text` |
-| `product_class`, category hierarchy | bm25, facet | `text` + `keyword` |
+| `product_class` | bm25 | feeds `search_text` |
+| category hierarchy | stored (facet) | `keyword` — kept for faceting; **not** in `search_text` |
 | `rating_count`, `average_rating`, `review_count` | numeric (stored) | `integer`/`float` |
 
 A canonical **`search_text`** field is built by concatenating the values of every `BM25`- and `SEMANTIC_SOURCE`-role field (§3.2) — for WANDS: `product_name`, `product_description`, `product_features`, `product_class` — **in schema order, joined by newlines (`"\n"`)**. It is **both** the BM25 target and the semantic source — so every variant ranks the same input text (fair comparison; isolates the ranker, not the field selection). The dataset adapter performs this concatenation when emitting each `Document`'s field bag.
