@@ -94,10 +94,20 @@ class EmbedderCfg:
     embedding_type: EmbeddingType
     settings: Mapping[str, Any]
 
+    @property
+    def inference_id(self) -> str:
+        """The wire inference id (== ``name``) — so ``EmbedderCfg`` satisfies ``EmbeddingModel`` (§3.4)."""
+        return self.name
+
+    @property
+    def task_type(self) -> InferenceTaskType:
+        """The ``_inference`` wire task type — so ``EmbedderCfg`` satisfies ``EmbeddingModel`` (§3.4)."""
+        return _EMBEDDING_TASK_TYPE[self.embedding_type]
+
     def as_endpoint(self) -> InferenceEndpoint:
         return InferenceEndpoint(
-            inference_id=self.name,
-            task_type=_EMBEDDING_TASK_TYPE[self.embedding_type],
+            inference_id=self.inference_id,
+            task_type=self.task_type,
             service=self.provider,
             service_settings=dict(self.settings),
         )

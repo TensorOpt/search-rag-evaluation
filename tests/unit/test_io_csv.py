@@ -312,7 +312,7 @@ def test_run_config_from_full_config_yaml(tmp_path: Path, repo_root: Path, monke
     path = write_run_config(cfg, output_dir=tmp_path)
     loaded = json.loads(path.read_text(encoding="utf-8"))
 
-    assert loaded["baseline"]["id"] == "baseline"
+    assert loaded["baseline"]["id"] == "bm25"  # config.yaml sets pipelines.baseline_id: bm25 (§9)
     variant_ids = {v["id"] for v in loaded["variants"]}
     assert {"semantic_e5", "semantic_co", "hybrid_e5_k60", "bm25_rerank", "hybrid_e5_rerank"} == variant_ids
     assert loaded["stats"]["correction"] == "bh"

@@ -526,6 +526,17 @@ def test_reranker_missing_candidate_raises() -> None:
     client.inference.rerank.assert_not_called()  # aborted before scoring
 
 
+def test_reranker_empty_candidates_no_round_trip() -> None:
+    client = _fake_client()
+    reranker = es.ESReranker(client, "wands_bench", "cohere-rerank", "search_text")
+
+    # A query with no retrieval hits -> nothing to rerank; return [] without any ES call
+    # (ES mget/_inference reject an empty ids/input list with a 400).
+    assert reranker.rerank("a query", []) == []
+    client.mget.assert_not_called()
+    client.inference.rerank.assert_not_called()
+
+
 # --- ESIndexer.build --------------------------------------------------------------------------
 
 

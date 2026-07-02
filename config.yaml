@@ -23,6 +23,7 @@ indexer:
   index: wands_bench
   settings: { url: "${ES_URL}" }
 pipelines:
+  baseline_id: bm25             # baseline pipeline's artifact id (§9): result_bm25_*, comparison_bm25_*
   baseline:                     # the reference every variant is compared against
     retriever: bm25
   variants:                     # each is one explicit run; the map key is its id

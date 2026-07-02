@@ -164,10 +164,16 @@ class EmbeddingModel(Protocol):
 
     Stays a descriptor (not behavioral): embeddings are registered once at ingest via
     ``SearchBackend.register_inference`` and then produced by the backend at index time.
+
+    ``inference_id``/``task_type`` are declared read-only (``@property``) so a FROZEN embedder
+    descriptor (``EmbedderCfg`` exposes them as properties over its ``name``/``embedding_type``
+    fields, §3.4) structurally satisfies this Protocol.
     """
 
-    inference_id: str
-    task_type: InferenceTaskType
+    @property
+    def inference_id(self) -> str: ...
+    @property
+    def task_type(self) -> InferenceTaskType: ...
 
     def as_endpoint(self) -> InferenceEndpoint: ...
 

@@ -32,7 +32,7 @@ dependencies = []
 [tool.hatch.envs.eval.scripts]
 wait-for-es = "python -m scripts.wait_for_es"
 fetch-data = "python -m scripts.fetch_data"
-index = "python -m scripts.index"
+index = "python -m scripts.index {args}"
 run = "python -m scripts.run {args}"
 
 # ---------------------------------------------------------------------------

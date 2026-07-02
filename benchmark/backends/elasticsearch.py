@@ -334,6 +334,10 @@ class ESReranker(Reranker):
         The whole candidate list is the rerank window (``rank_window_size=len(candidates)``) — the
         ``SearchPipeline`` already retrieved exactly ``rerank_window_size`` candidates (§3.6).
         """
+        if not candidates:
+            # Nothing to rerank (a query with no retrieval hits) — return empty without a round
+            # trip. ES `mget`/`_inference` reject an empty ids/input list ("no documents to get").
+            return []
         text_by_id = self._doc_texts_by_id([candidate.doc_id for candidate in candidates])
         return rerank_local(
             query,
