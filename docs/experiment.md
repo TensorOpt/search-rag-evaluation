@@ -250,10 +250,14 @@ class SearchBackend(Protocol):
 ### 3.4 Embedding model (ingest descriptor) & Reranker (behavioral)
 
 ```python
-class InferenceTaskType(StrEnum):
+class InferenceTaskType(StrEnum):          # the ES _inference WIRE task type on InferenceEndpoint
     TEXT_EMBEDDING = "text_embedding"
     SPARSE_EMBEDDING = "sparse_embedding"
-    RERANK = "rerank"
+    RERANK = "rerank"                      # legitimately spans embeddings AND rerank
+
+class EmbeddingType(StrEnum):              # the embedding-ONLY task type an embedder config declares
+    TEXT_EMBEDDING = "text_embedding"
+    SPARSE_EMBEDDING = "sparse_embedding"  # NO rerank — an embedder cannot be a reranker by type
 
 @dataclass(frozen=True)
 class InferenceEndpoint:                   # backend-agnostic descriptor
@@ -272,6 +276,8 @@ class Reranker(ABC):                       # BEHAVIORAL — rescores at query ti
     @abstractmethod
     def rerank(self, query: str, candidates: Sequence[ScoredDoc]) -> list[ScoredDoc]: ...
 ```
+
+`InferenceTaskType` is the **ES `_inference` wire task type** carried on `InferenceEndpoint` and the `EmbeddingModel` descriptor; it legitimately spans `text_embedding`/`sparse_embedding`/`rerank`. An **embedder config** (`EmbedderCfg`, §10) instead declares the narrower **`EmbeddingType`** (`text_embedding`/`sparse_embedding`, **never `rerank`**) via its `embedding_type` field — so an embedder cannot be misconfigured as a reranker by type. On flatten, `EmbedderCfg.as_endpoint()` maps `EmbeddingType → InferenceTaskType` (`TEXT_EMBEDDING → TEXT_EMBEDDING`, `SPARSE_EMBEDDING → SPARSE_EMBEDDING`); a `RerankerCfg` carries **no task type** at all and flattens to a `rerank` `InferenceEndpoint` with `task_type = RERANK` set implicitly.
 
 `EmbeddingModel` **stays a descriptor**: embeddings are registered once at ingest via `register_inference(endpoint)` → `PUT _inference/{task_type}/{inference_id}` and then produced by the backend at index time. The config (§10) constructs the `InferenceEndpoint` directly; an `EmbedderCfg` service entry (§10) implements the `EmbeddingModel` descriptor via `as_endpoint()` — no per-service adapter class.
 
@@ -412,7 +418,7 @@ def rerank_local(query: Query, candidates: Sequence[ScoredDoc], *,
 
 Every variant is a **`SearchPipeline` object graph** built from the same composers (§3.6). No variant has bespoke code; the config (§10) declares each pipeline explicitly as a `PipelineCfg`, and `build_pipeline` assembles the graph. There is **no matrix expansion** — the pipelines run are exactly the ones written in the config.
 
-> `build_pipeline` lives in **`matrix.py`** (§11 — historical filename; it is now the pipeline-assembly module) and is built in **Phase 6**, not with the pipeline: it maps a `PipelineCfg` → a `SearchPipeline`, so keeping it in `matrix.py` avoids a `pipeline`→`matrix` forward dependency. `pipeline.py` (Phase 5) defines only the composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`). `build_pipeline` takes a `searcher_factory` that builds the backend-specific leaf `Searcher`s / `Reranker` (the ES `LexicalSearcher`/`VectorSearch`/`ESReranker` land in Phase 9/10) and the typed `Services` registry (§10) so `matrix.py` stays backend-agnostic. The six strategies below are the conceptual shapes; each is an *example a user writes* as a named pipeline, not something auto-expanded.
+> `build_pipeline` lives in **`config.py`** (§11 — the config layer holds the config value types + the pipeline-assembly) and is built in **Phase 6**, not with the pipeline: it maps a `PipelineCfg` → a `SearchPipeline`, so keeping it in `config.py` (which already imports `pipeline` for the composers) avoids a `pipeline`→`config` forward dependency. `pipeline.py` (Phase 5) defines only the composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`). `build_pipeline` takes a `searcher_factory` that builds the backend-specific leaf `Searcher`s / `Reranker` (the ES `LexicalSearcher`/`VectorSearch`/`ESReranker` land in Phase 9/10) and the typed `Services` registry (§10) so it stays backend-agnostic (no adapter import). The six strategies below are the conceptual shapes; each is an *example a user writes* as a named pipeline, not something auto-expanded.
 
 | Strategy | retriever graph | reranker |
 |----------|-----------------|----------|
@@ -472,7 +478,9 @@ For WANDS `product.csv`:
 A canonical **`search_text`** field is built by concatenating the values of every `BM25`- and `SEMANTIC_SOURCE`-role field (§3.2) — for WANDS: `product_name`, `product_description`, `product_features`, `product_class` — **in schema order, joined by newlines (`"\n"`)**. It is **both** the BM25 target and the semantic source — so every variant ranks the same input text (fair comparison; isolates the ranker, not the field selection). The dataset adapter performs this concatenation when emitting each `Document`'s field bag.
 
 ### 5.2 One `semantic_text` field per embedding model (verified shape)
-Multiple embedding models coexist in **one index**: each gets its own `semantic_text` field bound to that model's endpoint, and the source `search_text` field uses **`copy_to`** to populate every semantic field. Per ES docs, `copy_to` lives on the **source `text` field** and points **to** the `semantic_text` field(s) — the v1 draft's `copy_to_source` key does not exist and is corrected here.
+With ElasticSearch there is exactly **ONE index** (`indexer.index`, e.g. `wands_bench`) — **not** one index per embedder. Inside that single index live a single **`search_text`** field (the BM25 target, §5.1) **plus one `semantic_text` field per embedder** that a **vector searcher** references. So in the §10 config, `semantic_e5` / `semantic_co` are **two fields in the same index, not two indices**: each is a `semantic_text` field bound to that embedder's endpoint, and the source `search_text` field uses **`copy_to`** to populate every semantic field so ES computes each embedding at ingest. Per ES docs, `copy_to` lives on the **source `text` field** and points **to** the `semantic_text` field(s) — the v1 draft's `copy_to_source` key does not exist and is corrected here.
+
+**Where and which (how the indexer is driven).** The indexer learns **WHERE** to build from `indexer.{provider, index, settings}` (§10). It learns **WHICH** embedders to build `semantic_text` fields for by **scanning the vector searchers'** `embedder` references — an embedder with no vector searcher pointing at it gets no field. The dataset's `FieldSchema` (§3.2) says **which columns feed `search_text`**. This single-`indexer`-block model works because ES is one store that holds BM25 + all semantic fields together; a per-store model (below and §12/§13) is only needed for a pure vector store.
 
 ```jsonc
 // 1) endpoints registered first (§3.5 step 1):
@@ -719,12 +727,16 @@ dataset:
   name: wands
   path: ./dataset/wands
 services:                       # named, typed, reusable building blocks
-  - embedder: { name: e5,     provider: elasticsearch, task_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-  - embedder: { name: cohere, provider: cohere,        task_type: text_embedding, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
+  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+  - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
   - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
   - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
+# ONE ES index for everything: a single search_text (BM25) field + one semantic_text field per
+# embedder referenced by a vector searcher above (via copy_to, §5.2). semantic_e5/semantic_co are
+# FIELDS in this one index, not separate indices; the indexer discovers which embedders to build
+# fields for by scanning the vector searchers.
 indexer:
   provider: elasticsearch
   index: wands_bench
@@ -759,13 +771,24 @@ top_k: 100                       # results retrieved per query
 ```
 
 **Services (`${VAR}` env placeholders resolved at load, secrets never in the file):**
-- **`embedder`** — a named embedding model. `provider` selects the backend adapter; `settings`
-  carries provider knobs (`model_id`, `api_key`, …). Flattens to an embedding `InferenceEndpoint`
-  (`inference_id = name`) the indexer registers at ingest (§3.4/§3.5).
-- **`reranker`** — a named reranker. `top_n` (the rank-window cap) is a **`task_settings`** key
-  (§3.4/§5.3); the rest of `settings` is `service_settings`. Registered lazily at R0 (§8.0).
+- **`embedder`** — a named embedding model. `provider` selects the backend adapter; `embedding_type`
+  is the narrow embedding-only task (`text_embedding` | `sparse_embedding`, **never `rerank`** — an
+  embedder cannot be a reranker by type, §3.4), defaulting to `text_embedding`; `settings` carries
+  provider knobs (`model_id`, `api_key`, …). Flattens to an embedding `InferenceEndpoint`
+  (`inference_id = name`; `embedding_type → InferenceTaskType`) the indexer registers at ingest
+  (§3.4/§3.5).
+- **`reranker`** — a named reranker (**no task type** — the `rerank` task is implied, §3.4). `top_n`
+  (the rank-window cap) is a **`task_settings`** key (§3.4/§5.3); the rest of `settings` is
+  `service_settings`. Registered lazily at R0 (§8.0).
 - **`searcher`** — a named leaf retriever. `kind` is `lexical` or `vector`; a `vector` searcher
   references an `embedder` by name.
+
+**`indexer`** — a **single** block naming ONE ES index (`indexer.index`) and how to reach it
+(`provider`, `settings.url`). With ES this one index holds everything (§5.2): a single `search_text`
+BM25 field **plus one `semantic_text` field per embedder that a `vector` searcher references** — the
+indexer discovers WHICH embedders to build fields for by scanning the vector searchers, and WHERE
+from this block. It does **not** index one-per-embedder. (A pure vector store would need a per-store
+indexing model instead — deferred, §12/§13.)
 
 **Pipeline field rules (validated at load; a violation raises a clear `ConfigError`, exhaustive — no silent default):**
 - Exactly **one of `retriever`** (a single searcher name) **XOR `retrievers`** (a list of 2+ searcher names).
@@ -798,10 +821,9 @@ benchmark/
   rerank.py              # rerank_local (client-side score+reorder helper, windowed)
   metrics.py             # Evaluator, Metrics, QrelIndex (ndcg/recall/precision/avg_relevance)
   stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, FDR/BH-BY; degenerate-set handling)
-  matrix.py              # PipelineCfg + build_pipeline (assemble a SearchPipeline from an explicit named pipeline); Services/EmbedderCfg/RerankerCfg/SearcherCfg/FuserCfg + ResolvedConfig value types; NO expansion
   runner.py              # ExperimentRunner (the single execution path, §8.0)
   io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
-  config.py              # YAML/JSON load + resolve; owns the services registry + ResolvedConfig; lazy adapter factories (load_dataset / make_indexer / make_searcher_factory)
+  config.py              # the config layer: EmbedderCfg/RerankerCfg/SearcherCfg/Services/FuserCfg/PipelineCfg/ResolvedConfig value types (NO expansion); build_pipeline (assemble a SearchPipeline from an explicit named pipeline); YAML/JSON load + resolve; lazy adapter factories (load_dataset / make_indexer / make_searcher_factory)
   logging_setup.py       # cross-cutting: console + file logging (logs/run_{timestamp}.log); use instead of print()
   datasets/
     wands.py             # WandsDataset (implements Dataset; label->gain; search_text concat)
@@ -810,7 +832,7 @@ benchmark/
 docs/experiment.md
 dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
 ```
-`pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib; `pipeline` also imports the leaf `fusion`; `matrix` imports `pipeline`, the one allowed backward edge, §4) — never `datasets/*` or `backends/*`. `matrix.py` holds the pure resolved-config value types (`Services` registry + `PipelineCfg` + `ResolvedConfig`) and `build_pipeline`; `config.py` parses the §10 YAML into them and owns the lazy adapter factories (`load_dataset`, `make_indexer`, and the `searcher_factory` that builds leaf `Searcher`/`Reranker`). This enforces success criterion §1.4(3). The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
+`pipeline`, `metrics`, `stats`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib; `pipeline` also imports the leaf `fusion`) — never `datasets/*` or `backends/*`. `config.py` is the config layer: it holds the pure resolved-config value types (`EmbedderCfg`/`RerankerCfg`/`SearcherCfg`/`Services` registry + `FuserCfg`/`PipelineCfg`/`ResolvedConfig`) **and** `build_pipeline`, parses the §10 YAML into them, and owns the lazy adapter factories (`load_dataset`, `make_indexer`, and the `searcher_factory` that builds leaf `Searcher`/`Reranker`). Because `build_pipeline` builds the composers, `config` imports `pipeline` (`RRFFuser`/`HybridSearch`/`SearchPipeline`) — a one-way wiring edge (§4; `pipeline` never imports `config`); `config` still imports **no adapter** at import time (the factories resolve dotted targets lazily). `runner`/`io_csv` import `ResolvedConfig`/`build_pipeline` from `config`. This enforces success criterion §1.4(3). The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
 
 ---
 
@@ -822,6 +844,8 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 
 **Add a backend (Vespa, OpenSearch, Qdrant, FAISS, …):** implement (a) the ingest `SearchBackend` (`register_inference`, `ensure_index`, `bulk_index`) + an `Indexer`, and (b) the leaf retrieval seams — a lexical `Searcher`, a vector `Searcher`, and a `Reranker` — in `backends/`, wired through the `searcher_factory`. `HybridSearch` + `RRFFuser` + `SearchPipeline` (client-side, §3.6/§3.7) compose those leaves into `hybrid`/`*_rerank` with no new code, reproducing ES's `rank_window_size` semantics. The `Reranker` uses the `rerank_local` helper. Set `indexer.provider`.
 
+> **Multiple vector stores (e.g. Qdrant) — a per-store indexing model, deferred (§13).** The single-`indexer`-block, one-ES-index model (§5.2) works because ES is one store holding BM25 + every `semantic_text` field together. A **pure vector store** (Qdrant, FAISS) has **no BM25** and needs **one collection per embedding** (different embedders have different vector dims), so that model does not carry over. The good news: the **client-side `Searcher`/`Fuser` composition already fuses across stores** (each leaf `Searcher` just returns a ranked list), so mixing an ES lexical leaf with a Qdrant vector leaf is a clean future extension — what it needs is a **per-store indexing model** (each searcher/embedder carrying its own store/collection settings) rather than the single `indexer` block that indexes everything at once (true only for ES). There is **no Qdrant adapter today (YAGNI)**; this is deferred (§13).
+
 **Add an embedding model:** add an `embedder` service (and a `vector` `searcher` that references it) → the indexer registers the endpoint, adds a `semantic_text` field + `copy_to` (§5.2), reindex. Reference the new searcher from whatever named pipelines you want it in.
 
 **Add a reranker:** add a `reranker` service (with `settings.top_n >= rerank_window_size`) → reference it from the pipelines that should rerank. No code changes.
@@ -832,6 +856,7 @@ Each extension is an *adapter + config* change; pipeline, metrics, stats, runner
 - **Optional sweep / expansion helper (deliberately omitted):** pipelines are **fully explicit** named config entries (§10) — chosen for legibility, so the config is readable at a glance and the runner is a flat loop with no data-dependent selection. A convenience helper that *generates* many pipelines from axes (e.g. embedding_models × RRF-k) could be added later as pure config sugar that emits explicit `PipelineCfg`s before the run; it is intentionally not shipped, to keep the config transparent and reproducible. If added, any data-dependent auto-selection (e.g. "best k per model" on the eval set) would reintroduce selection-on-the-evaluation-set bias and must be treated as exploratory.
 - **Matching FDR-adjusted interval regime:** **BH-FDR is now the DEFAULT decision** (§8.3), with an unadjusted descriptive CI (§8.2) that may disagree with the flag. What remains **deferred** is a **matching FDR-adjusted confidence-interval regime** (or a max-statistic simultaneous confidence band) so the reported interval and the FDR decision coincide *by construction* rather than living in separate roles — and, possibly, **switching BY to the default** if PRDS proves doubtful for these correlated retrieval configs.
 - **Server-side fusion / rerank as a performance optimization (deferred):** fusion and rerank run **client-side** (§3.6/§3.7) — chosen for simplicity and generality (one composite model, any backend that returns ranked leaf lists composes). ES *can* fuse (`rrf`) and rerank (`text_similarity_reranker`) server-side in a single round trip, which would cut per-query latency; adopting that as an optional fast path (an alternate `Searcher` that emits the nested retriever tree, selected by config) is deferred as a performance optimization. It is out of scope for the v1 relevance-quality success criteria.
+- **Multiple vector stores / per-store indexing model (deferred, no adapter today):** the single-`indexer`-block model indexes everything into ONE ES index (§5.2) because ES holds BM25 + every `semantic_text` field together. A **pure vector store** (Qdrant/FAISS) has no BM25 and needs **one collection per embedding** (differing vector dims), so the single-index model does not carry over. Since the client-side `Searcher`/`Fuser` composition **already fuses across stores** (§12), the clean extension is a **per-store indexing model** — each searcher/embedder carrying its own store/collection settings — rather than one `indexer` block. Deferred; **no Qdrant adapter today (YAGNI)**, no consumer.
 - **Lexical-less backend (no `bm25` graph):** BM25 is realized as a concrete `LexicalSearcher` (§3.3), so every in-scope backend provides it. If a lexical-less backend (e.g. a pure vector index like FAISS/Qdrant) is added, simply omit the lexical `searcher` service and any pipeline that references it (a config concern — there is no backend capability flag). Deferred until such a backend exists (no consumer today).
 - Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
 - Pooling-depth / missing-judgement sensitivity analysis (current default: **missing judgements are skipped via condensed-list evaluation**, §7 — NOT scored as gain 0; only judged-irrelevant docs count as a 0).

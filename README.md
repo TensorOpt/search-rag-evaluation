@@ -87,10 +87,9 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 │   ├── rerank.py              # rerank_local (client-side score+reorder helper, windowed)
 │   ├── metrics.py             # Evaluator, Metrics, QrelIndex
 │   ├── stats.py               # Comparator (bootstrap CI, Wilcoxon/permutation, FDR/BH-BY)
-│   ├── matrix.py              # PipelineCfg + build_pipeline; Services registry + ResolvedConfig value types (NO expansion)
 │   ├── runner.py              # ExperimentRunner — the single execution path
 │   ├── io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
-│   ├── config.py              # YAML/JSON load + resolve; services registry + lazy adapter factories
+│   ├── config.py              # config value types (PipelineCfg/Services/ResolvedConfig, NO expansion) + build_pipeline; YAML/JSON load + resolve; lazy adapter factories
 │   ├── datasets/
 │   │   └── wands.py           # WandsDataset (label→gain, search_text concat)
 │   └── backends/
@@ -106,7 +105,7 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 └── LICENSE                    # MIT
 ```
 
-Module names and responsibilities follow §11 of the design doc. `pipeline`, `metrics`, `stats`, `matrix`, `runner`, and `io_csv` depend only on `models`/`protocols`; adapters are selected by `config.py` factories.
+Module names and responsibilities follow §11 of the design doc. `pipeline`, `metrics`, `stats`, `runner`, and `io_csv` depend only on `models`/`protocols`; `config.py` (the config layer — value types + `build_pipeline` + loader) imports `pipeline` for the composers, a one-way wiring edge; adapters are selected by `config.py`'s lazy factories.
 ---
 
 ## Install
@@ -315,8 +314,8 @@ dataset:
   name: wands
   path: ./dataset/wands
 services:                       # named, typed, reusable building blocks
-  - embedder: { name: e5,     provider: elasticsearch, task_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-  - embedder: { name: cohere, provider: cohere,        task_type: text_embedding, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
+  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+  - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
   - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
   - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }

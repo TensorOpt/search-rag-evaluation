@@ -128,7 +128,7 @@ class SearchBackend(Protocol):
 class SearcherFactory(Protocol):
     """Backend-agnostic builder of leaf ``Searcher``s / the ``Reranker`` (§4).
 
-    ``build_pipeline`` (``matrix.py``) uses this seam to assemble a pipeline's ``SearchPipeline`` object
+    ``build_pipeline`` (``config.py``) uses this seam to assemble a pipeline's ``SearchPipeline`` object
     graph without importing any adapter: the backend supplies a factory that binds these to its
     client + ``IndexMapping`` (ES ``LexicalSearcher``/``VectorSearch``/``ESReranker``, Phase 9/10).
     """

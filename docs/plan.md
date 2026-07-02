@@ -31,7 +31,7 @@ developer implements  →  reviewer reviews  →  USER signs off  →  USER comm
 
 ## 2. Guiding principles for phasing
 
-1. **Build bottom-up along the §11 import DAG.** §11 fixes the dependency direction: `pipeline`, `metrics`, `stats`, `matrix`, `runner`, `io_csv` import only `models`/`protocols`; adapters (`datasets/*`, `backends/*`) are selected by `config.py` factories and depended on by nobody upstream. We build leaves first (`models`, `protocols`), then each pure consumer, then adapters, then the wiring. **No phase may depend on a later phase.**
+1. **Build bottom-up along the §11 import DAG.** §11 fixes the dependency direction: `pipeline`, `metrics`, `stats`, `runner`, `io_csv` import only `models`/`protocols`; `config.py` (value types + `build_pipeline` + loader) additionally imports `pipeline` for the composers (a one-way wiring edge); adapters (`datasets/*`, `backends/*`) are selected by `config.py`'s lazy factories and depended on by nobody upstream. We build leaves first (`models`, `protocols`), then each pure consumer, then adapters, then the wiring. **No phase may depend on a later phase.**
 2. **Each phase is independently testable WITHOUT later phases.** Where a phase needs a collaborator that is not yet built (notably the ES adapter), it is tested against a **fake/stub** that satisfies the relevant seam (`FakeSearcher`, `FakeReranker`, tiny in-memory dataset fixture). This is exactly the seam the design promises (§1.4(3), §3.3/§3.7): the pure core never imports an adapter.
 3. **Keep each phase reviewable in one sitting.** One coherent module (or a tightly-coupled pair) plus its tests per phase. The single risky, large module — `backends/elasticsearch.py` — is split into two phases (`LexicalSearcher` + ingest first, then `VectorSearch`/`ESReranker`/`ESIndexer`).
 4. **Isolate ES integration risk late and behind the adapter.** Everything except the two ES phases and the end-to-end phases is **pure unit-testable offline** (no Docker). Docker-dependent work (compose ES ≥ 8.15, `register_inference`, `ensure_index`, `bulk_index`, leaf `Searcher`/`Reranker` execution) lands in Phases 10–12 only. By then the entire pure core is proven against the fakes, so ES work reduces to making the real leaf `Searcher`s/`Reranker` satisfy the same ABCs.
@@ -48,7 +48,7 @@ flowchart TB
   P1 --> P4["Phase 4<br/>fusion.py + rerank.py"]
   P1 --> P5["Phase 5<br/>pipeline.py (composite model)"]
   P4 --> P5
-  P1 --> P6["Phase 6<br/>matrix.py (PipelineCfg + build_pipeline) + config.py"]
+  P1 --> P6["Phase 6<br/>config.py (config value types + build_pipeline + loader)"]
   P1 --> P7["Phase 7<br/>io_csv.py"]
   P2 --> P7
   P3 --> P7
@@ -74,7 +74,7 @@ flowchart TB
 | 3 | `stats.py` | 1 | no (pure) |
 | 4 | `fusion.py` + `rerank.py` (harness-side fallbacks) | 1 | no (pure) |
 | 5 | `pipeline.py` (`RRFFuser`/`HybridSearch`/`SearchPipeline` composers) | 1, 4 | no (fakes) |
-| 6 | `matrix.py` (`PipelineCfg` + `build_pipeline`) + `config.py` | 1 | no (pure) |
+| 6 | `config.py` (config value types + `PipelineCfg` + `build_pipeline` + loader) | 1 | no (pure) |
 | 7 | `io_csv.py` | 1, 2, 3 | no (golden files) |
 | 8 | `datasets/wands.py` | 1 | no (fixture) |
 | 9 | `backends/elasticsearch.py` — ingest lifecycle + `LexicalSearcher` | 5, 6 | **yes** |
@@ -98,7 +98,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 **Deliverables (only what this phase adds).**
 - `pyproject.toml` — hatch project; an `eval` environment exposing scripts `wait-for-es`, `fetch-data`, `index`, `run` (wired to placeholders that import cleanly and exit non-destructively for now); a `dev`/`test` environment with `pytest`, `ruff`, `mypy`. Python 3.11+.
-- `benchmark/` package skeleton: empty-but-importable `models.py`, `protocols.py`, `pipeline.py`, `fusion.py`, `rerank.py`, `metrics.py`, `stats.py`, `matrix.py`, `runner.py`, `io_csv.py`, `config.py`, `logging_setup.py`, `datasets/__init__.py`, `datasets/wands.py`, `backends/__init__.py`, `backends/elasticsearch.py` (modules may be stubs; names must match §11 exactly). `logging_setup.py` is the one module with real content this phase: console + `logs/run_{timestamp}.log` logging used everywhere instead of `print()`.
+- `benchmark/` package skeleton: empty-but-importable `models.py`, `protocols.py`, `pipeline.py`, `fusion.py`, `rerank.py`, `metrics.py`, `stats.py`, `runner.py`, `io_csv.py`, `config.py`, `logging_setup.py`, `datasets/__init__.py`, `datasets/wands.py`, `backends/__init__.py`, `backends/elasticsearch.py` (modules may be stubs; names must match §11 exactly). `logging_setup.py` is the one module with real content this phase: console + `logs/run_{timestamp}.log` logging used everywhere instead of `print()`.
 - `docker-compose.yml` — single-node ElasticSearch **≥ 8.15** (hard floor, §1.1), security relaxed for local eval, `9200` published, `ES_JAVA_OPTS=-Xms2g -Xmx2g` pinned.
 - `.gitignore` — ignores `results/` and `dataset/` (CLAUDE.md "don't commit dataset/ or results/").
 - `eval:fetch-data` script — downloads/copies WANDS `query.csv`/`product.csv`/`label.csv` into `dataset/wands/` (README "Dataset").
@@ -112,7 +112,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 **Test / acceptance criteria.** *(pure / offline)*
 - `hatch env create eval` and `hatch env show` succeed; `hatch run dev:ruff check` and `hatch run dev:mypy benchmark` run clean over the (empty) package.
-- `python -c "import benchmark.models, benchmark.protocols, benchmark.pipeline, benchmark.fusion, benchmark.rerank, benchmark.metrics, benchmark.stats, benchmark.matrix, benchmark.runner, benchmark.io_csv, benchmark.config, benchmark.datasets.wands, benchmark.backends.elasticsearch"` imports with no error (skeleton importability).
+- `python -c "import benchmark.models, benchmark.protocols, benchmark.pipeline, benchmark.fusion, benchmark.rerank, benchmark.metrics, benchmark.stats, benchmark.runner, benchmark.io_csv, benchmark.config, benchmark.datasets.wands, benchmark.backends.elasticsearch"` imports with no error (skeleton importability).
 - `docker compose config` validates; image tag ≥ 8.15. (Compose is validated, not necessarily started, in this phase.)
 - **`config.yaml` stats block matches §10:** assert the keys/values `bootstrap_B: 10000`, `alpha: 0.05`, `correction: bh`, `test: wilcoxon`, and a `seed` are present (these are load-bearing for Phases 3/6/7/11 reproducibility); assert the inline comments are present that `ci_level` is the **unadjusted per-comparison effect-size CI, not a gate** and that a reranker's `top_n` is a task setting. Catches drift at sign-off rather than in Phase 11.
 - `.gitignore` excludes `results/` and `dataset/`; `git status` shows neither after creating them.
@@ -131,7 +131,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 - `benchmark/models.py` — frozen dataclasses / enums: `Query`, `Document`, `Qrel`, `ScoredDoc`, `RankedResult`, `FieldRole`, `FieldSpec`, `FieldSchema`, `IndexMapping`, `InferenceTaskType`, `InferenceEndpoint`. (No `BackendCapabilities` — the composite model has no `capabilities()` seam, §3.3.) **The composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`) are NOT here — they live in `pipeline.py` (Phase 5) per §11/§3.6.**
 - `benchmark/protocols.py` — the behavioral ABCs `Searcher`/`Fuser`/`Reranker` (§3.3/§3.4) and the structural ingest Protocols `Dataset`, `EmbeddingModel`, `Indexer`, `SearchBackend` (ingest seam only).
 
-> Note: the composers live in `pipeline.py` (Phase 5); `build_pipeline` lives in `matrix.py` (Phase 6, see §4). Only the §3.1 plain data models (`Query`/`Document`/`Qrel`/`ScoredDoc`/`RankedResult`/`FieldSchema`/`InferenceEndpoint`) + shared enums (`FieldRole`, `InferenceTaskType`, `IndexMapping`) live in `models.py`. Reviewer enforces this split against §11's per-module comments. *(The composite-model refactor — removing `RetrieverSpec`/`BackendCapabilities`/the old `Reranker` descriptor and the `SearchBackend` retrieval methods, adding the `Searcher`/`Fuser`/`Reranker` ABCs — landed with Phase 5; §11 is the current target.)*
+> Note: the composers live in `pipeline.py` (Phase 5); `build_pipeline` lives in `config.py` (Phase 6, see §4). Only the §3.1 plain data models (`Query`/`Document`/`Qrel`/`ScoredDoc`/`RankedResult`/`FieldSchema`/`InferenceEndpoint`) + shared enums (`FieldRole`, `InferenceTaskType`, `IndexMapping`) live in `models.py`. Reviewer enforces this split against §11's per-module comments. *(The composite-model refactor — removing `RetrieverSpec`/`BackendCapabilities`/the old `Reranker` descriptor and the `SearchBackend` retrieval methods, adding the `Searcher`/`Fuser`/`Reranker` ABCs — landed with Phase 5; §11 is the current target.)*
 
 **Depends on.** Phase 0.
 
@@ -235,12 +235,12 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 ### Phase 5 — `pipeline.py` (composite model: `RRFFuser` / `HybridSearch` / `SearchPipeline`)
 
-**Objective.** Implement the composite retrieval model — the three backend-agnostic composers + the `Searcher`/`Fuser`/`Reranker` ABCs — tested entirely against `FakeSearcher`/`FakeReranker`. (`build_pipeline` moves to Phase 6 / `matrix.py` — it builds the `SearchPipeline` object graph and would be a `pipeline`→`matrix` forward dependency here; see §4.)
+**Objective.** Implement the composite retrieval model — the three backend-agnostic composers + the `Searcher`/`Fuser`/`Reranker` ABCs — tested entirely against `FakeSearcher`/`FakeReranker`. (`build_pipeline` moves to Phase 6 / `config.py` — it builds the `SearchPipeline` object graph and would be a `pipeline`→`config` forward dependency here; see §4.)
 
 **Deliverables.**
 - `benchmark/protocols.py` — the behavioral ABCs `Searcher`/`Fuser`/`Reranker` (§3.3/§3.4); the `Reranker` **descriptor** and `RetrieverSpec` are removed, and `SearchBackend` is trimmed to the ingest seam (`register_inference`/`ensure_index`/`bulk_index`). *(These protocol edits accompany the composite-model refactor; they land with this phase.)*
 - `benchmark/models.py` — `BackendCapabilities` **removed**.
-- `benchmark/pipeline.py` — `RRFFuser(Fuser)`, `HybridSearch(Searcher)`, `SearchPipeline(Searcher)` (the composers per §3.6). **No `build_pipeline`** (Phase 6). **No `StageCfg`/`RerankCfg`/`PipelineSpec`** — the declarative spec layer is gone (pipelines are object graphs; `FuserCfg`/`PipelineCfg` are config value types in `matrix.py`).
+- `benchmark/pipeline.py` — `RRFFuser(Fuser)`, `HybridSearch(Searcher)`, `SearchPipeline(Searcher)` (the composers per §3.6). **No `build_pipeline`** (Phase 6). **No `StageCfg`/`RerankCfg`/`PipelineSpec`** — the declarative spec layer is gone (pipelines are object graphs; `FuserCfg`/`PipelineCfg` are config value types in `config.py`).
 
 **Depends on.** Phases 1, 4.
 
@@ -265,20 +265,19 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 
 ---
 
-### Phase 6 — `matrix.py` + `config.py`
+### Phase 6 — `config.py` (config value types + `build_pipeline` + loader)
 
 **Objective.** Implement the explicit-config resolution: the `Services` registry + `PipelineCfg` + `build_pipeline` (assemble a `SearchPipeline` from one explicit named pipeline; **no expansion, no sweep, no best_per_model**), and config load/resolve/validate.
 
 **Deliverables.**
-- `benchmark/matrix.py` — the pure resolved-config value types (`EmbedderCfg`/`RerankerCfg`/`SearcherCfg`/`Services`, `FuserCfg`, `PipelineCfg`, `ResolvedConfig`) and `build_pipeline(pcfg, services, mapping, searcher_factory)` (§4; kept here rather than in `pipeline.py` to avoid a `pipeline`→`matrix` forward dependency — it builds the `SearchPipeline` object graph). **No `expand_matrix`, no `resolve_hybrid_rerank_best_per_model`, no `VariantCfg`.**
-- `benchmark/config.py` — YAML/JSON load + resolve, `${VAR}` env substitution, the `Services` registry parse, the `pipelines` (baseline + named variants) parse + validation, and lazy factories `load_dataset`/`make_indexer`/`make_searcher_factory` (dotted-path targets, stubbed/lazily-imported offline this phase). An `EmbedderCfg` service implements the `EmbeddingModel` descriptor via `as_endpoint()`; a `RerankerCfg` flattens to a `rerank` `InferenceEndpoint` (`task_settings.top_n`) the runner registers at R0 and hands to the ES `searcher_factory` to build an `ESReranker`.
+- `benchmark/config.py` — the whole config layer in one module: (a) the pure resolved-config value types (`EmbedderCfg`/`RerankerCfg`/`SearcherCfg`/`Services`, `FuserCfg`, `PipelineCfg`, `ResolvedConfig`); (b) `build_pipeline(pcfg, services, mapping, searcher_factory)` (§4; it builds the `SearchPipeline` object graph, so `config.py` imports the composers from `pipeline.py` — a one-way wiring edge, avoiding a `pipeline`→`config` forward dependency); (c) YAML/JSON load + resolve, `${VAR}` env substitution, the `Services` registry parse, the `pipelines` (baseline + named variants) parse + validation; (d) lazy factories `load_dataset`/`make_indexer`/`make_searcher_factory` (dotted-path targets, lazily-imported offline this phase — no adapter imported at import time). **No `expand_matrix`, no `resolve_hybrid_rerank_best_per_model`, no `VariantCfg`.** An `EmbedderCfg` declares a narrow `embedding_type` (`EmbeddingType`, never `rerank`) and implements the `EmbeddingModel` descriptor via `as_endpoint()` (mapping `EmbeddingType → InferenceTaskType`); a `RerankerCfg` carries no task type and flattens to a `rerank` `InferenceEndpoint` (`task_settings.top_n`) the runner registers at R0 and hands to the ES `searcher_factory` to build an `ESReranker`.
 
 **Depends on.** Phase 1. *(Factories reference adapters by name only; the adapters themselves arrive in Phases 8/9–10. `make_indexer`/`load_dataset` dispatch on `provider`/`name` with the ES/WANDS branches imported lazily so this phase stays offline.)*
 
 **Implementation notes (§4, §10, §11).**
 - **Explicit pipelines, no expansion.** The config declares one `baseline` pipeline plus a map of named `variants`; `ResolvedConfig.pipelines()` yields them baseline-first. There is no matrix, no sweep, no data-dependent selection.
 - **Pipeline validation (§10 field rules), exhaustive, ConfigError on violation:** exactly one of `retriever` XOR `retrievers`; `retrievers` (2+) requires a `fuser`; `fuser` only with `retrievers` (`type` exhaustive — only `rrf`); `reranker` requires `rerank_window_size` and vice-versa; every referenced service must exist and be the right type; a vector searcher must reference an existing embedder; a variant id must not duplicate the baseline id.
-- `build_pipeline(pcfg, services, mapping, factory)` matches §4 exactly and builds a `SearchPipeline` **object graph** via a `searcher_factory` (so `matrix.py` stays backend-agnostic and offline): each retriever name → its `SearcherCfg` → `factory.lexical(fields=[mapping.search_text_field])` (lexical) or `factory.vector(field=mapping.sem_field(embedder.name))` (vector); with a `fuser` wrap the leaves in `HybridSearch(retrievers, RRFFuser(rank_constant=fuser.rank_constant), retrieval_window_size=fuser.window)`, else take the single leaf (raise if ≠ 1); with a `reranker` → `SearchPipeline(retriever, reranker=factory.reranker(reranker, mapping.search_text_field), rerank_window_size=pcfg.rerank_window_size)`, else `SearchPipeline(retriever)`. It imports the composers from `pipeline.py` and **performs no selection** — `fuser.rank_constant` is a concrete int from the config. Tests use a fake factory + fake `Services` so no adapter is imported.
+- `build_pipeline(pcfg, services, mapping, factory)` matches §4 exactly and builds a `SearchPipeline` **object graph** via a `searcher_factory` (so it stays backend-agnostic and imports no adapter): each retriever name → its `SearcherCfg` → `factory.lexical(fields=[mapping.search_text_field])` (lexical) or `factory.vector(field=mapping.sem_field(embedder.name))` (vector); with a `fuser` wrap the leaves in `HybridSearch(retrievers, RRFFuser(rank_constant=fuser.rank_constant), retrieval_window_size=fuser.window)`, else take the single leaf (raise if ≠ 1); with a `reranker` → `SearchPipeline(retriever, reranker=factory.reranker(reranker, mapping.search_text_field), rerank_window_size=pcfg.rerank_window_size)`, else `SearchPipeline(retriever)`. It imports the composers from `pipeline.py` and **performs no selection** — `fuser.rank_constant` is a concrete int from the config. Tests use a fake factory + fake `Services` so no adapter is imported.
 - Run/artifact ids are the pipeline names from config (e.g. `hybrid_e5_k60`), §9.
 - `config.py`: `${VAR}` resolved at load (secrets never in file); `ci_level` parsed but is **not** a gate; records correction/test/zero-tie params for run metadata.
 
@@ -457,7 +456,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Test / acceptance criteria.** *(requires dockerized ES ≥ 8.15; full corpus)*
 - Full matrix run completes; **schema lint** over every produced CSV asserts exact headers/field order (§9) for every variant.
 - **Reproducibility:** two runs with the same seed produce identical `metrics_*`/`comparison_*` stats columns (modulo documented ES nondeterminism mitigated by the doc_id tie-break); `run_config_*.json` captures the seed and all §9.1 fields.
-- **Generality check:** an import-graph test asserts `pipeline`/`metrics`/`stats`/`matrix`/`runner`/`io_csv` import only `models`/`protocols` (plus the stdlib-only `logging_setup`) and **no** adapter imports — automating the §11 invariant.
+- **Generality check:** an import-graph test asserts `pipeline`/`metrics`/`stats`/`runner`/`io_csv` import only `models`/`protocols` (plus the stdlib-only `logging_setup`) and **no** adapter imports; `config.py` additionally imports `pipeline` for `build_pipeline` (the one wiring edge) but still **no** adapter at import time — automating the §11 invariant.
 - **DRY check:** automated/inspection confirmation of the single execution path.
 
 **Developer / reviewer responsibilities.** Developer executes the full run and the validation suite; files fixes against the owning phase modules for any defect. Reviewer signs that all four §1.4 criteria are demonstrably met.
@@ -508,15 +507,14 @@ tests/
 | `models.py` | 1 |
 | `protocols.py` | 1 |
 | `pipeline.py` (`RRFFuser`/`HybridSearch`/`SearchPipeline`) | 5 |
-| `build_pipeline()` (in `matrix.py`) | 6 |
+| `build_pipeline()` (in `config.py`) | 6 |
 | `fusion.py` | 4 |
 | `rerank.py` | 4 |
 | `metrics.py` | 2 |
 | `stats.py` | 3 |
-| `matrix.py` | 6 |
 | `runner.py` | 11 |
 | `io_csv.py` | 7 |
-| `config.py` | 6 |
+| `config.py` (config value types `PipelineCfg`/`Services`/`ResolvedConfig` + `build_pipeline` + loader/factories) | 6 |
 | `logging_setup.py` | 0 |
 | `datasets/wands.py` | 8 |
 | `backends/elasticsearch.py` (ingest lifecycle + `LexicalSearcher`) | 9 |

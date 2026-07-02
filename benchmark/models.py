@@ -110,11 +110,28 @@ class FieldSchema:
 
 
 class InferenceTaskType(StrEnum):
-    """Inference endpoint task type (§3.4)."""
+    """ES ``_inference`` wire task type on :class:`InferenceEndpoint` (§3.4).
+
+    Spans the full endpoint surface — embeddings AND rerank. An embedder config uses the narrower
+    :class:`EmbeddingType` (no rerank) and maps into this on flatten; a reranker flattens to
+    ``RERANK`` implicitly.
+    """
 
     TEXT_EMBEDDING = "text_embedding"
     SPARSE_EMBEDDING = "sparse_embedding"
     RERANK = "rerank"
+
+
+class EmbeddingType(StrEnum):
+    """The embedding-only task type an ``embedder`` config declares (§3.4, §10).
+
+    Narrower than :class:`InferenceTaskType` — it deliberately excludes ``rerank``, so an embedder
+    cannot be misconfigured as a reranker. Maps onto ``InferenceTaskType`` when an embedder flattens
+    to an :class:`InferenceEndpoint`.
+    """
+
+    TEXT_EMBEDDING = "text_embedding"
+    SPARSE_EMBEDDING = "sparse_embedding"
 
 
 @dataclass(frozen=True)

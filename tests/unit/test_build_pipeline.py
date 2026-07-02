@@ -11,7 +11,7 @@ from typing import Sequence
 
 import pytest
 
-from benchmark.matrix import (
+from benchmark.config import (
     EmbedderCfg,
     FuserCfg,
     PipelineCfg,
@@ -20,7 +20,7 @@ from benchmark.matrix import (
     Services,
     build_pipeline,
 )
-from benchmark.models import IndexMapping, InferenceTaskType, ScoredDoc
+from benchmark.models import EmbeddingType, IndexMapping, ScoredDoc
 from benchmark.pipeline import HybridSearch, SearchPipeline
 from benchmark.protocols import Reranker, Searcher
 
@@ -58,7 +58,7 @@ class _FakeFactory:
 
 SERVICES = Services(
     embedders={
-        "e5": EmbedderCfg("e5", "elasticsearch", InferenceTaskType.TEXT_EMBEDDING, {}),
+        "e5": EmbedderCfg("e5", "elasticsearch", EmbeddingType.TEXT_EMBEDDING, {}),
     },
     rerankers={
         "co-rr": RerankerCfg("co-rr", "cohere", {"top_n": 100}),

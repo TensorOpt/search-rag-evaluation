@@ -1,23 +1,27 @@
-"""Config load + resolve, ``${VAR}`` substitution, adapter factories (docs/experiment.md §10, §11). Phase 6.
+"""Resolved-config value types + config load/resolve + pipeline assembly + adapter factories (docs/experiment.md §4, §10, §11). Phase 6.
 
-Parses the explicit §10 YAML config (``dataset`` / ``services`` / ``indexer`` / ``pipelines`` /
-``stats`` / ``cutoff`` / ``top_k``), substitutes whole-value ``${VAR}`` environment placeholders at
-load (secrets never live in the file), validates it, and resolves it into a
-:class:`benchmark.matrix.ResolvedConfig`.
+This module is the whole configuration layer. It holds:
 
-- The ``services`` block builds the typed :class:`Services` registry (embedders/rerankers/searchers
-  by name). Embedders flatten to embedding ``InferenceEndpoint``s (§3.4/§3.5); rerankers flatten to
-  ``rerank`` endpoints (``task_settings.top_n``) the runner registers lazily at R0 and hands to the
-  ES ``searcher_factory``.
-- ``pipelines`` is FULLY EXPLICIT: ``baseline`` (the reference) plus a map of named ``variants``.
-  There is NO matrix expansion and NO sweep. Each pipeline is validated (§10 pipeline field rules)
-  and resolved into a :class:`PipelineCfg`.
-- ``load_dataset`` / ``make_indexer`` / ``make_searcher_factory`` dispatch on ``dataset.name`` /
-  ``indexer.provider`` to a dotted-path target. They do NOT import the adapter at this phase
-  (offline); the live import + construct is deferred to Phase 11. An unknown name/provider raises.
+- The pure resolved-config value types — :class:`EmbedderCfg`/:class:`RerankerCfg`/:class:`SearcherCfg`
+  + the :class:`Services` registry, :class:`FuserCfg`, :class:`PipelineCfg`, :class:`ResolvedConfig`.
+  Pipelines are named + explicit (§10): the config declares one ``baseline`` plus a map of named
+  ``variants``, each resolved into a :class:`PipelineCfg`. There is NO matrix expansion and NO sweep.
+- :func:`build_pipeline`, which assembles one ``PipelineCfg`` into a ``SearchPipeline`` object graph
+  (§4) via a ``SearcherFactory`` seam, reading concrete field names from ``IndexMapping``.
+- The loader: parses the explicit §10 YAML (``dataset`` / ``services`` / ``indexer`` / ``pipelines`` /
+  ``stats`` / ``cutoff`` / ``top_k``), substitutes whole-value ``${VAR}`` environment placeholders at
+  load (secrets never live in the file), validates it, and resolves it into a :class:`ResolvedConfig`.
+  Embedders flatten to embedding ``InferenceEndpoint``s (§3.4/§3.5); rerankers flatten to ``rerank``
+  endpoints (``task_settings.top_n``) the runner registers lazily at R0 and hands to the ES
+  ``searcher_factory``.
+- The lazy factories ``load_dataset`` / ``make_indexer`` / ``make_searcher_factory``, which dispatch on
+  ``dataset.name`` / ``indexer.provider`` to a dotted-path target. They do NOT import the adapter at
+  this phase (offline); the live import + construct is deferred to Phase 11. An unknown name/provider
+  raises.
 
-Imports only ``benchmark.models`` / ``benchmark.matrix`` / ``benchmark.stats`` + pyyaml + stdlib —
-never an adapter module at import time (§11).
+Imports ``benchmark.models`` / ``benchmark.protocols`` / ``benchmark.stats`` / ``benchmark.pipeline``
+(the composers, for :func:`build_pipeline` — a one-way wiring edge, §11) + pyyaml + stdlib. It NEVER
+imports an adapter module at import time (§11): the factories resolve their dotted targets lazily.
 """
 
 from __future__ import annotations
@@ -25,25 +29,31 @@ from __future__ import annotations
 import importlib
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 
 from benchmark.logging_setup import get_logger
-from benchmark.matrix import (
-    EmbedderCfg,
-    FuserCfg,
-    PipelineCfg,
-    RerankerCfg,
-    ResolvedConfig,
-    SearcherCfg,
-    Services,
+from benchmark.models import (
+    EmbeddingType,
+    IndexMapping,
+    InferenceEndpoint,
+    InferenceTaskType,
 )
-from benchmark.models import InferenceTaskType
+from benchmark.pipeline import HybridSearch, RRFFuser, SearchPipeline
+from benchmark.protocols import Searcher, SearcherFactory
 from benchmark.stats import StatsCfg
 
 logger = get_logger(__name__)
+
+#: Maps an embedder's :class:`EmbeddingType` to the ``_inference`` wire :class:`InferenceTaskType`.
+#: Exhaustive over ``EmbeddingType`` — a reranker sets ``RERANK`` implicitly (not via this map).
+_EMBEDDING_TASK_TYPE: Mapping[EmbeddingType, InferenceTaskType] = {
+    EmbeddingType.TEXT_EMBEDDING: InferenceTaskType.TEXT_EMBEDDING,
+    EmbeddingType.SPARSE_EMBEDDING: InferenceTaskType.SPARSE_EMBEDDING,
+}
 
 #: ``${VAR}`` env placeholder (§10). Whole-value only — secrets are always their own scalar.
 _ENV_PLACEHOLDER = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -64,6 +74,235 @@ SEARCHER_FACTORY_TARGETS: Mapping[str, str] = {
 _SEARCHER_KINDS = ("lexical", "vector")
 #: Valid fuser types (§10). Only RRF today; anything else is a ConfigError.
 _FUSER_TYPES = ("rrf",)
+
+
+# --- resolved-config value types (§4, §10) -----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EmbedderCfg:
+    """A named embedder service (§10 ``services`` block).
+
+    ``name`` is the config-local reference; ``provider`` selects the backend adapter; ``settings``
+    carries provider-specific knobs (``model_id``, ``api_key`` …). ``embedding_type`` is the narrow
+    embedding-only :class:`EmbeddingType` (never rerank). It flattens to an embedding
+    ``InferenceEndpoint`` (``inference_id = name``) the indexer registers at ingest (§3.4/§3.5).
+    """
+
+    name: str
+    provider: str
+    embedding_type: EmbeddingType
+    settings: Mapping[str, Any]
+
+    def as_endpoint(self) -> InferenceEndpoint:
+        return InferenceEndpoint(
+            inference_id=self.name,
+            task_type=_EMBEDDING_TASK_TYPE[self.embedding_type],
+            service=self.provider,
+            service_settings=dict(self.settings),
+        )
+
+
+@dataclass(frozen=True)
+class RerankerCfg:
+    """A named reranker service (§10 ``services`` block).
+
+    Flattens to a ``rerank`` ``InferenceEndpoint`` (``top_n`` is a ``task_settings`` key, §3.4/§5.3)
+    the runner registers lazily at R0 and hands to the ES ``searcher_factory`` to build an
+    ``ESReranker`` (``Reranker`` is a behavioral ABC realized by the backend, not a descriptor). A
+    reranker carries NO task type — the ``rerank`` task is implied.
+    """
+
+    name: str
+    provider: str
+    settings: Mapping[str, Any]
+
+    def as_endpoint(self) -> InferenceEndpoint:
+        settings = dict(self.settings)
+        top_n = settings.pop("top_n", None)
+        return InferenceEndpoint(
+            inference_id=self.name,
+            task_type=InferenceTaskType.RERANK,
+            service=self.provider,
+            service_settings=settings,
+            task_settings={} if top_n is None else {"top_n": top_n},
+        )
+
+
+@dataclass(frozen=True)
+class SearcherCfg:
+    """A named searcher service (§10 ``services`` block).
+
+    ``kind`` is ``"lexical"`` or ``"vector"``; a vector searcher references an ``embedder`` service
+    name (``None`` for lexical). ``build_pipeline`` resolves these into leaf ``Searcher``s.
+    """
+
+    name: str
+    provider: str
+    kind: str
+    embedder: str | None
+
+
+@dataclass(frozen=True)
+class Services:
+    """The typed registry of named services (§10 ``services`` block).
+
+    Embedders/rerankers/searchers keyed by their config name. The accessors raise a clear
+    ``KeyError``-style ``ValueError`` on a missing/mistyped reference so ``build_pipeline`` and
+    config validation fail loudly rather than silently.
+    """
+
+    embedders: Mapping[str, EmbedderCfg]
+    rerankers: Mapping[str, RerankerCfg]
+    searchers: Mapping[str, SearcherCfg]
+
+    def embedder(self, name: str) -> EmbedderCfg:
+        if name not in self.embedders:
+            raise ValueError(f"unknown embedder service {name!r}; known: {sorted(self.embedders)}")
+        return self.embedders[name]
+
+    def reranker(self, name: str) -> RerankerCfg:
+        if name not in self.rerankers:
+            raise ValueError(f"unknown reranker service {name!r}; known: {sorted(self.rerankers)}")
+        return self.rerankers[name]
+
+    def searcher(self, name: str) -> SearcherCfg:
+        if name not in self.searchers:
+            raise ValueError(f"unknown searcher service {name!r}; known: {sorted(self.searchers)}")
+        return self.searchers[name]
+
+
+@dataclass(frozen=True)
+class FuserCfg:
+    """RRF fusion parameters for a multi-retriever pipeline (§10 ``fuser`` block).
+
+    Only ``rrf`` fusion exists today; ``build_pipeline`` raises on any other ``type`` (exhaustive).
+    ``rank_constant`` is the RRF k; ``window`` is the retrieval/fusion candidate depth W.
+    """
+
+    type: str
+    rank_constant: int
+    window: int
+
+
+@dataclass(frozen=True)
+class PipelineCfg:
+    """One explicit, named pipeline from the config (§4, §10).
+
+    ``id`` is the pipeline's config name (the map key; the baseline's is ``"baseline"`` by default).
+    ``retrievers`` is a tuple of searcher service names (exactly one leaf when ``fuser`` is None; 2+
+    when fusing). ``fuser`` is present iff there are multiple retrievers. ``reranker`` is a reranker
+    service name (paired with ``rerank_window_size``); both are set together or both None.
+    """
+
+    id: str
+    retrievers: tuple[str, ...]
+    fuser: FuserCfg | None
+    reranker: str | None
+    rerank_window_size: int | None
+
+
+@dataclass(frozen=True)
+class ResolvedConfig:
+    """The fully-resolved run configuration (§10, §9.1 run metadata).
+
+    ``dataset``/``indexer`` are the raw resolved config sections (this module dispatches the live
+    adapter from ``dataset["name"]`` / ``indexer["provider"]``, deferred to Phase 11). ``services``
+    is the typed registry. ``baseline`` is the reference pipeline; ``variants`` is the ORDERED list
+    of explicit variant pipelines (iterate ``baseline`` first, then ``variants``, via
+    :meth:`pipelines`). ``cutoff`` is the metric depth k; ``top_k`` is the retrieval depth.
+    """
+
+    dataset: Mapping[str, object]
+    indexer: Mapping[str, object]
+    services: Services
+    baseline: PipelineCfg
+    variants: Sequence[PipelineCfg]
+    stats: StatsCfg
+    cutoff: int
+    top_k: int
+    baseline_id: str
+    timestamp: str
+    seed: int
+
+    def pipelines(self) -> list[PipelineCfg]:
+        """The run's pipelines, baseline first (§8.0)."""
+        return [self.baseline, *self.variants]
+
+
+# --- pipeline assembly (§4) --------------------------------------------------------------------
+
+
+def build_pipeline(
+    pcfg: PipelineCfg,
+    services: Services,
+    mapping: IndexMapping,
+    factory: SearcherFactory,
+) -> SearchPipeline:
+    """Assemble ``pcfg``'s ``SearchPipeline`` object graph via the ``SearcherFactory`` (§4).
+
+    Each retriever name resolves to its :class:`SearcherCfg` in ``services``; a lexical searcher
+    becomes ``factory.lexical(fields=[mapping.search_text_field])`` and a vector searcher becomes
+    ``factory.vector(field=mapping.sem_field(embedder_name))``. With a ``fuser`` the leaves are
+    wrapped in a ``HybridSearch`` (RRF at ``fuser.rank_constant``, window ``fuser.window``); without
+    one, exactly one leaf is expected (else ``ValueError``). A ``reranker`` wraps the retriever in a
+    ``SearchPipeline`` with a rerank pass at ``rerank_window_size``; else a bare pass-through pipeline.
+
+    The reranker's doc-text field is ``mapping.search_text_field`` — ``IndexMapping`` carries only
+    that canonical text field, and §5.3 fixes the ES rerank field to that same ``search_text``.
+    """
+    leaves: list[Searcher] = [
+        _build_leaf(services.searcher(name), services, mapping, factory)
+        for name in pcfg.retrievers
+    ]
+
+    if pcfg.fuser is not None:
+        if pcfg.fuser.type != "rrf":
+            raise ValueError(
+                f"pipeline {pcfg.id!r}: unknown fuser type {pcfg.fuser.type!r}; only 'rrf' is supported"
+            )
+        retriever: Searcher = HybridSearch(
+            retrievers=leaves,
+            fuser=RRFFuser(rank_constant=pcfg.fuser.rank_constant),
+            retrieval_window_size=pcfg.fuser.window,
+        )
+    else:
+        if len(leaves) != 1:
+            raise ValueError(
+                f"pipeline {pcfg.id!r} has no fuser but built {len(leaves)} leaf retrievers; "
+                "expected exactly one"
+            )
+        (retriever,) = leaves
+
+    if pcfg.reranker is not None:
+        return SearchPipeline(
+            retriever=retriever,
+            reranker=factory.reranker(pcfg.reranker, mapping.search_text_field),
+            rerank_window_size=pcfg.rerank_window_size,
+        )
+    return SearchPipeline(retriever=retriever)
+
+
+def _build_leaf(
+    searcher: SearcherCfg,
+    services: Services,
+    mapping: IndexMapping,
+    factory: SearcherFactory,
+) -> Searcher:
+    """Resolve one searcher service to a leaf ``Searcher`` (§4). Exhaustive on ``kind``."""
+    if searcher.kind == "lexical":
+        return factory.lexical(fields=[mapping.search_text_field])
+    if searcher.kind == "vector":
+        if searcher.embedder is None:
+            raise ValueError(f"vector searcher {searcher.name!r} has no embedder reference")
+        embedder: EmbedderCfg = services.embedder(searcher.embedder)
+        return factory.vector(field=mapping.sem_field(embedder.name))
+    raise ValueError(
+        f"searcher {searcher.name!r} has unknown kind {searcher.kind!r}; expected 'lexical' or 'vector'"
+    )
+
+
+# --- config load + resolve (§10) ---------------------------------------------------------------
 
 
 class ConfigError(ValueError):
@@ -195,20 +434,18 @@ def _reject_duplicate(
 
 def _resolve_embedder(body: Mapping[str, Any]) -> EmbedderCfg:
     name = body["name"]
-    task_type_raw = body.get("task_type", "text_embedding")
+    embedding_type_raw = body.get("embedding_type", "text_embedding")
     try:
-        task_type = InferenceTaskType(task_type_raw)
+        embedding_type = EmbeddingType(embedding_type_raw)
     except ValueError:
         raise ConfigError(
-            f"embedder {name!r}: unknown task_type {task_type_raw!r}; "
-            f"expected one of {[t.value for t in InferenceTaskType if t is not InferenceTaskType.RERANK]}"
+            f"embedder {name!r}: unknown embedding_type {embedding_type_raw!r}; "
+            f"expected one of {[t.value for t in EmbeddingType]}"
         )
-    if task_type is InferenceTaskType.RERANK:
-        raise ConfigError(f"embedder {name!r} must not use the 'rerank' task_type")
     return EmbedderCfg(
         name=name,
         provider=_require(body, "provider", f"embedder {name!r}"),
-        task_type=task_type,
+        embedding_type=embedding_type,
         settings=dict(_require(body, "settings", f"embedder {name!r}")),
     )
 
@@ -367,6 +604,9 @@ def _resolve_stats(raw: Mapping[str, Any]) -> StatsCfg:
         wilcoxon_correction=bool(raw.get("wilcoxon_correction", True)),
         seed=int(_require(raw, "seed", "stats")),
     )
+
+
+# --- lazy adapter factories (§11, Phase 11) ----------------------------------------------------
 
 
 def _resolve_target(target: str) -> Any:

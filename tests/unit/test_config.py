@@ -17,13 +17,16 @@ from benchmark.config import (
     DATASET_TARGETS,
     INDEXER_TARGETS,
     ConfigError,
+    EmbedderCfg,
+    PipelineCfg,
+    RerankerCfg,
+    SearcherCfg,
     load_config,
     load_dataset,
     make_indexer,
     make_searcher_factory,
     resolve_config,
 )
-from benchmark.matrix import EmbedderCfg, PipelineCfg, RerankerCfg, SearcherCfg
 from benchmark.models import InferenceTaskType
 
 CONFIG_YAML = textwrap.dedent(
@@ -32,8 +35,8 @@ CONFIG_YAML = textwrap.dedent(
       name: wands
       path: ./dataset/wands
     services:
-      - embedder: { name: e5,     provider: elasticsearch, task_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-      - embedder: { name: cohere, provider: cohere,        task_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
+      - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+      - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
       - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100 } }
       - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
       - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
@@ -117,7 +120,7 @@ def test_missing_required_key_raises() -> None:
 
 def test_stats_block_parsed() -> None:
     resolved = resolve_config(_parsed())
-    assert resolved.stats.ci_level == 0.95  # parsed, never a gate (§8.2)
+    assert resolved.stats.ci_level == pytest.approx(0.95)  # parsed, never a gate (§8.2)
     assert resolved.stats.correction == "bh"
     assert resolved.stats.test == "wilcoxon"
     assert resolved.stats.seed == 1234

@@ -9,9 +9,9 @@ into the six retrieval shapes as object graphs — no declarative spec layer, no
 - ``SearchPipeline`` — the top-level ``Searcher``: an optional rerank pass over a retriever.
 
 Imports only ``benchmark.models`` / ``benchmark.protocols`` / ``benchmark.fusion`` + stdlib —
-never adapters, ``matrix``, or numpy (§11). ``build_pipeline`` (``PipelineCfg`` -> ``SearchPipeline``
-object graph) lives in ``matrix.py`` (Phase 6), not here, to avoid a pipeline->matrix forward
-dependency (§4).
+never adapters, ``config``, or numpy (§11). ``build_pipeline`` (``PipelineCfg`` -> ``SearchPipeline``
+object graph) lives in ``config.py`` (Phase 6), not here, to avoid a pipeline->config forward
+dependency (§4); ``config`` importing ``pipeline`` for ``build_pipeline`` is the one-way wiring edge.
 """
 
 from __future__ import annotations

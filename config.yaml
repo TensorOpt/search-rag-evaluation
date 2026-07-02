@@ -8,12 +8,16 @@ dataset:
   name: wands
   path: ./dataset/wands
 services:                       # named, typed, reusable building blocks
-  - embedder: { name: e5,     provider: elasticsearch, task_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-  - embedder: { name: cohere, provider: cohere,        task_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
+  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
+  - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
   - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100 } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
   - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
+# ONE index for everything (ES): a single search_text (BM25) field plus one semantic_text field per
+# embedder referenced by a vector searcher above (via copy_to, §5.2) — semantic_e5/semantic_co are
+# FIELDS in this one index, not separate indices. The indexer learns which embedders to build fields
+# for by scanning the vector searchers.
 indexer:
   provider: elasticsearch
   index: wands_bench
