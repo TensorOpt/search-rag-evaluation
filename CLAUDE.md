@@ -58,6 +58,12 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   Equally, don't pad obvious names: a short/idiomatic name is fine when context makes it plain
   (`idx`/`rank` for a loop counter, `k` for the RRF rank constant inside `fuse_rrf_local`). Avoid
   both extremes — cryptic (`obs`) and needlessly verbose (`zero_based_index`).
+- **Handle exceptions meaningfully — never `except …: pass`.** Catch narrowly (the specific
+  exception, not bare `except`). If the caught condition is *expected/benign*, make that intent
+  explicit — log at `debug`/`info` and continue (prefer `try/except/else`, e.g. `NotFoundError` →
+  "not found; creating it"). If it is *unexpected*, log a `warning`/`error` with context **or** let
+  it bubble up. Don't widen the `try` to swallow errors you did not mean to catch. A silent `pass`
+  hides both the intent and real failures.
 - **Use logging, not `print()`.** Get a logger via `benchmark.logging_setup.get_logger(__name__)`
   and call `setup_logging()` once at each entry point — it logs to the console and to
   `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.

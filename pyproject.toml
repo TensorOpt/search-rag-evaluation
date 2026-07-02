@@ -13,6 +13,7 @@ dependencies = [
   "numpy",
   "scipy>=1.11",  # scipy.stats.false_discovery_control (BH/BY FDR) was added in 1.11
   "pyyaml>=6",    # config.py loads the §10 YAML config matrix
+  "elasticsearch>=8.15,<9",  # ES client; matches ES server >=8.15 (§1.1). Ingest + search (Phase 9/10)
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -71,3 +72,14 @@ follow_imports_for_stubs = true
 [[tool.mypy.overrides]]
 module = "yaml"
 ignore_missing_imports = true
+
+# The elasticsearch client ships partial/dynamic types (namespaced sub-clients built at runtime);
+# ignore the missing-stub import for the ES adapter rather than pulling a stubs dep (§9 backend).
+[[tool.mypy.overrides]]
+module = "elasticsearch.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: live-ES tests (Phases 9-12); skipped when ES is unreachable (plan §5).",
+]
