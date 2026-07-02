@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from elasticsearch import NotFoundError
+from elasticsearch.helpers import BulkIndexError
 
 from benchmark.backends import elasticsearch as es
 from benchmark.fusion import fuse_rrf_local
@@ -237,6 +238,33 @@ def test_bulk_index_failed_item_raises_not_swallowed(monkeypatch: pytest.MonkeyP
         backend.bulk_index(docs, mapping=_mapping())
     # a failed item aborts before refresh (the error surfaces, exception convention)
     client.indices.refresh.assert_not_called()
+
+
+def test_bulk_index_logs_per_item_reasons_then_reraises(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A semantic_text ingest error (bad input / rate limit / auth) surfaces as a BulkIndexError whose
+    # per-item reasons live on .errors — assert they are LOGGED (not just the opaque count) and the
+    # error still propagates (never swallowed).
+    def fake_streaming_bulk(client: Any, actions: Any, **kwargs: Any) -> Any:
+        list(actions)  # drive the lazy generator
+        raise BulkIndexError(
+            "1 document(s) failed to index.",
+            [{"index": {"_id": "p2", "status": 400,
+                        "error": {"type": "status_exception", "reason": "cohere embed failed"}}}],
+        )
+        yield  # pragma: no cover - generator marker
+
+    monkeypatch.setattr(es, "streaming_bulk", fake_streaming_bulk)
+    backend = _backend_with(_fake_client())
+
+    with caplog.at_level("ERROR"):
+        with pytest.raises(BulkIndexError):
+            backend.bulk_index([Document(doc_id="p2", fields={"search_text": "x"})], mapping=_mapping())
+
+    assert "cohere embed failed" in caplog.text  # the real reason is surfaced
+    assert "p2" in caplog.text
+    backend.client.indices.refresh.assert_not_called()  # re-raised before refresh
 
 
 def test_bulk_index_no_docs_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -21,7 +21,7 @@ import re
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from elasticsearch import Elasticsearch, NotFoundError
-from elasticsearch.helpers import streaming_bulk
+from elasticsearch.helpers import BulkIndexError, streaming_bulk
 
 from benchmark.logging_setup import get_logger
 from benchmark.models import (
@@ -189,15 +189,32 @@ class ElasticsearchBackend:
                 }
 
         indexed = 0
-        for _ok, _info in streaming_bulk(
-            self.client,
-            actions(),
-            chunk_size=self.bulk_chunk_size,
-            raise_on_error=True,
-        ):
-            indexed += 1
-            if indexed % _BULK_PROGRESS_EVERY == 0:
-                logger.info("bulk_index: %d docs into %r so far", indexed, index_name)
+        try:
+            for _ok, _info in streaming_bulk(
+                self.client,
+                actions(),
+                chunk_size=self.bulk_chunk_size,
+                raise_on_error=True,
+            ):
+                indexed += 1
+                if indexed % _BULK_PROGRESS_EVERY == 0:
+                    logger.info("bulk_index: %d docs into %r so far", indexed, index_name)
+        except BulkIndexError as exc:
+            # The per-item failure reasons live on ``exc.errors``, NOT in the message (which is just a
+            # count) — for a semantic_text field these are the ingest-time embedding errors (bad input,
+            # rate limit, auth). Log the first few with their status so the cause is visible, then
+            # re-raise (errors surface, never swallowed — the exception convention).
+            for item in exc.errors[:3]:
+                op = next(iter(item.values()))  # {"_id", "status", "error": {...}} under the op key
+                logger.error(
+                    "bulk_index: doc %r failed (status %s): %s",
+                    op.get("_id"), op.get("status"), op.get("error"),
+                )
+            logger.error(
+                "bulk_index: %d docs failed indexing into %r (see reasons above)",
+                len(exc.errors), index_name,
+            )
+            raise
 
         if indexed == 0:
             logger.info("bulk_index: no documents to index into %r", index_name)
