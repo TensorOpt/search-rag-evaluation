@@ -1,7 +1,7 @@
 """Phase 1 unit tests for benchmark.protocols (docs/experiment.md §3.2-§3.5).
 
 Two seam kinds:
-- structural ingest Protocols (``EmbeddingModel``, ``Indexer``, ``SearchBackend``):
+- structural Protocols (``Embedder``, ``RerankClient``, ``Indexer``, ``SearchBackend``):
   a trivial in-test class satisfies each (mypy checks data attributes; ``@runtime_checkable``
   ``isinstance`` here only verifies method presence).
 - ABCs (``Searcher``, ``Fuser``, ``Reranker``, ``Dataset``): a trivial subclass implementing the
@@ -19,18 +19,17 @@ from benchmark.models import (
     Document,
     FieldSchema,
     IndexMapping,
-    InferenceEndpoint,
-    InferenceTaskType,
     Qrel,
     Query,
     ScoredDoc,
 )
 from benchmark.protocols import (
     Dataset,
-    EmbeddingModel,
+    Embedder,
     Fuser,
     Indexer,
     Reranker,
+    RerankClient,
     Searcher,
     SearchBackend,
 )
@@ -54,19 +53,31 @@ class _Dataset(Dataset):
         return FieldSchema(fields=[])
 
 
-class _EmbeddingModel:
-    inference_id = "e5-small"
-    task_type = InferenceTaskType.TEXT_EMBEDDING
+class _Embedder:
+    """A trivial embedding connector: id / dim / embed_documents / embed_queries."""
 
-    def as_endpoint(self) -> InferenceEndpoint:
-        return InferenceEndpoint(self.inference_id, self.task_type, "elasticsearch")
+    id = "cohere"
+
+    @property
+    def dim(self) -> int:
+        return 3
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+    def embed_queries(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[0.0, 1.0, 0.0] for _ in texts]
+
+
+class _RerankClient:
+    """A trivial rerank connector: one score per document, aligned to input."""
+
+    def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]:
+        return [float(len(documents) - i) for i in range(len(documents))]
 
 
 class _Backend:
-    """A trivial ingest seam: register_inference / ensure_index / bulk_index only."""
-
-    def register_inference(self, ep: InferenceEndpoint) -> str:
-        return ep.inference_id
+    """A trivial ingest seam: ensure_index / bulk_index only (no inference registration)."""
 
     def ensure_index(self, mapping: IndexMapping) -> None:
         return None
@@ -80,7 +91,7 @@ class _Indexer:
         self,
         dataset: Dataset,
         backend: SearchBackend,
-        embeddings: Sequence[EmbeddingModel],
+        embeddings: Sequence[Embedder],
     ) -> IndexMapping:
         return IndexMapping("i", "search_text", {}, {})
 
@@ -111,12 +122,15 @@ class _Reranker(Reranker):
 def test_static_structural_conformance() -> None:
     dataset: Dataset = _Dataset()
     backend: SearchBackend = _Backend()
-    embedding: EmbeddingModel = _EmbeddingModel()
+    embedder: Embedder = _Embedder()
+    rerank_client: RerankClient = _RerankClient()
     indexer: Indexer = _Indexer()
     assert dataset.name == "fake"
-    assert backend.register_inference(embedding.as_endpoint()) == "e5-small"
-    assert embedding.as_endpoint().inference_id == "e5-small"
-    assert isinstance(indexer.build(dataset, backend, [embedding]), IndexMapping)
+    assert embedder.id == "cohere" and embedder.dim == 3
+    assert embedder.embed_queries(["q"]) == [[0.0, 1.0, 0.0]]
+    assert rerank_client.rerank_scores("q", ["a", "b"]) == [2.0, 1.0]
+    backend.ensure_index(IndexMapping("i", "search_text", {}, {}))
+    assert isinstance(indexer.build(dataset, backend, [embedder]), IndexMapping)
 
 
 # --- runtime isinstance checks against @runtime_checkable ingest Protocols ---------------------
@@ -125,7 +139,8 @@ def test_static_structural_conformance() -> None:
 def test_runtime_isinstance_method_protocols() -> None:
     assert isinstance(_Dataset(), Dataset)
     assert isinstance(_Backend(), SearchBackend)
-    assert isinstance(_EmbeddingModel(), EmbeddingModel)
+    assert isinstance(_Embedder(), Embedder)
+    assert isinstance(_RerankClient(), RerankClient)
     assert isinstance(_Indexer(), Indexer)
 
 

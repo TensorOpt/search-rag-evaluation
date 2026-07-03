@@ -1,14 +1,13 @@
-"""Live-ES integration tests for the ES adapter (marked; skip-not-fail, never touches the unit suite).
+"""Live integration tests for the ES adapter (marked; skip-not-fail, never touches the unit suite).
 
-Runs against ``ES_URL`` (default ``http://localhost:9200``) on uniquely-named throwaway indices,
-created and deleted per test. SKIPS (never fails) when the cluster is unreachable OR when a required
-ML model cannot be deployed (HTTP 429 ``status_exception`` — insufficient memory / could-not-start-
-deployment); see ``_skip_if_deploy_error``. Covers the lexical path (``LexicalSearcher`` +
-``bulk_index`` chunking), the semantic path (``VectorSearch`` over a live ``semantic_text`` field,
-E5-embedded at ingest), and ``ESReranker`` (``.rerank-v1``). The semantic and rerank tests are
-INDEPENDENT — the ``VectorSearch`` test needs only E5, the reranker test needs only ``.rerank-v1`` —
-so neither requires both models resident at once. Does NOT depend on ``WandsDataset``.
-See docs/experiment.md §5.2, §5.3, §13.
+ES is a plain vector/BM25 index (§1.1). Runs against ``ES_URL`` (default ``http://localhost:9200``)
+on uniquely-named throwaway indices, created and deleted per test. SKIPS (never fails) when the
+cluster is unreachable, when a required provider API key is absent, or on a provider ``ProviderError``
+(an environment constraint — auth/rate limit — not a code defect). Covers the lexical path
+(``LexicalSearcher`` + ``bulk_index`` chunking), the semantic path (client-side embed → ES ``knn``
+over a live ``dense_vector`` field, via a real embedding connector), and ``ESReranker`` over a real
+provider ``RerankClient``. The semantic + rerank tests need a Cohere API key
+(``COHERE_KEY``). Does NOT depend on ``WandsDataset``. See docs/experiment.md §5.2, §5.3, §5.4.
 """
 
 from __future__ import annotations
@@ -18,8 +17,6 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from elasticsearch import ApiError
-from elasticsearch.helpers import BulkIndexError
 
 from benchmark.backends.elasticsearch import (
     ElasticsearchBackend,
@@ -28,34 +25,19 @@ from benchmark.backends.elasticsearch import (
     VectorSearch,
 )
 from benchmark.models import Document, IndexMapping, ScoredDoc
+from benchmark.providers import CohereEmbedder, CohereReranker, ProviderError
 
 pytestmark = pytest.mark.integration
 
 ES_URL = os.environ.get("ES_URL", "http://localhost:9200")
-
-# Preconfigured endpoints in the validation container (§ prompt): E5 (dense, 384-dim) + rerank v1.
-E5_INFERENCE_ID = ".multilingual-e5-small-elasticsearch"
-RERANK_INFERENCE_ID = ".rerank-v1-elasticsearch"
+COHERE_KEY = os.environ.get("COHERE_KEY")
 
 
-def _skip_if_deploy_error(exc: ApiError | BulkIndexError) -> None:
-    """Skip (not fail) on a 429 model-deployment/memory error; re-raise anything else.
-
-    When ML memory is tight a model deploy returns HTTP 429 ``status_exception`` ("insufficient ...
-    memory" / "Could not start deployment"). That surfaces two ways: a direct ``ApiError`` (a
-    search/rerank call), OR — at ingest — a ``BulkIndexError`` whose per-item ``status`` is 429 (ES
-    embeds each ``semantic_text`` at ingest, so a failed E5 deploy fails the ingest item). Either is
-    an environment constraint, not a code defect — skip it; anything else re-raises.
-    """
-    if isinstance(exc, BulkIndexError):
-        if any(
-            next(iter(item.values())).get("status") == 429 for item in exc.errors
-        ):
-            pytest.skip(f"model could not be deployed (429 on ingest): {exc.errors[:1]}")
-        raise exc
-    if exc.status_code == 429:
-        pytest.skip(f"model could not be deployed (429, insufficient ML memory): {exc}")
-    raise exc
+def _require_cohere() -> str:
+    """Skip (not fail) when no Cohere API key is configured — the connector tests need one."""
+    if not COHERE_KEY:
+        pytest.skip("COHERE_KEY not set — provider connector tests need a live key")
+    return COHERE_KEY
 
 
 @pytest.fixture
@@ -73,10 +55,10 @@ def backend() -> ElasticsearchBackend:
 
 @pytest.fixture
 def mapping(backend: ElasticsearchBackend) -> Iterator[IndexMapping]:
-    """A plain text index (no semantic field, so no model deploy); deleted on teardown.
+    """A plain text index (BM25 only); deleted on teardown.
 
-    Shared by the lexical searchers and by the reranker's ``mget`` doc-text lookup — neither needs
-    an embedding model, so this fixture never triggers a deploy.
+    Shared by the lexical searchers and by the reranker's ``mget`` doc-text lookup — neither needs a
+    vector field, so this fixture is fully local (no provider call).
     """
     mapping = IndexMapping(
         index_name=backend.index,
@@ -176,59 +158,63 @@ def test_bulk_index_more_than_one_chunk_indexes_all_docs(
     assert count == n
 
 
-# --- semantic path (VectorSearch, live E5) ----------------------------------------------------
+# --- semantic path (client-side embed via connector -> ES knn) --------------------------------
 
 
-def test_vector_search_semantic_query_returns_scored_docs(backend: ElasticsearchBackend) -> None:
-    sem_field = "sem__e5"
+def test_vector_search_knn_returns_scored_docs(backend: ElasticsearchBackend) -> None:
+    api_key = _require_cohere()
+    embedder = CohereEmbedder("cohere", {"api_key": api_key, "model_id": "embed-english-v3.0"})
+    sem_field = "sem__cohere"
+
+    try:
+        dim = embedder.dim  # probes the provider once for the output dimensionality
+        docs = [
+            Document(doc_id="p1", fields={"search_text": "a comfortable blue velvet sofa"}),
+            Document(doc_id="p2", fields={"search_text": "a wooden dining table"}),
+        ]
+        vectors = embedder.embed_documents([d.fields["search_text"] for d in docs])
+    except ProviderError as exc:
+        pytest.skip(f"cohere embedding unavailable (env constraint): {exc}")
+
     mapping = IndexMapping(
         index_name=backend.index,
         search_text_field="search_text",
-        sem_fields={E5_INFERENCE_ID: sem_field},
+        sem_fields={"cohere": sem_field},
         backend_mapping={
             "properties": {
-                "search_text": {"type": "text", "copy_to": [sem_field]},
-                sem_field: {"type": "semantic_text", "inference_id": E5_INFERENCE_ID},
+                "search_text": {"type": "text"},
+                sem_field: {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"},
             }
         },
     )
+    backend.ensure_index(mapping)
     try:
-        backend.ensure_index(mapping)  # binding the semantic_text field deploys E5
-    except ApiError as exc:
-        _skip_if_deploy_error(exc)
-    try:
-        try:
-            # ES embeds each semantic_text at ingest, so a failed E5 deploy fails here as a
-            # BulkIndexError with a per-item 429 (not an ApiError) — skip on that too.
-            backend.bulk_index(
-                [
-                    Document(doc_id="p1", fields={"search_text": "a comfortable blue velvet sofa"}),
-                    Document(doc_id="p2", fields={"search_text": "a wooden dining table"}),
-                ],
-                mapping=mapping,
-            )
-        except (ApiError, BulkIndexError) as exc:
-            _skip_if_deploy_error(exc)
+        enriched = [
+            Document(doc_id=doc.doc_id, fields={**doc.fields, sem_field: vector})
+            for doc, vector in zip(docs, vectors)
+        ]
+        backend.bulk_index(enriched, mapping=mapping)
 
-        searcher = VectorSearch(backend.client, backend.index, sem_field)
+        searcher = VectorSearch(backend.client, backend.index, sem_field, embedder)
         try:
             result = searcher.search("couch for the living room", top_k=10)
-        except ApiError as exc:
-            _skip_if_deploy_error(exc)
+        except ProviderError as exc:
+            pytest.skip(f"cohere query embedding unavailable (env constraint): {exc}")
 
-        assert result, "semantic query should return at least one scored doc"
+        assert result, "knn query should return at least one scored doc"
         assert all(isinstance(doc.score, float) for doc in result)
         assert {doc.doc_id for doc in result} <= {"p1", "p2"}
     finally:
         backend.client.indices.delete(index=backend.index, ignore_unavailable=True)
 
 
-# --- reranker (ESReranker, live .rerank-v1) ---------------------------------------------------
+# --- reranker (ESReranker over a live provider RerankClient) ----------------------------------
 
 
 def test_reranker_reorders_candidates_by_model_score(
     backend: ElasticsearchBackend, mapping: IndexMapping
 ) -> None:
+    api_key = _require_cohere()
     docs = [
         Document(doc_id="c1", fields={"search_text": "a wooden dining table"}),
         Document(doc_id="c2", fields={"search_text": "a comfortable blue velvet sofa"}),
@@ -236,17 +222,18 @@ def test_reranker_reorders_candidates_by_model_score(
     ]
     backend.bulk_index(docs, mapping=mapping)
 
-    reranker = ESReranker(backend.client, backend.index, RERANK_INFERENCE_ID, "search_text")
+    rerank_client = CohereReranker("co-rr", {"api_key": api_key, "model_id": "rerank-v3.5"})
+    reranker = ESReranker(backend.client, backend.index, "search_text", rerank_client)
     # Retrieval order deliberately NOT the relevance order for the query "couch to sit on".
     candidates = [ScoredDoc("c1", 1.0), ScoredDoc("c3", 1.0), ScoredDoc("c2", 1.0)]
     try:
         result = reranker.rerank("a couch to sit on in the living room", candidates)
-    except ApiError as exc:
-        _skip_if_deploy_error(exc)
+    except ProviderError as exc:
+        pytest.skip(f"cohere rerank unavailable (env constraint): {exc}")
 
     assert {doc.doc_id for doc in result} == {"c1", "c2", "c3"}
     # the sofa/couch doc should rank first after reranking
     assert result[0].doc_id == "c2"
-    # scores are model scores (may be negative), sorted DESC
+    # scores are model scores, sorted DESC
     scores = [doc.score for doc in result]
     assert scores == sorted(scores, reverse=True)

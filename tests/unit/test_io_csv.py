@@ -30,7 +30,7 @@ from benchmark.io_csv import (
     write_run_config,
 )
 from benchmark.metrics import Metrics
-from benchmark.models import EmbeddingType, RankedResult, ScoredDoc
+from benchmark.models import RankedResult, ScoredDoc
 from benchmark.stats import ComparisonResult, StatsCfg
 
 TIMESTAMP = "20260101T000000Z"
@@ -214,9 +214,8 @@ def _resolved_config() -> ResolvedConfig:
     services = Services(
         embedders={
             "e5": EmbedderCfg(
-                name="e5", provider="elasticsearch",
-                embedding_type=EmbeddingType.TEXT_EMBEDDING,
-                settings={"model_id": ".multilingual-e5-small"},
+                name="e5", provider="cohere",
+                settings={"model_id": "embed-english-v3.0", "api_key": "co-test"},
             )
         },
         rerankers={
@@ -276,8 +275,9 @@ def test_run_config_round_trips_and_has_section_9_1_fields(tmp_path: Path) -> No
     # Resolved services registry — embedders/rerankers/searchers by name.
     services = loaded["services"]
     assert set(services["embedders"]) == {"e5"}
-    # StrEnum serialized as its string value.
-    assert services["embedders"]["e5"]["embedding_type"] == "text_embedding"
+    # Embedder connector config round-trips (provider + settings; §3.4).
+    assert services["embedders"]["e5"]["provider"] == "cohere"
+    assert services["embedders"]["e5"]["settings"]["model_id"] == "embed-english-v3.0"
     assert set(services["rerankers"]) == {"co-rr"}
     assert set(services["searchers"]) == {"bm25", "semantic_e5"}
 

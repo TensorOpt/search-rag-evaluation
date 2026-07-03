@@ -32,7 +32,6 @@ from benchmark.config import (
 )
 from benchmark.models import (
     Document,
-    EmbeddingType,
     FieldRole,
     FieldSchema,
     FieldSpec,
@@ -101,24 +100,47 @@ class FakeDataset(Dataset):
 
 class FakeBackend:
     """A fake ``SearchBackend`` recording the §3.5 ingest calls (no ES). ``.client``/``.index`` are
-    present so ``eval:index``-style probing works; ``register_inference`` returns the endpoint id.
+    present so ``eval:index``-style probing works. ES is a plain index writer now — no inference
+    registration; the harness embeds the corpus upstream and hands already-embedded documents here.
     """
 
     def __init__(self, indexer_cfg: Any = None) -> None:
         self.index = "fake_index"
-        self.registered: list[str] = []
         self.ensured = False
         self.indexed: list[Document] = []
-
-    def register_inference(self, ep: Any) -> str:
-        self.registered.append(ep.inference_id)
-        return ep.inference_id
 
     def ensure_index(self, mapping: Any) -> None:
         self.ensured = True
 
     def bulk_index(self, docs: Iterable[Document], *, mapping: Any) -> None:
         self.indexed = list(docs)
+
+
+class FakeEmbedder:
+    """A fake embedding connector: fixed-dim canned vectors (no network). ``id``/``dim`` drive the
+    real ``ESIndexer`` mapping; ``embed_documents`` is called at ingest, ``embed_queries`` never here
+    (the FakeFactory's vector leaf is a canned ``FakeSearcher`` that ignores the embedder)."""
+
+    def __init__(self, name: str, dim: int = 3) -> None:
+        self.id = name
+        self._dim = dim
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[float(i)] * self._dim for i, _ in enumerate(texts)]
+
+    def embed_queries(self, texts: Sequence[str]) -> list[list[float]]:
+        return [[0.0] * self._dim for _ in texts]
+
+
+class FakeRerankClient:
+    """A fake rerank connector: canned descending scores aligned to input (no network)."""
+
+    def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]:
+        return [float(len(documents) - i) for i in range(len(documents))]
 
 
 # Canned per-leaf lists: every returned doc is judged so metrics are non-NaN. Lexical and vector
@@ -134,10 +156,10 @@ class FakeFactory:
     def lexical(self, *, fields: Sequence[str]) -> Searcher:
         return FakeSearcher(_LEXICAL_DOCS)
 
-    def vector(self, *, field: str) -> Searcher:
+    def vector(self, *, field: str, embedder_id: str) -> Searcher:
         return FakeSearcher(_VECTOR_DOCS)
 
-    def reranker(self, inference_id: str, field: str) -> Reranker:
+    def reranker(self, name: str, field: str) -> Reranker:
         return FakeReranker()
 
 
@@ -147,10 +169,10 @@ class FakeFactory:
 def _services(*, reranker_top_n: int = 100) -> Services:
     return Services(
         embedders={
-            "e5": EmbedderCfg("e5", "elasticsearch", EmbeddingType.TEXT_EMBEDDING, {"model_id": "e5"})
+            "e5": EmbedderCfg("e5", "cohere", {"api_key": "k", "model_id": "embed-english-v3.0"})
         },
         rerankers={
-            "rr": RerankerCfg("rr", "elasticsearch", {"top_n": reranker_top_n})
+            "rr": RerankerCfg("rr", "cohere", {"api_key": "k", "model_id": "rerank-v3.5", "top_n": reranker_top_n})
         },
         searchers={
             "bm25": SearcherCfg("bm25", "elasticsearch", "lexical", None),
@@ -196,7 +218,15 @@ def patch_runner_factories(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
     monkeypatch.setattr(config, "load_dataset", lambda dataset_cfg: FakeDataset())
     monkeypatch.setattr(config, "make_indexer", lambda indexer_cfg: backend)
     monkeypatch.setattr(config, "make_index_builder", lambda indexer_cfg: ESIndexer())
-    monkeypatch.setattr(config, "make_searcher_factory", lambda indexer_cfg: FakeFactory())
+    # Embedder/reranker connectors are FAKES (no network): the real ESIndexer embeds the corpus with
+    # these at ingest; the FakeFactory's vector leaf is canned, so it ignores the query embedder.
+    monkeypatch.setattr(
+        config, "make_embedders", lambda services: {name: FakeEmbedder(name) for name in services.embedders}
+    )
+    monkeypatch.setattr(
+        config, "make_rerankers", lambda services: {name: FakeRerankClient() for name in services.rerankers}
+    )
+    monkeypatch.setattr(config, "make_searcher_factory", lambda indexer_cfg, **kwargs: FakeFactory())
     return backend
 
 
@@ -257,11 +287,12 @@ def test_run_produces_all_artifacts_baseline_first(
     assert not (tmp_path / f"comparison_bm25_bm25_{ts}.csv").exists()  # baseline not vs itself
     assert (tmp_path / f"run_config_{ts}.json").exists()
 
-    # The ingest seam ran for the one configured embedder FIRST (§3.5 register→ensure→bulk); the
-    # reranker 'rr' registers lazily at R0 for the bm25_rerank variant (§8.0).
-    assert patched_factories.registered == ["e5", "rr"]
+    # The ingest seam ran (ensure_index + streamed bulk_index) and the corpus was embedded at
+    # ingest: every indexed doc carries the embedder's dense_vector field (§3.5). No inference
+    # registration happens (ES is a plain index); the reranker 'rr' is a connector, not registered.
     assert patched_factories.ensured is True
     assert len(patched_factories.indexed) == len(_DOCS)
+    assert all("sem__e5" in doc.fields for doc in patched_factories.indexed)
 
 
 def test_run_result_csv_is_first_written_for_baseline(
@@ -305,13 +336,13 @@ def test_build_index_reuses_single_ingest_path(
     from benchmark.runner import ExperimentRunner
 
     cfg = _config(variants=[], timestamp="20260702T030000Z")
-    dataset, backend, mapping = ExperimentRunner().build_index(cfg)
+    dataset, backend, mapping, embedders = ExperimentRunner().build_index(cfg)
 
     assert isinstance(dataset, FakeDataset)
     assert backend is patched_factories
-    # One semantic_text field per embedder (§5.2); doc _id-keyed ingest happened.
+    # One dense_vector field per embedder (§5.2); doc _id-keyed ingest happened.
     assert mapping.sem_fields == {"e5": "sem__e5"}
-    assert backend.registered == ["e5"]
+    assert set(embedders) == {"e5"}  # the embedder connector registry the runner reuses (§8.0)
     assert backend.ensured is True
 
 
@@ -340,7 +371,7 @@ def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 _DRY_RUN_CONFIG_YAML = """\
 dataset: { name: wands, path: ./dataset/wands }
 services:
-  - embedder: { name: e5, provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: x } }
+  - embedder: { name: e5, provider: cohere, settings: { api_key: x, model_id: x } }
   - searcher: { name: bm25, provider: elasticsearch, kind: lexical }
   - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
 indexer: { provider: elasticsearch, index: wands_bench, settings: { url: "http://localhost:9200" } }

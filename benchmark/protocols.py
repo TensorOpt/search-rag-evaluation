@@ -7,8 +7,9 @@ Two kinds of seam live here:
   composition mirrors a real search pipeline), plus the ``Dataset`` base every dataset adapter
   derives from (§3.2). ``Dataset`` is an ABC (not a Protocol) so it can carry the two shared
   concrete helpers (``build_search_text``, ``map_label``) every adapter reuses.
-- **Structural Protocols** for the rest of the ingest side: ``EmbeddingModel`` (a descriptor),
-  ``Indexer``, and ``SearchBackend`` (the index-writer/ingest seam used by ``Indexer.build``).
+- **Structural Protocols** for the rest of the ingest/inference side: ``Embedder`` and
+  ``RerankClient`` (the provider connectors, realized in ``benchmark.providers``), ``Indexer``, and
+  ``SearchBackend`` (the index-writer/ingest seam used by ``Indexer.build``).
 
 Data models are imported from ``benchmark.models``. Structural Protocols are ``@runtime_checkable``
 so tests can do ``isinstance`` checks (note: that only verifies method presence, not data
@@ -25,8 +26,6 @@ from benchmark.models import (
     FieldRole,
     FieldSchema,
     IndexMapping,
-    InferenceEndpoint,
-    InferenceTaskType,
     Qrel,
     Query,
     ScoredDoc,
@@ -159,34 +158,43 @@ class Dataset(ABC):
 
 
 @runtime_checkable
-class EmbeddingModel(Protocol):
-    """A pluggable embedding model descriptor that flattens to an InferenceEndpoint (§3.4).
+class Embedder(Protocol):
+    """A dense-embedding provider connector (§3.4), realized in ``benchmark.providers``.
 
-    Stays a descriptor (not behavioral): embeddings are registered once at ingest via
-    ``SearchBackend.register_inference`` and then produced by the backend at index time.
-
-    ``inference_id``/``task_type`` are declared read-only (``@property``) so a FROZEN embedder
-    descriptor (``EmbedderCfg`` exposes them as properties over its ``name``/``embedding_type``
-    fields, §3.4) structurally satisfies this Protocol.
+    The harness embeds the corpus at ingest (``embed_documents``) into ``dense_vector`` fields and
+    embeds each query at search time (``embed_queries``) to run ES ``knn``. ``id`` is the config
+    service name (== the sem-field naming key, §3.5); ``dim`` is the output dimensionality (probed
+    once or taken from ``settings.dims``) the ``dense_vector`` mapping needs before ingest.
     """
 
-    @property
-    def inference_id(self) -> str: ...
-    @property
-    def task_type(self) -> InferenceTaskType: ...
+    id: str
 
-    def as_endpoint(self) -> InferenceEndpoint: ...
+    @property
+    def dim(self) -> int: ...
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]: ...
+    def embed_queries(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+
+@runtime_checkable
+class RerankClient(Protocol):
+    """A rerank provider connector (§3.4/§5.4), realized in ``benchmark.providers``.
+
+    Returns one relevance score per document, ALIGNED 1:1 to ``documents`` (higher = more relevant).
+    A backend ``Reranker`` (ES ``ESReranker``) fetches candidate doc-text and calls this over it.
+    """
+
+    def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]: ...
 
 
 @runtime_checkable
 class Indexer(Protocol):
-    """Builds a backend index from a dataset + embedding models (§3.5)."""
+    """Builds a backend index from a dataset + embedder connectors (§3.5)."""
 
     def build(
         self,
         dataset: Dataset,
         backend: SearchBackend,
-        embeddings: Sequence[EmbeddingModel],
+        embeddings: Sequence[Embedder],
     ) -> IndexMapping: ...
 
 
@@ -194,15 +202,15 @@ class Indexer(Protocol):
 class SearchBackend(Protocol):
     """The index-writer / ingest seam used by ``Indexer.build`` (§3.3/§3.5).
 
-    This is the only place that knows a wire format for WRITING: it registers inference
-    endpoints, creates the index mapping, and bulk-indexes documents (ES embeds each
-    ``semantic_text`` field at ingest). RETRIEVAL is no longer here — it moved to the
-    ``Searcher`` / ``Fuser`` / ``Reranker`` composite model (§3.3/§3.6); a backend realizes
-    those as concrete ``Searcher``/``Reranker`` implementations (e.g. ES ``LexicalSearcher`` /
-    ``VectorSearch`` / ``ESReranker`` in Phase 9/10).
+    This is the only place that knows a wire format for WRITING: it creates the index mapping and
+    bulk-indexes documents. ES is a plain index writer now — the harness embeds the corpus
+    client-side (``Embedder``) and stores the vectors in ``dense_vector`` fields; no inference runs
+    server-side. RETRIEVAL is no longer here — it moved to the ``Searcher`` / ``Fuser`` /
+    ``Reranker`` composite model (§3.3/§3.6); a backend realizes those as concrete
+    ``Searcher``/``Reranker`` implementations (e.g. ES ``LexicalSearcher`` / ``VectorSearch`` /
+    ``ESReranker`` in Phase 9/10).
     """
 
-    def register_inference(self, ep: InferenceEndpoint) -> str: ...
     def ensure_index(self, mapping: IndexMapping) -> None: ...
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None: ...
 
@@ -217,5 +225,5 @@ class SearcherFactory(Protocol):
     """
 
     def lexical(self, *, fields: Sequence[str]) -> Searcher: ...
-    def vector(self, *, field: str) -> Searcher: ...
-    def reranker(self, inference_id: str, field: str) -> Reranker: ...
+    def vector(self, *, field: str, embedder_id: str) -> Searcher: ...
+    def reranker(self, name: str, field: str) -> Reranker: ...

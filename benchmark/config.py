@@ -11,13 +11,14 @@ This module is the whole configuration layer. It holds:
 - The loader: parses the explicit §10 YAML (``dataset`` / ``services`` / ``indexer`` / ``pipelines`` /
   ``stats`` / ``cutoff`` / ``top_k``), substitutes whole-value ``${VAR}`` environment placeholders at
   load (secrets never live in the file), validates it, and resolves it into a :class:`ResolvedConfig`.
-  Embedders flatten to embedding ``InferenceEndpoint``s (§3.4/§3.5); rerankers flatten to ``rerank``
-  endpoints (``task_settings.top_n``) the runner registers lazily at R0 and hands to the ES
-  ``searcher_factory``.
-- The lazy factories ``load_dataset`` / ``make_indexer`` / ``make_searcher_factory``, which dispatch on
-  ``dataset.name`` / ``indexer.provider`` to a dotted-path target. They do NOT import the adapter at
-  this phase (offline); the live import + construct is deferred to Phase 11. An unknown name/provider
-  raises.
+  Embedders/rerankers are provider connectors (Cohere/Voyage/OpenAI, §3.4): the config validates the
+  ``provider`` offline (no network) and the runner instantiates them lazily via :func:`make_embedders`
+  / :func:`make_rerankers`.
+- The lazy factories ``load_dataset`` / ``make_indexer`` / ``make_searcher_factory`` /
+  ``make_embedders`` / ``make_rerankers``, which dispatch on ``dataset.name`` / ``indexer.provider`` /
+  the connector ``provider`` to a dotted-path target. They do NOT import the adapter or
+  ``benchmark.providers`` at import time (offline, §11); the live import + construct resolves at CALL
+  time. An unknown name/provider raises.
 
 Imports ``benchmark.models`` / ``benchmark.protocols`` / ``benchmark.stats`` / ``benchmark.pipeline``
 (the composers, for :func:`build_pipeline` — a one-way wiring edge, §11) + pyyaml + stdlib. It NEVER
@@ -36,24 +37,19 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from benchmark.logging_setup import get_logger
-from benchmark.models import (
-    EmbeddingType,
-    IndexMapping,
-    InferenceEndpoint,
-    InferenceTaskType,
-)
+from benchmark.models import IndexMapping
 from benchmark.pipeline import HybridSearch, RRFFuser, SearchPipeline
 from benchmark.protocols import Searcher, SearcherFactory
 from benchmark.stats import StatsCfg
 
 logger = get_logger(__name__)
 
-#: Maps an embedder's :class:`EmbeddingType` to the ``_inference`` wire :class:`InferenceTaskType`.
-#: Exhaustive over ``EmbeddingType`` — a reranker sets ``RERANK`` implicitly (not via this map).
-_EMBEDDING_TASK_TYPE: Mapping[EmbeddingType, InferenceTaskType] = {
-    EmbeddingType.TEXT_EMBEDDING: InferenceTaskType.TEXT_EMBEDDING,
-    EmbeddingType.SPARSE_EMBEDDING: InferenceTaskType.SPARSE_EMBEDDING,
-}
+#: Valid embedder/reranker connector providers (§3.4). These MIRROR ``benchmark.providers``
+#: (``EMBEDDER_PROVIDERS`` / ``RERANKER_PROVIDERS`` there are the source of truth); duplicated here so
+#: config validation stays offline (no ``benchmark.providers`` import at config time, §11). OpenAI is
+#: deliberately absent from rerankers — it has no reranker.
+_EMBEDDER_PROVIDERS = ("cohere", "voyage", "openai")
+_RERANKER_PROVIDERS = ("cohere", "voyage")
 
 #: ``${VAR}`` env placeholder (§10). Whole-value only — secrets are always their own scalar.
 _ENV_PLACEHOLDER = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -88,60 +84,31 @@ _FUSER_TYPES = ("rrf",)
 class EmbedderCfg:
     """A named embedder service (§10 ``services`` block).
 
-    ``name`` is the config-local reference; ``provider`` selects the backend adapter; ``settings``
-    carries provider-specific knobs (``model_id``, ``api_key`` …). ``embedding_type`` is the narrow
-    embedding-only :class:`EmbeddingType` (never rerank). It flattens to an embedding
-    ``InferenceEndpoint`` (``inference_id = name``) the indexer registers at ingest (§3.4/§3.5).
+    ``name`` is the config-local reference (== the embedder id used for sem-field naming, §3.5);
+    ``provider`` selects the connector (``cohere`` / ``voyage`` / ``openai``, §3.4); ``settings``
+    carries connector knobs (``model_id``, ``api_key``, ``rate_limit`` …). The runner instantiates
+    the connector lazily via :func:`make_embedders`.
     """
 
     name: str
     provider: str
-    embedding_type: EmbeddingType
     settings: Mapping[str, Any]
-
-    @property
-    def inference_id(self) -> str:
-        """The wire inference id (== ``name``) — so ``EmbedderCfg`` satisfies ``EmbeddingModel`` (§3.4)."""
-        return self.name
-
-    @property
-    def task_type(self) -> InferenceTaskType:
-        """The ``_inference`` wire task type — so ``EmbedderCfg`` satisfies ``EmbeddingModel`` (§3.4)."""
-        return _EMBEDDING_TASK_TYPE[self.embedding_type]
-
-    def as_endpoint(self) -> InferenceEndpoint:
-        return InferenceEndpoint(
-            inference_id=self.inference_id,
-            task_type=self.task_type,
-            service=self.provider,
-            service_settings=dict(self.settings),
-        )
 
 
 @dataclass(frozen=True)
 class RerankerCfg:
     """A named reranker service (§10 ``services`` block).
 
-    Flattens to a ``rerank`` ``InferenceEndpoint`` (``top_n`` is a ``task_settings`` key, §3.4/§5.3)
-    the runner registers lazily at R0 and hands to the ES ``searcher_factory`` to build an
-    ``ESReranker`` (``Reranker`` is a behavioral ABC realized by the backend, not a descriptor). A
-    reranker carries NO task type — the ``rerank`` task is implied.
+    ``provider`` selects the rerank connector (``cohere`` / ``voyage`` — OpenAI has no reranker,
+    §3.4); ``settings`` carries connector knobs plus ``top_n`` (the §5.3 W <= top_n cap the runner
+    reads at R0). The runner instantiates the connector lazily via :func:`make_rerankers` and hands
+    it to the ES ``searcher_factory`` to build an ``ESReranker`` (``Reranker`` is a behavioral ABC
+    realized by the backend).
     """
 
     name: str
     provider: str
     settings: Mapping[str, Any]
-
-    def as_endpoint(self) -> InferenceEndpoint:
-        settings = dict(self.settings)
-        top_n = settings.pop("top_n", None)
-        return InferenceEndpoint(
-            inference_id=self.name,
-            task_type=InferenceTaskType.RERANK,
-            service=self.provider,
-            service_settings=settings,
-            task_settings={} if top_n is None else {"top_n": top_n},
-        )
 
 
 @dataclass(frozen=True)
@@ -258,7 +225,7 @@ def build_pipeline(
 
     Each retriever name resolves to its :class:`SearcherCfg` in ``services``; a lexical searcher
     becomes ``factory.lexical(fields=[mapping.search_text_field])`` and a vector searcher becomes
-    ``factory.vector(field=mapping.sem_field(embedder_name))``. With a ``fuser`` the leaves are
+    ``factory.vector(field=mapping.sem_field(embedder_name), embedder_id=embedder_name)``. With a ``fuser`` the leaves are
     wrapped in a ``HybridSearch`` (RRF at ``fuser.rank_constant``, window ``fuser.window``); without
     one, exactly one leaf is expected (else ``ValueError``). A ``reranker`` wraps the retriever in a
     ``SearchPipeline`` with a rerank pass at ``rerank_window_size``; else a bare pass-through pipeline.
@@ -311,7 +278,9 @@ def _build_leaf(
         if searcher.embedder is None:
             raise ValueError(f"vector searcher {searcher.name!r} has no embedder reference")
         embedder: EmbedderCfg = services.embedder(searcher.embedder)
-        return factory.vector(field=mapping.sem_field(embedder.name))
+        return factory.vector(
+            field=mapping.sem_field(embedder.name), embedder_id=embedder.name
+        )
     raise ValueError(
         f"searcher {searcher.name!r} has unknown kind {searcher.kind!r}; expected 'lexical' or 'vector'"
     )
@@ -424,9 +393,16 @@ def _resolve_services(entries: Any) -> Services:
             embedders[name] = _resolve_embedder(body)
         elif kind == "reranker":
             _reject_duplicate(name, embedders, rerankers, searchers)
+            provider = _require(body, "provider", f"reranker {name!r}")
+            if provider not in _RERANKER_PROVIDERS:
+                extra = " (openai has no reranker)" if provider == "openai" else ""
+                raise ConfigError(
+                    f"reranker {name!r}: unknown provider {provider!r}; "
+                    f"expected one of {list(_RERANKER_PROVIDERS)}{extra}"
+                )
             rerankers[name] = RerankerCfg(
                 name=name,
-                provider=_require(body, "provider", f"reranker {name!r}"),
+                provider=provider,
                 settings=dict(_require(body, "settings", f"reranker {name!r}")),
             )
         elif kind == "searcher":
@@ -449,18 +425,15 @@ def _reject_duplicate(
 
 def _resolve_embedder(body: Mapping[str, Any]) -> EmbedderCfg:
     name = body["name"]
-    embedding_type_raw = body.get("embedding_type", "text_embedding")
-    try:
-        embedding_type = EmbeddingType(embedding_type_raw)
-    except ValueError:
+    provider = _require(body, "provider", f"embedder {name!r}")
+    if provider not in _EMBEDDER_PROVIDERS:
         raise ConfigError(
-            f"embedder {name!r}: unknown embedding_type {embedding_type_raw!r}; "
-            f"expected one of {[t.value for t in EmbeddingType]}"
+            f"embedder {name!r}: unknown provider {provider!r}; "
+            f"expected one of {list(_EMBEDDER_PROVIDERS)}"
         )
     return EmbedderCfg(
         name=name,
-        provider=_require(body, "provider", f"embedder {name!r}"),
-        embedding_type=embedding_type,
+        provider=provider,
         settings=dict(_require(body, "settings", f"embedder {name!r}")),
     )
 
@@ -657,8 +630,8 @@ def make_index_builder(indexer_cfg: Mapping[str, Any]) -> Any:
 
     Mirrors :func:`make_indexer`/:func:`make_searcher_factory`: resolves the dotted target at CALL
     time so ``config`` imports no adapter at import time. The returned object exposes
-    ``build(dataset, backend, embedders) -> IndexMapping`` — the single register→ensure→bulk path
-    the runner drives (so the backend is swappable via config alone, §1.4(3)).
+    ``build(dataset, backend, embedders) -> IndexMapping`` — the single ensure_index→embed-corpus→
+    bulk_index path the runner drives (so the backend is swappable via config alone, §1.4(3)).
     """
     provider = _require(indexer_cfg, "provider", "indexer")
     target = INDEX_BUILDER_TARGETS.get(provider)
@@ -678,3 +651,24 @@ def make_searcher_factory(indexer_cfg: Mapping[str, Any], *args: Any, **kwargs: 
             f"unknown indexer provider {provider!r}; known: {sorted(SEARCHER_FACTORY_TARGETS)}"
         )
     return _resolve_target(target)(indexer_cfg, *args, **kwargs)
+
+
+def make_embedders(services: Services) -> dict[str, Any]:
+    """Instantiate every configured embedder connector, keyed by service name (§3.4).
+
+    ``benchmark.providers`` is resolved at CALL time (not imported at config-module import time, §11)
+    so config validation stays offline. Returns ``{name: Embedder}``; the provider was validated
+    against ``_EMBEDDER_PROVIDERS`` at config load.
+    """
+    make = _resolve_target("benchmark.providers:make_embedder")
+    return {name: make(cfg.name, cfg.provider, cfg.settings) for name, cfg in services.embedders.items()}
+
+
+def make_rerankers(services: Services) -> dict[str, Any]:
+    """Instantiate every configured rerank connector, keyed by service name (§3.4/§5.4).
+
+    Resolves ``benchmark.providers`` at CALL time (§11). Returns ``{name: RerankClient}``; the
+    provider was validated against ``_RERANKER_PROVIDERS`` at config load.
+    """
+    make = _resolve_target("benchmark.providers:make_reranker")
+    return {name: make(cfg.name, cfg.provider, cfg.settings) for name, cfg in services.rerankers.items()}

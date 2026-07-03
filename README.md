@@ -1,6 +1,6 @@
 # Search-Relevance Benchmark
 
-A reproducible harness for measuring how much different retrieval strategies improve search relevance over a **BM25 baseline**, on a fixed dataset and qrel set. It indexes documents into ElasticSearch, runs each variant (semantic, hybrid + RRF, and reranked combinations) through **one shared pipeline**, scores them with graded relevance metrics (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`), and emits per-run CSV artifacts plus a paired statistical comparison against the baseline. The first concrete instantiation uses **WANDS** (Wayfair ANnotation Dataset for Search) on ElasticSearch **>= 8.15**, driven through native `_inference` endpoints and retrievers.
+A reproducible harness for measuring how much different retrieval strategies improve search relevance over a **BM25 baseline**, on a fixed dataset and qrel set. It indexes documents into ElasticSearch, runs each variant (semantic, hybrid + RRF, and reranked combinations) through **one shared pipeline**, scores them with graded relevance metrics (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`), and emits per-run CSV artifacts plus a paired statistical comparison against the baseline. The first concrete instantiation uses **WANDS** (Wayfair ANnotation Dataset for Search) on ElasticSearch **>= 8.15**, used as a **plain vector + BM25 index**: the harness embeds the corpus and queries via provider connectors (Cohere / Voyage / OpenAI) and retrieves with BM25 `match` + `knn` over `dense_vector` fields.
 
 This README is the operational guide for **running the evals**. For the full experimental design — abstractions, metric definitions, statistics, and the DRY single-execution-path argument — read [`docs/experiment.md`](docs/experiment.md). Where this guide and the design doc differ on a name, the design doc wins.
 
@@ -23,14 +23,14 @@ hatch run eval:wait-for-es   # blocks until cluster health is yellow/green
 
 # 3. Configure inference provider keys (only those you actually use)
 export ES_URL=http://localhost:9200
-export OPENAI_KEY=sk-...        # if using an OpenAI embedding model
-export COHERE_KEY=...           # if using a Cohere reranker
-export HF_KEY=... HF_URL=...    # if using a HuggingFace-hosted model
+export COHERE_KEY=...           # Cohere embedder / reranker
+export VOYAGE_KEY=...           # Voyage embedder / reranker
+export OPENAI_KEY=sk-...        # OpenAI embedder (no reranker)
 
 # 4. Provision the dataset into dataset/wands/  (see "Dataset" below)
 hatch run eval:fetch-data       # downloads query.csv / product.csv / label.csv
 
-# 5. Register embedding endpoints + build the index
+# 5. Embed the corpus + build the index
 hatch run eval:index
 
 # 6. Run the full experiment matrix (baseline + 5 variants)
@@ -69,9 +69,9 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 - **Docker + Docker Compose** (Compose v2, the `docker compose` subcommand).
 - **Python 3.11+**.
 - **[Hatch](https://hatch.pypa.io)** for environment + script management (`pipx install hatch`).
-- **~8 GB free RAM** recommended for a comfortable single-node ES. The compose file pins the JVM heap (default `-Xms2g -Xmx2g`); raise it for large corpora. Local semantic models (ELSER/E5) need additional headroom.
-- **ElasticSearch >= 8.15** — a hard floor. The default semantic path (`VectorSearch`) emits the explicit `semantic` query, which ES exposes from 8.15; the floor is a hard version pin, not a runtime capability probe. The compose file ships a compatible image; do not downgrade it.
-- API keys for any **external** inference providers you enable (OpenAI, Cohere, HuggingFace). Local-only runs (ELSER + E5) need none.
+- **~8 GB free RAM** recommended for a comfortable single-node ES. The compose file pins the JVM heap (default `-Xms2g -Xmx2g`); raise it for large corpora. ES stores + searches vectors only — embeddings are computed by the provider, so no ES ML-node memory is required.
+- **ElasticSearch >= 8.15** — ES is a plain vector + BM25 index (`dense_vector` + `knn`, available in ES well before 8.15). The `>= 8.15` pin matches the shipped `elasticsearch` client; it is a convenience version pin, not a hard feature floor. The compose file ships a compatible image.
+- API keys for the **inference providers** you enable — Cohere, Voyage, and/or OpenAI (see the env-var table below). Every embedder and reranker is an external provider connector; there are no local models.
 
 ---
 
@@ -80,8 +80,9 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 ```
 .
 ├── benchmark/                 # the harness package
-│   ├── models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, InferenceEndpoint
-│   ├── protocols.py           # Searcher/Fuser/Reranker + Dataset ABCs; EmbeddingModel, Indexer, SearchBackend, SearcherFactory
+│   ├── models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, IndexMapping
+│   ├── protocols.py           # Searcher/Fuser/Reranker + Dataset ABCs; Embedder, RerankClient, Indexer, SearchBackend, SearcherFactory
+│   ├── providers.py           # provider connectors: OpenAI/Cohere/Voyage embedders + Cohere/Voyage rerankers (stdlib-HTTP)
 │   ├── pipeline.py            # RRFFuser, HybridSearch, SearchPipeline (the composers)
 │   ├── fusion.py              # fuse_rrf_local (client-side RRF, windowed)
 │   ├── rerank.py              # rerank_local (client-side score+reorder helper, windowed)
@@ -151,40 +152,37 @@ A single-node cluster reports **yellow** (replicas unassigned), which is expecte
 - **Heap / OOM** — if ES is killed at startup, give Docker more memory or lower the heap. The heap is pinned in compose (`ES_JAVA_OPTS=-Xms2g -Xmx2g`); set both `-Xms` and `-Xmx` to the same value.
 - **Port already in use** — something else is on `9200`; stop it or change the published port in compose and `ES_URL`.
 
-### Configure inference endpoints
+### Configure provider connectors
 
-Embedding and reranker models are **inference endpoints** in ES (`PUT _inference/{task_type}/{inference_id}`). You declare them in `config.yaml`; secrets are injected from environment variables at registration time. Provider auth is **provider-agnostic** — `service_settings` carries identity/auth, `task_settings` carries per-task knobs (notably the reranker `top_n`).
+Embedding and reranker models are **provider connectors** (`benchmark/providers.py`): the harness calls Cohere / Voyage / OpenAI directly over HTTP — ES runs no inference. You declare each as a `services` entry in `config.yaml`; secrets are injected from environment variables at load time. A connector is just a `provider` + a `settings` block (`api_key`, `model_id`, optional `rate_limit.requests_per_minute`, `batch_size`, `dims`). **OpenAI has no reranker** — a `reranker` with `provider: openai` is rejected at load.
 
 Set only the variables for providers you actually use:
 
 ```bash
 export ES_URL=http://localhost:9200
 
-# External providers (skip any you don't use):
-export OPENAI_KEY=sk-...          # OpenAI text-embedding-3-small
-export COHERE_KEY=...             # Cohere rerank-v3.5
-export HF_KEY=...                 # HuggingFace-hosted model (e.g. a BGE reranker)
-export HF_URL=https://...
+# Inference providers (skip any you don't use):
+export COHERE_KEY=...             # Cohere embedder (embed-english-v3.0) + reranker (rerank-v3.5)
+export VOYAGE_KEY=...             # Voyage embedder (voyage-3.5) + reranker (rerank-2.5)
+export OPENAI_KEY=sk-...          # OpenAI embedder (text-embedding-3-small); no reranker
 ```
 
-Concrete provider shapes, as they appear in `config.yaml` under `services`:
+Concrete connector shapes, as they appear in `config.yaml` under `services`:
 
 ```yaml
 services:
-  # Local embedder, no API key — uses ES's own inference service:
-  - embedder: { name: e5, provider: elasticsearch, settings: { model_id: .multilingual-e5-small } }
-  # External embedder — auth via env var:
+  # Embedder — auth via env var; the harness embeds the corpus into a dense_vector field:
   - embedder: { name: cohere, provider: cohere,
       settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
-  # Reranker — top_n (the rank-window cap) is a task setting, carried in settings:
+  # Reranker — top_n (the rank-window cap) is a plain settings key:
   - reranker: { name: co-rr, provider: cohere,
       settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
   # Searchers reference the services above by name:
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
-  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
+  - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
 ```
 
-Embedder endpoints are registered **before** the index is built (a `semantic_text` field cannot be mapped before its `inference_id` exists). Reranker endpoints are registered lazily, just before each rerank pipeline runs; the harness sets `top_n >= rerank_window_size` at registration and asserts it before running. ELSER/E5 may take a moment to download on first registration.
+The harness embeds the whole corpus with each configured embedder **before** searching — one `dense_vector` field per embedder (see §5.2 of the design doc). Rerankers need no setup: `ESReranker` calls the provider connector per query, and the harness asserts `rerank_window_size <= settings.top_n` before running each rerank pipeline.
 
 ---
 
@@ -217,13 +215,13 @@ Note that the raw `label.csv` stores the **string** label (`Exact` / `Partial` /
 
 ## Build the index
 
-This registers each embedding model's inference endpoint, creates the index mapping (one `semantic_text` field per embedding model, populated via `copy_to` from `search_text`), and bulk-indexes the documents (ES embeds each `semantic_text` field at ingest).
+This creates the index mapping (a `text` `search_text` field + one `dense_vector` field per embedder), embeds the corpus **client-side** with each configured embedder connector, and bulk-indexes the documents with their vectors attached (ES stores the vectors; it computes none).
 
 ```bash
 hatch run eval:index
 ```
 
-Indexing is idempotent (`_id = product_id`), so re-running is safe. Adding a new embedding model later requires a reindex (the new `semantic_text` field must be embedded for the whole corpus).
+Indexing is idempotent (`_id = product_id`), so re-running is safe. Adding a new embedder later requires a reindex (its `dense_vector` field must be embedded for the whole corpus).
 
 ---
 
@@ -237,7 +235,7 @@ This drives the entire `ExperimentRunner` path from `config.yaml`:
 
 1. Loads the dataset, builds (or reuses) the index, freezes the shared query set.
 2. Reads the explicit pipelines from config, **baseline first**.
-3. For each pipeline: registers the reranker endpoint if needed, builds the `SearchPipeline` graph (`build_pipeline`), runs it over all queries, writes the result CSV, scores it, writes the metrics CSV.
+3. For each pipeline: (for a rerank pipeline) asserts `rerank_window_size <= settings.top_n`, builds the `SearchPipeline` graph (`build_pipeline`), runs it over all queries, writes the result CSV, scores it, writes the metrics CSV.
 4. Compares every named variant against the baseline on the identical query set and writes the comparison CSV.
 5. Serializes the fully-resolved config + seed to `run_config_{timestamp}.json`.
 
@@ -313,13 +311,13 @@ The config lives in `config.yaml` (YAML or JSON). It declares **explicit, named 
 dataset:
   name: wands
   path: ./dataset/wands
-services:                       # named, typed, reusable building blocks
-  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-  - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
-  - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
+services:                       # named, typed, reusable building blocks (embedders/rerankers are provider connectors)
+  - embedder: { name: cohere, provider: cohere, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
+  - embedder: { name: voyage, provider: voyage, settings: { api_key: ${VOYAGE_KEY}, model_id: voyage-3.5 } }
+  - reranker: { name: co-rr,  provider: cohere, settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
-  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
+  - searcher: { name: semantic_vo, provider: elasticsearch, kind: vector, embedder: voyage }
 indexer:
   provider: elasticsearch
   index: wands_bench
@@ -328,17 +326,17 @@ pipelines:
   baseline:                      # the reference every variant is compared against
     retriever: bm25
   variants:                      # each is one explicit run; the map key is its id
-    semantic_e5:   { retriever: semantic_e5 }
     semantic_co:   { retriever: semantic_co }
-    hybrid_e5_k60:
-      retrievers: [bm25, semantic_e5]
+    semantic_vo:   { retriever: semantic_vo }
+    hybrid_co_k60:
+      retrievers: [bm25, semantic_co]
       fuser: { type: rrf, rank_constant: 60, window: 100 }
     bm25_rerank:
       retriever: bm25
       reranker: co-rr
       rerank_window_size: 100
-    hybrid_e5_rerank:
-      retrievers: [bm25, semantic_e5]
+    hybrid_co_rerank:
+      retrievers: [bm25, semantic_co]
       fuser: { type: rrf, rank_constant: 60, window: 100 }
       reranker: co-rr
       rerank_window_size: 100
@@ -366,9 +364,9 @@ top_k: 100                       # results retrieved per query
 | Variable | Purpose |
 |----------|---------|
 | `ES_URL` | ElasticSearch endpoint (e.g. `http://localhost:9200`). |
-| `OPENAI_KEY` | API key for an OpenAI embedding endpoint. |
-| `COHERE_KEY` | API key for a Cohere embedder/reranker. |
-| `HF_KEY`, `HF_URL` | Auth + endpoint URL for a HuggingFace-hosted model. |
+| `COHERE_KEY` | API key for the Cohere embedder / reranker. |
+| `VOYAGE_KEY` | API key for the Voyage embedder / reranker. |
+| `OPENAI_KEY` | API key for the OpenAI embedder (OpenAI has no reranker). |
 
 Keys are referenced via `${VAR}` in `config.yaml` and resolved at load time — secrets never live in the config file. A reranker's `top_n` must be `>= rerank_window_size`.
 
@@ -378,11 +376,11 @@ Keys are referenced via `${VAR}` in `config.yaml` and resolved at load time — 
 
 - **ES won't start / `vm.max_map_count` error** — raise it: `sudo sysctl -w vm.max_map_count=262144` (Linux), or via the Docker VM on Desktop. See the compose section above.
 - **ES killed at startup / OOM** — give Docker more RAM, or lower `ES_JAVA_OPTS` heap in `docker-compose.yml` (set `-Xms` and `-Xmx` equal).
-- **Mapping rejects `semantic_text` / `semantic` query unsupported** — your ES is below 8.15. The 8.15 floor is hard; upgrade the image. `VectorSearch` emits the explicit `semantic` query directly, so ES must support it.
-- **Inference endpoint auth failures (401/403)** — the relevant provider env var is unset or wrong. Confirm `OPENAI_KEY` / `COHERE_KEY` / `HF_KEY`/`HF_URL` are exported in the shell that runs `hatch run eval:*`, and that the `inference_id`/`model_id` in `config.yaml` match the provider.
-- **`W <= top_n` assertion fails before a rerank variant** — a reranker's `task_settings.top_n` is smaller than the pipeline's `rerank_window_size`. Raise `top_n` (it is a `task_settings` key, not `service_settings`).
+- **Mapping rejects `dense_vector` / `knn` unsupported** — your ES is very old; upgrade the image (`dense_vector` + `knn` predate the `>= 8.15` pin). `VectorSearch` embeds the query and issues a `knn` query, so ES must support `dense_vector`.
+- **Provider auth failures (401/403)** — the relevant provider env var is unset or wrong. Confirm `COHERE_KEY` / `VOYAGE_KEY` / `OPENAI_KEY` are exported in the shell that runs `hatch run eval:*`, and that the `model_id` in `config.yaml` matches the provider. A failed call raises a `ProviderError` carrying the provider, HTTP status, and raw body.
+- **`W <= top_n` assertion fails before a rerank variant** — a reranker's `settings.top_n` is smaller than the pipeline's `rerank_window_size`. Raise `settings.top_n` (the number of candidates the provider scores per request).
 - **Empty results / all-zero metrics** — usually the index is empty or the wrong index name. Re-run `hatch run eval:index`, confirm `dataset/wands/` is populated, and check `indexer.index` in `config.yaml`. Verify doc count: `curl -s "$ES_URL/wands_bench/_count"`.
-- **First semantic run is slow** — local ELSER/E5 models download and warm up on first registration; subsequent runs are fast.
+- **First run is slow / rate-limited** — `eval:index` embeds the whole corpus through the provider, so a large corpus is many calls (bounded by `settings.rate_limit.requests_per_minute`); a `429` is retried with backoff automatically.
 
 ---
 

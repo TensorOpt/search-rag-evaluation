@@ -1,12 +1,12 @@
-"""Offline unit tests for the ES adapter — the ES client is MOCKED (no network).
+"""Offline unit tests for the ES adapter — the ES client + provider connectors are FAKES (no network).
 
-Covers the whole ES adapter surface: the ingest seam (``register_inference``/``ensure_index``/
-``bulk_index``); the searchers — ``LexicalSearcher``'s match body and ``VectorSearch``'s semantic
-body, both over the shared ``_search``/``_msearch`` helpers' client-side score-desc/doc_id-asc
-tie-break; ``ESReranker`` (``mget`` doc-text + ``_inference`` rerank parsed BY ``index`` +
-``rerank_local`` reorder); ``ESIndexer.build`` (register→ensure→index order, ``copy_to`` + dot-free
-sem fields); the ``make_searcher_factory`` builders; and a client-side ``HybridSearch`` ==
-``fuse_rrf_local`` cross-check. See docs/experiment.md §3.3-§3.7, §5.
+ES is a plain vector/BM25 index (§1.1): no ``_inference``/``semantic_text``. Covers the ingest seam
+(``ensure_index`` / streamed ``bulk_index``); the searchers — ``LexicalSearcher``'s ``match`` body and
+``VectorSearch``'s embed-query + ``knn`` body, both over the shared ``_search``/``_msearch`` helpers'
+client-side score-desc/doc_id-asc tie-break; ``ESReranker`` (``mget`` doc-text + a provider
+``RerankClient`` + ``rerank_local`` reorder); ``ESIndexer.build`` (dense_vector mapping, dot-free sem
+fields, embed-at-ingest); the ``make_searcher_factory`` builders; and a client-side ``HybridSearch``
+== ``fuse_rrf_local`` cross-check. See docs/experiment.md §3.3-§3.7, §5.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from elasticsearch import NotFoundError
 from elasticsearch.helpers import BulkIndexError
 
 from benchmark.backends import elasticsearch as es
@@ -26,8 +25,6 @@ from benchmark.models import (
     FieldSchema,
     FieldSpec,
     IndexMapping,
-    InferenceEndpoint,
-    InferenceTaskType,
     ScoredDoc,
 )
 from benchmark.pipeline import HybridSearch, RRFFuser
@@ -36,15 +33,9 @@ from benchmark.protocols import Dataset, Searcher
 INDEXER_CFG = {"index": "wands_bench", "settings": {"url": "http://localhost:9200"}}
 
 
-def _not_found() -> NotFoundError:
-    """A minimal ``NotFoundError`` for the ``inference.get`` idempotency probe."""
-    return NotFoundError("not found", meta=MagicMock(status=404), body={})
-
-
 def _fake_client() -> MagicMock:
-    """A MagicMock ES client with the ``inference`` / ``indices`` sub-clients tests touch."""
+    """A MagicMock ES client with the ``indices`` sub-client tests touch."""
     client = MagicMock()
-    client.inference = MagicMock()
     client.indices = MagicMock()
     return client
 
@@ -55,71 +46,50 @@ def _backend_with(client: MagicMock) -> es.ElasticsearchBackend:
     backend.index = INDEXER_CFG["index"]
     backend.client = client
     backend.bulk_chunk_size = es._BULK_CHUNK_SIZE
+    backend.embed_batch_size = es._EMBED_BATCH_SIZE
     return backend
 
 
-# --- register_inference -----------------------------------------------------------------------
+# --- fake provider connectors -----------------------------------------------------------------
 
 
-def test_register_inference_emits_separate_service_and_task_settings() -> None:
-    client = _fake_client()
-    client.inference.get.side_effect = _not_found()  # endpoint absent -> create it
-    backend = _backend_with(client)
+class _FakeEmbedder:
+    """A fake ``Embedder``: fixed-``dim`` canned vectors; records the texts it embedded (no network).
 
-    ep = InferenceEndpoint(
-        inference_id="cohere-rerank",
-        task_type=InferenceTaskType.RERANK,
-        service="cohere",
-        service_settings={"api_key": "k", "model_id": "rerank-v3"},
-        task_settings={"top_n": 100},
-    )
-    returned = backend.register_inference(ep)
+    ``embed_queries`` returns a constant vector per input so the ``knn`` body is assertable;
+    ``embed_documents`` returns a per-index vector so a doc's stored vector is identifiable.
+    """
 
-    assert returned == "cohere-rerank"
-    client.inference.put.assert_called_once()
-    kwargs = client.inference.put.call_args.kwargs
-    assert kwargs["task_type"] == "rerank"
-    assert kwargs["inference_id"] == "cohere-rerank"
-    body = kwargs["body"]
-    # service / service_settings / task_settings stay SEPARATE maps (§3.4).
-    assert body["service"] == "cohere"
-    assert body["service_settings"] == {"api_key": "k", "model_id": "rerank-v3"}
-    assert body["task_settings"] == {"top_n": 100}
+    def __init__(self, embedder_id: str, dim: int = 3, query_vector: list[float] | None = None) -> None:
+        self.id = embedder_id
+        self._dim = dim
+        self._query_vector = query_vector if query_vector is not None else [1.0, 2.0, 3.0]
+        self.doc_batches: list[list[str]] = []
+        self.query_batches: list[list[str]] = []
 
+    @property
+    def dim(self) -> int:
+        return self._dim
 
-def test_register_inference_omits_empty_task_settings() -> None:
-    client = _fake_client()
-    client.inference.get.side_effect = _not_found()
-    backend = _backend_with(client)
+    def embed_documents(self, texts: Any) -> list[list[float]]:
+        self.doc_batches.append(list(texts))
+        return [[float(i)] * self._dim for i, _ in enumerate(texts)]
 
-    ep = InferenceEndpoint(
-        inference_id="e5-small",
-        task_type=InferenceTaskType.TEXT_EMBEDDING,
-        service="elasticsearch",
-        service_settings={"model_id": ".multilingual-e5-small"},
-    )
-    backend.register_inference(ep)
-
-    body = client.inference.put.call_args.kwargs["body"]
-    assert "task_settings" not in body  # empty task_settings omitted
-    assert body["service_settings"] == {"model_id": ".multilingual-e5-small"}
+    def embed_queries(self, texts: Any) -> list[list[float]]:
+        self.query_batches.append(list(texts))
+        return [list(self._query_vector) for _ in texts]
 
 
-def test_register_inference_idempotent_when_endpoint_exists() -> None:
-    client = _fake_client()
-    client.inference.get.return_value = {"endpoints": [{"inference_id": "e5-small"}]}
-    backend = _backend_with(client)
+class _FakeRerankClient:
+    """A fake ``RerankClient`` returning canned scores aligned to input; records its calls."""
 
-    ep = InferenceEndpoint(
-        inference_id="e5-small",
-        task_type=InferenceTaskType.TEXT_EMBEDDING,
-        service="elasticsearch",
-        service_settings={"model_id": ".multilingual-e5-small"},
-    )
-    returned = backend.register_inference(ep)
+    def __init__(self, scores: list[float]) -> None:
+        self._scores = scores
+        self.calls: list[tuple[str, list[str]]] = []
 
-    assert returned == "e5-small"
-    client.inference.put.assert_not_called()  # existing endpoint is not recreated
+    def rerank_scores(self, query: str, documents: Any) -> list[float]:
+        self.calls.append((query, list(documents)))
+        return list(self._scores)
 
 
 # --- ensure_index -----------------------------------------------------------------------------
@@ -243,15 +213,15 @@ def test_bulk_index_failed_item_raises_not_swallowed(monkeypatch: pytest.MonkeyP
 def test_bulk_index_logs_per_item_reasons_then_reraises(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # A semantic_text ingest error (bad input / rate limit / auth) surfaces as a BulkIndexError whose
-    # per-item reasons live on .errors — assert they are LOGGED (not just the opaque count) and the
-    # error still propagates (never swallowed).
+    # An ES write error (e.g. a dense_vector dim mismatch) surfaces as a BulkIndexError whose per-item
+    # reasons live on .errors — assert they are LOGGED (not just the opaque count) and the error still
+    # propagates (never swallowed).
     def fake_streaming_bulk(client: Any, actions: Any, **kwargs: Any) -> Any:
         list(actions)  # drive the lazy generator
         raise BulkIndexError(
             "1 document(s) failed to index.",
             [{"index": {"_id": "p2", "status": 400,
-                        "error": {"type": "status_exception", "reason": "cohere embed failed"}}}],
+                        "error": {"type": "mapper_parsing_exception", "reason": "wrong vector dims"}}}],
         )
         yield  # pragma: no cover - generator marker
 
@@ -262,7 +232,7 @@ def test_bulk_index_logs_per_item_reasons_then_reraises(
         with pytest.raises(BulkIndexError):
             backend.bulk_index([Document(doc_id="p2", fields={"search_text": "x"})], mapping=_mapping())
 
-    assert "cohere embed failed" in caplog.text  # the real reason is surfaced
+    assert "wrong vector dims" in caplog.text  # the real reason is surfaced
     assert "p2" in caplog.text
     backend.client.indices.refresh.assert_not_called()  # re-raised before refresh
 
@@ -329,7 +299,7 @@ def _msearch_response(*per_search_hits: dict[str, Any]) -> dict[str, Any]:
     return {"responses": list(per_search_hits)}
 
 
-def test_lexical_bulk_search_chunks_and_aligns(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lexical_bulk_search_chunks_and_aligns() -> None:
     client = _fake_client()
     # chunk size 2, three queries -> TWO msearch calls (chunks of [q0,q1] then [q2]).
     searcher = es.LexicalSearcher(client, "wands_bench", ["search_text"], msearch_chunk_size=2)
@@ -387,11 +357,15 @@ def test_lexical_bulk_search_empty_queries_no_round_trip() -> None:
 # --- make_searcher_factory --------------------------------------------------------------------
 
 
-def test_factory_lexical_builds_lexical_searcher(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _fake_client()
-    monkeypatch.setattr(es, "_make_client", lambda cfg: fake)
+def _factory(client: MagicMock, monkeypatch: pytest.MonkeyPatch, **kw: Any) -> Any:
+    monkeypatch.setattr(es, "_make_client", lambda cfg: client)
+    embedders = kw.pop("embedders", {})
+    rerankers = kw.pop("rerankers", {})
+    return es.make_searcher_factory(INDEXER_CFG, embedders=embedders, rerankers=rerankers)
 
-    factory = es.make_searcher_factory(INDEXER_CFG)
+
+def test_factory_lexical_builds_lexical_searcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory = _factory(_fake_client(), monkeypatch)
     searcher = factory.lexical(fields=["search_text"])
 
     assert isinstance(searcher, es.LexicalSearcher)
@@ -399,55 +373,75 @@ def test_factory_lexical_builds_lexical_searcher(monkeypatch: pytest.MonkeyPatch
     assert searcher.field == "search_text"
 
 
-def test_factory_vector_builds_vector_search(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _fake_client()
-    monkeypatch.setattr(es, "_make_client", lambda cfg: fake)
-    factory = es.make_searcher_factory(INDEXER_CFG)
+def test_factory_vector_builds_vector_search_with_query_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder = _FakeEmbedder("e5")
+    factory = _factory(_fake_client(), monkeypatch, embedders={"e5": embedder})
 
-    searcher = factory.vector(field="sem__e5")
+    searcher = factory.vector(field="sem__e5", embedder_id="e5")
 
     assert isinstance(searcher, es.VectorSearch)
     assert searcher.index == "wands_bench"
     assert searcher.field == "sem__e5"
+    assert searcher.query_embedder is embedder  # the referenced connector is attached
 
 
-def test_factory_reranker_builds_es_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _fake_client()
-    monkeypatch.setattr(es, "_make_client", lambda cfg: fake)
-    factory = es.make_searcher_factory(INDEXER_CFG)
+def test_factory_reranker_builds_es_reranker_with_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rerank_client = _FakeRerankClient([1.0])
+    factory = _factory(_fake_client(), monkeypatch, rerankers={"co-rr": rerank_client})
 
-    reranker = factory.reranker("cohere-rerank", "search_text")
+    reranker = factory.reranker("co-rr", "search_text")
 
     assert isinstance(reranker, es.ESReranker)
     assert reranker.index == "wands_bench"
-    assert reranker.inference_id == "cohere-rerank"
     assert reranker.field == "search_text"
+    assert reranker.rerank_client is rerank_client  # the referenced connector is attached
 
 
-# --- VectorSearch -----------------------------------------------------------------------------
+# --- VectorSearch (embed-query + knn) ---------------------------------------------------------
 
 
-def test_vector_search_builds_explicit_semantic_body() -> None:
+def test_vector_search_builds_knn_body() -> None:
     client = _fake_client()
     client.search.return_value = _hits(("p1", 5.0), ("p2", 4.0))
+    embedder = _FakeEmbedder("e5", dim=3, query_vector=[0.1, 0.2, 0.3])
 
-    searcher = es.VectorSearch(client, "wands_bench", "sem__e5")
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5", embedder)
     docs = searcher.search("comfy sofa", top_k=2)
 
+    # the query was embedded CLIENT-SIDE, then a knn query was issued (not the old semantic query)
+    assert embedder.query_batches == [["comfy sofa"]]
     kwargs = client.search.call_args.kwargs
     assert kwargs["index"] == "wands_bench"
-    # explicit semantic query (version-robust ES >= 8.15) — NOT the implicit match form
-    assert kwargs["query"] == {"semantic": {"field": "sem__e5", "query": "comfy sofa"}}
+    assert kwargs["knn"] == {
+        "field": "sem__e5",
+        "query_vector": [0.1, 0.2, 0.3],
+        "k": 2,
+        "num_candidates": es._KNN_NUM_CANDIDATES,  # max(top_k, default) = 100
+    }
     assert kwargs["size"] == 2
     assert "sort" not in kwargs  # no server-side _id sort (§9.1)
     assert [d.doc_id for d in docs] == ["p1", "p2"]
+
+
+def test_vector_search_num_candidates_floored_at_top_k() -> None:
+    client = _fake_client()
+    client.search.return_value = _hits(("p1", 1.0))
+    embedder = _FakeEmbedder("e5")
+    # top_k above the default -> num_candidates is floored at top_k.
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5", embedder, num_candidates=50)
+    searcher.search("q", top_k=200)
+    assert client.search.call_args.kwargs["knn"]["num_candidates"] == 200
 
 
 def test_vector_search_sorts_score_desc_then_doc_id_asc() -> None:
     client = _fake_client()
     client.search.return_value = _hits(("d_b", 2.0), ("d_c", 3.0), ("d_a", 2.0))
 
-    searcher = es.VectorSearch(client, "wands_bench", "sem__e5")
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5", _FakeEmbedder("e5"))
     result = searcher.search("x", top_k=10)
 
     assert [(d.doc_id, d.score) for d in result] == [
@@ -457,9 +451,10 @@ def test_vector_search_sorts_score_desc_then_doc_id_asc() -> None:
     ]
 
 
-def test_vector_bulk_search_chunks_and_aligns_via_msearch() -> None:
+def test_vector_bulk_search_embeds_all_then_msearch() -> None:
     client = _fake_client()
-    searcher = es.VectorSearch(client, "wands_bench", "sem__e5", msearch_chunk_size=2)
+    embedder = _FakeEmbedder("e5", dim=3, query_vector=[0.5, 0.5, 0.5])
+    searcher = es.VectorSearch(client, "wands_bench", "sem__e5", embedder, msearch_chunk_size=2)
     client.msearch.side_effect = [
         _msearch_response(_hits(("a", 1.0)), _hits(("d_b", 2.0), ("d_c", 3.0), ("d_a", 2.0))),
         _msearch_response(_hits(("z", 9.0))),
@@ -467,17 +462,14 @@ def test_vector_bulk_search_chunks_and_aligns_via_msearch() -> None:
 
     result = searcher.bulk_search(["q0", "q1", "q2"], top_k=5)
 
-    # two chunked _msearch round trips (chunk size 2 over three queries)
+    # all queries embedded in ONE batch (the connector batches), then chunked _msearch round trips
+    assert embedder.query_batches == [["q0", "q1", "q2"]]
     assert client.msearch.call_count == 2
     first_searches = client.msearch.call_args_list[0].kwargs["searches"]
     assert client.msearch.call_args_list[0].kwargs["index"] == "wands_bench"
     assert first_searches[0] == {}  # per-search header
     assert first_searches[1] == {
-        "query": {"semantic": {"field": "sem__e5", "query": "q0"}},
-        "size": 5,
-    }
-    assert first_searches[3] == {
-        "query": {"semantic": {"field": "sem__e5", "query": "q1"}},
+        "knn": {"field": "sem__e5", "query_vector": [0.5, 0.5, 0.5], "k": 5, "num_candidates": es._KNN_NUM_CANDIDATES},
         "size": 5,
     }
     # aligned + client-side tie-break identical to LexicalSearcher
@@ -489,7 +481,7 @@ def test_vector_bulk_search_chunks_and_aligns_via_msearch() -> None:
     assert [d.doc_id for d in result[2]] == ["z"]
 
 
-# --- ESReranker -------------------------------------------------------------------------------
+# --- ESReranker (provider RerankClient) -------------------------------------------------------
 
 
 def _mget_response(field: str, *pairs: tuple[str, str]) -> dict[str, Any]:
@@ -501,23 +493,17 @@ def _mget_response(field: str, *pairs: tuple[str, str]) -> dict[str, Any]:
     }
 
 
-def test_reranker_maps_scores_by_index_and_reorders_desc() -> None:
+def test_reranker_scores_via_connector_and_reorders_desc() -> None:
     client = _fake_client()
     # candidate INPUT order c1,c2,c3 (retrieval order) — different from the model's score order.
     candidates = [ScoredDoc("c1", 5.0), ScoredDoc("c2", 4.0), ScoredDoc("c3", 3.0)]
     client.mget.return_value = _mget_response(
         "search_text", ("c1", "text one"), ("c2", "text two"), ("c3", "text three")
     )
-    # response NOT in input order + a NEGATIVE score (cross-encoder logit); map BY "index".
-    client.inference.rerank.return_value = {
-        "rerank": [
-            {"index": 1, "relevance_score": 2.95},  # c2 highest
-            {"index": 0, "relevance_score": -6.25},  # c1 lowest (negative)
-            {"index": 2, "relevance_score": 0.5},  # c3 middle
-        ]
-    }
+    # scores ALIGNED to input (c1,c2,c3); a NEGATIVE score is allowed (cross-encoder logit).
+    rerank_client = _FakeRerankClient([-6.25, 2.95, 0.5])
 
-    reranker = es.ESReranker(client, "wands_bench", "cohere-rerank", "search_text")
+    reranker = es.ESReranker(client, "wands_bench", "search_text", rerank_client)
     result = reranker.rerank("a query", candidates)
 
     # reordered by model score DESC: c2(2.95) > c3(0.5) > c1(-6.25)
@@ -530,13 +516,8 @@ def test_reranker_maps_scores_by_index_and_reorders_desc() -> None:
     assert mget_kwargs["ids"] == ["c1", "c2", "c3"]
     assert mget_kwargs["source"] == ["search_text"]
 
-    # the inference call received the query + the candidate doc-texts IN INPUT ORDER
-    infer_kwargs = client.inference.rerank.call_args.kwargs
-    assert infer_kwargs["inference_id"] == "cohere-rerank"
-    assert infer_kwargs["query"] == "a query"
-    assert infer_kwargs["input"] == ["text one", "text two", "text three"]
-    # a generous server-side timeout rides out a cold/slow rerank deployment (ES default is 30s).
-    assert infer_kwargs["timeout"] == es._RERANK_INFERENCE_TIMEOUT
+    # the connector received the query + the candidate doc-texts IN INPUT ORDER
+    assert rerank_client.calls == [("a query", ["text one", "text two", "text three"])]
 
 
 def test_reranker_missing_candidate_raises() -> None:
@@ -549,42 +530,26 @@ def test_reranker_missing_candidate_raises() -> None:
             {"_id": "c2", "found": False},
         ]
     }
+    rerank_client = _FakeRerankClient([1.0, 2.0])
 
-    reranker = es.ESReranker(client, "wands_bench", "cohere-rerank", "search_text")
+    reranker = es.ESReranker(client, "wands_bench", "search_text", rerank_client)
     with pytest.raises(KeyError, match="c2"):
         reranker.rerank("a query", candidates)
-    client.inference.rerank.assert_not_called()  # aborted before scoring
+    assert rerank_client.calls == []  # aborted before scoring
 
 
 def test_reranker_empty_candidates_no_round_trip() -> None:
     client = _fake_client()
-    reranker = es.ESReranker(client, "wands_bench", "cohere-rerank", "search_text")
+    rerank_client = _FakeRerankClient([])
+    reranker = es.ESReranker(client, "wands_bench", "search_text", rerank_client)
 
-    # A query with no retrieval hits -> nothing to rerank; return [] without any ES call
-    # (ES mget/_inference reject an empty ids/input list with a 400).
+    # A query with no retrieval hits -> nothing to rerank; return [] without any ES/provider call.
     assert reranker.rerank("a query", []) == []
     client.mget.assert_not_called()
-    client.inference.rerank.assert_not_called()
+    assert rerank_client.calls == []
 
 
-# --- ESIndexer.build --------------------------------------------------------------------------
-
-
-class _FakeEmbedder:
-    """Minimal ``EmbeddingModel`` descriptor for the indexer test."""
-
-    def __init__(self, inference_id: str, model_id: str) -> None:
-        self.inference_id = inference_id
-        self.task_type = InferenceTaskType.TEXT_EMBEDDING
-        self._model_id = model_id
-
-    def as_endpoint(self) -> InferenceEndpoint:
-        return InferenceEndpoint(
-            inference_id=self.inference_id,
-            task_type=self.task_type,
-            service="elasticsearch",
-            service_settings={"model_id": self._model_id},
-        )
+# --- ESIndexer.build (dense_vector mapping + embed-at-ingest) ----------------------------------
 
 
 class _FakeDataset(Dataset):
@@ -615,19 +580,14 @@ class _FakeDataset(Dataset):
 
 
 class _RecordingBackend:
-    """A fake ``SearchBackend`` recording call order + the mapping it was handed."""
+    """A fake ``SearchBackend`` recording call order + the mapping/docs it was handed (no register)."""
 
     def __init__(self) -> None:
         self.index = "wands_bench"
+        self.embed_batch_size = es._EMBED_BATCH_SIZE
         self.calls: list[str] = []
-        self.registered: list[str] = []
         self.ensured_mapping: Any = None
         self.indexed_docs: list[Document] = []
-
-    def register_inference(self, ep: InferenceEndpoint) -> str:
-        self.calls.append("register")
-        self.registered.append(ep.inference_id)
-        return ep.inference_id
 
     def ensure_index(self, mapping: Any) -> None:
         self.calls.append("ensure")
@@ -638,25 +598,27 @@ class _RecordingBackend:
         self.indexed_docs = list(docs)  # drive the streamed generator
 
 
-def test_indexer_registers_before_ensure_and_builds_mapping() -> None:
+def test_indexer_builds_dense_vector_mapping_and_embeds_at_ingest() -> None:
     backend = _RecordingBackend()
-    # embedder id carries dots -> the sem field name must be dot-free.
-    embedders = [_FakeEmbedder("e5.small.v1", ".multilingual-e5-small")]
+    # embedder id carries dots -> the dense_vector field name must be dot-free.
+    embedders = [_FakeEmbedder("e5.small.v1", dim=4)]
 
     mapping = es.ESIndexer().build(_FakeDataset(), backend, embedders)
 
-    # register happens for every embedder BEFORE ensure_index (a semantic field can't map first)
-    assert backend.calls == ["register", "ensure", "index"]
-    assert backend.registered == ["e5.small.v1"]
+    # ensure BEFORE index (no register step — ES is a plain index)
+    assert backend.calls == ["ensure", "index"]
 
     props = mapping.backend_mapping["properties"]
     sem_field = "sem__e5_small_v1"  # dots -> "_", prefixed
-    # copy_to lives on the SOURCE search_text field and points at the sem field (§5.2)
-    assert props["search_text"]["type"] == "text"
-    assert props["search_text"]["copy_to"] == [sem_field]
-    assert "copy_to_source" not in props["search_text"]
-    # the semantic_text field carries its inference_id explicitly and its name is dot-free
-    assert props[sem_field] == {"type": "semantic_text", "inference_id": "e5.small.v1"}
+    # search_text is a plain text field — NO copy_to, NO semantic_text (§5.2)
+    assert props["search_text"] == {"type": "text"}
+    # one dense_vector field per embedder (dims from embedder.dim, cosine, indexed)
+    assert props[sem_field] == {
+        "type": "dense_vector",
+        "dims": 4,
+        "index": True,
+        "similarity": "cosine",
+    }
     assert "." not in sem_field
     # non-text roles mapped; id/bm25/semantic_source are NOT own mapped fields
     assert props["rating"] == {"type": "float"}
@@ -670,25 +632,28 @@ def test_indexer_registers_before_ensure_and_builds_mapping() -> None:
     assert mapping.search_text_field == "search_text"
     assert mapping.index_name == "wands_bench"
 
-    # documents() were streamed to bulk_index; the SAME mapping was handed to ensure + index
+    # the corpus was embedded at ingest: each indexed doc carries its dense_vector under the sem field
     assert [d.doc_id for d in backend.indexed_docs] == ["p1"]
+    stored = backend.indexed_docs[0].fields[sem_field]
+    assert stored == [0.0, 0.0, 0.0, 0.0]  # _FakeEmbedder's index-0 vector, dim 4
+    assert backend.indexed_docs[0].fields["search_text"] == "sofa"  # original field preserved
     assert backend.ensured_mapping is mapping
 
 
-def test_indexer_multiple_embedders_copy_to_all_sem_fields() -> None:
+def test_indexer_multiple_embedders_one_dense_vector_each() -> None:
     backend = _RecordingBackend()
-    embedders = [
-        _FakeEmbedder("e5-small", ".e5"),
-        _FakeEmbedder("elser", ".elser"),
-    ]
+    embedders = [_FakeEmbedder("e5-small", dim=3), _FakeEmbedder("elser", dim=5)]
 
     mapping = es.ESIndexer().build(_FakeDataset(), backend, embedders)
 
     props = mapping.backend_mapping["properties"]
-    assert props["search_text"]["copy_to"] == ["sem__e5_small", "sem__elser"]
-    assert props["sem__e5_small"]["inference_id"] == "e5-small"
-    assert props["sem__elser"]["inference_id"] == "elser"
+    assert props["sem__e5_small"]["type"] == "dense_vector" and props["sem__e5_small"]["dims"] == 3
+    assert props["sem__elser"]["type"] == "dense_vector" and props["sem__elser"]["dims"] == 5
     assert mapping.sem_field("elser") == "sem__elser"
+    # each indexed doc carries BOTH embedders' vectors
+    doc_fields = backend.indexed_docs[0].fields
+    assert len(doc_fields["sem__e5_small"]) == 3
+    assert len(doc_fields["sem__elser"]) == 5
 
 
 # --- client-side hybrid cross-check (fakes, no live models) -----------------------------------

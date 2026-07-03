@@ -12,8 +12,6 @@ from benchmark.models import (
     FieldSchema,
     FieldSpec,
     IndexMapping,
-    InferenceEndpoint,
-    InferenceTaskType,
     Qrel,
     Query,
     RankedResult,
@@ -58,16 +56,6 @@ def test_fieldspec_and_schema_construction():
     assert schema.fields[0].role is FieldRole.BM25
 
 
-def test_inference_endpoint_construction():
-    ep = InferenceEndpoint(
-        inference_id="e5-small",
-        task_type=InferenceTaskType.TEXT_EMBEDDING,
-        service="elasticsearch",
-    )
-    assert ep.inference_id == "e5-small"
-    assert ep.task_type is InferenceTaskType.TEXT_EMBEDDING
-
-
 def test_indexmapping_construction():
     m = IndexMapping(
         index_name="wands_bench",
@@ -92,11 +80,6 @@ def test_indexmapping_construction():
         (RankedResult("q1", []), "query_id", "q2"),
         (FieldSpec("n", FieldRole.ID), "name", "m"),
         (FieldSchema([]), "search_text_field", "other"),
-        (
-            InferenceEndpoint("e5", InferenceTaskType.TEXT_EMBEDDING, "elasticsearch"),
-            "service",
-            "openai",
-        ),
         (IndexMapping("i", "search_text", {}, {}), "index_name", "j"),
     ],
 )
@@ -128,45 +111,6 @@ def test_field_role_values():
     assert FieldRole.SEMANTIC_SOURCE == "semantic_source"
     assert FieldRole.NUMERIC == "numeric"
     assert FieldRole.STORED == "stored"
-
-
-def test_inference_task_type_values():
-    assert InferenceTaskType.TEXT_EMBEDDING == "text_embedding"
-    assert InferenceTaskType.SPARSE_EMBEDDING == "sparse_embedding"
-    assert InferenceTaskType.RERANK == "rerank"
-
-
-# --- InferenceEndpoint settings separation ------------------------------------
-
-
-def test_inference_endpoint_settings_default_empty_and_independent():
-    ep = InferenceEndpoint(
-        inference_id="cohere",
-        task_type=InferenceTaskType.RERANK,
-        service="cohere",
-    )
-    assert ep.service_settings == {}
-    assert ep.task_settings == {}
-    # default_factory must yield independent maps, not a shared mutable default.
-    assert ep.service_settings is not ep.task_settings
-    ep2 = InferenceEndpoint("c2", InferenceTaskType.RERANK, "cohere")
-    assert ep.service_settings is not ep2.service_settings
-    assert ep.task_settings is not ep2.task_settings
-
-
-def test_inference_endpoint_keeps_service_and_task_settings_separate():
-    ep = InferenceEndpoint(
-        inference_id="cohere-rerank-v3",
-        task_type=InferenceTaskType.RERANK,
-        service="cohere",
-        service_settings={"api_key": "secret", "model_id": "rerank-v3.5"},
-        task_settings={"top_n": 100},
-    )
-    assert ep.service_settings == {"api_key": "secret", "model_id": "rerank-v3.5"}
-    assert ep.task_settings == {"top_n": 100}
-    # top_n lives in task_settings, not service_settings (§3.4).
-    assert "top_n" not in ep.service_settings
-    assert ep.task_settings["top_n"] == 100
 
 
 # --- IndexMapping.sem_field ----------------------------------------------------

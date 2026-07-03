@@ -8,7 +8,7 @@ in ``pipeline.py`` per §11).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
@@ -109,55 +109,15 @@ class FieldSchema:
     rerank_field: str = "search_text"
 
 
-class InferenceTaskType(StrEnum):
-    """ES ``_inference`` wire task type on :class:`InferenceEndpoint` (§3.4).
-
-    Spans the full endpoint surface — embeddings AND rerank. An embedder config uses the narrower
-    :class:`EmbeddingType` (no rerank) and maps into this on flatten; a reranker flattens to
-    ``RERANK`` implicitly.
-    """
-
-    TEXT_EMBEDDING = "text_embedding"
-    SPARSE_EMBEDDING = "sparse_embedding"
-    RERANK = "rerank"
-
-
-class EmbeddingType(StrEnum):
-    """The embedding-only task type an ``embedder`` config declares (§3.4, §10).
-
-    Narrower than :class:`InferenceTaskType` — it deliberately excludes ``rerank``, so an embedder
-    cannot be misconfigured as a reranker. Maps onto ``InferenceTaskType`` when an embedder flattens
-    to an :class:`InferenceEndpoint`.
-    """
-
-    TEXT_EMBEDDING = "text_embedding"
-    SPARSE_EMBEDDING = "sparse_embedding"
-
-
-@dataclass(frozen=True)
-class InferenceEndpoint:
-    """Backend-agnostic inference endpoint descriptor (§3.4).
-
-    ``service_settings`` carries auth/model identity (e.g. ``api_key``, ``model_id``);
-    ``task_settings`` carries per-task knobs (e.g. rerank ``top_n``, ``return_documents``).
-    They are kept SEPARATE maps and emitted separately by ``register_inference`` (§3.4).
-    """
-
-    inference_id: str
-    task_type: InferenceTaskType
-    service: str
-    service_settings: Mapping[str, Any] = field(default_factory=dict)
-    task_settings: Mapping[str, Any] = field(default_factory=dict)
-
-
 @dataclass(frozen=True)
 class IndexMapping:
-    """Index identity + per-model semantic field names + backend-native mapping (§3.5)."""
+    """Index identity + per-embedder ``dense_vector`` field names + backend-native mapping (§3.5)."""
 
     index_name: str
     search_text_field: str
     sem_fields: Mapping[str, str]
     backend_mapping: Mapping[str, Any]
 
-    def sem_field(self, embedding_model_id: str) -> str:
-        return self.sem_fields[embedding_model_id]
+    def sem_field(self, embedder_id: str) -> str:
+        """The ``dense_vector`` field name (the ES ``knn`` target) for ``embedder_id`` (§5.2)."""
+        return self.sem_fields[embedder_id]

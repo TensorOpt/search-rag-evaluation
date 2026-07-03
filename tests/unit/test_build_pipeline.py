@@ -20,7 +20,7 @@ from benchmark.config import (
     Services,
     build_pipeline,
 )
-from benchmark.models import EmbeddingType, IndexMapping, ScoredDoc
+from benchmark.models import IndexMapping, ScoredDoc
 from benchmark.pipeline import HybridSearch, SearchPipeline
 from benchmark.protocols import Reranker, Searcher
 
@@ -28,17 +28,18 @@ WINDOW = 100
 
 
 class _FakeSearcher(Searcher):
-    def __init__(self, kind: str, target: object) -> None:
+    def __init__(self, kind: str, target: object, embedder_id: str | None = None) -> None:
         self.kind = kind
         self.target = target
+        self.embedder_id = embedder_id
 
     def search(self, query: str, *, top_k: int) -> list[ScoredDoc]:
         return []
 
 
 class _FakeReranker(Reranker):
-    def __init__(self, inference_id: str, field: str) -> None:
-        self.inference_id = inference_id
+    def __init__(self, name: str, field: str) -> None:
+        self.name = name
         self.field = field
 
     def rerank(self, query: str, candidates: Sequence[ScoredDoc]) -> list[ScoredDoc]:
@@ -49,16 +50,16 @@ class _FakeFactory:
     def lexical(self, *, fields: Sequence[str]) -> Searcher:
         return _FakeSearcher("lexical", list(fields))
 
-    def vector(self, *, field: str) -> Searcher:
-        return _FakeSearcher("vector", field)
+    def vector(self, *, field: str, embedder_id: str) -> Searcher:
+        return _FakeSearcher("vector", field, embedder_id)
 
-    def reranker(self, inference_id: str, field: str) -> Reranker:
-        return _FakeReranker(inference_id, field)
+    def reranker(self, name: str, field: str) -> Reranker:
+        return _FakeReranker(name, field)
 
 
 SERVICES = Services(
     embedders={
-        "e5": EmbedderCfg("e5", "elasticsearch", EmbeddingType.TEXT_EMBEDDING, {}),
+        "e5": EmbedderCfg("e5", "cohere", {"model_id": "embed-english-v3.0"}),
     },
     rerankers={
         "co-rr": RerankerCfg("co-rr", "cohere", {"top_n": 100}),
@@ -107,6 +108,7 @@ def test_single_vector_leaf() -> None:
     assert isinstance(pipeline.retriever, _FakeSearcher)
     assert pipeline.retriever.kind == "vector"
     assert pipeline.retriever.target == "sem__e5"  # mapping.sem_field(embedder.name)
+    assert pipeline.retriever.embedder_id == "e5"  # the query embedder to attach (§4)
     assert pipeline.reranker is None
 
 
@@ -127,7 +129,7 @@ def test_reranker_wraps_leaf_with_window() -> None:
     assert pipeline.retriever.kind == "lexical"
     assert isinstance(pipeline.reranker, _FakeReranker)
     assert pipeline.reranker.field == "search_text"  # mapping.search_text_field
-    assert pipeline.reranker.inference_id == "co-rr"
+    assert pipeline.reranker.name == "co-rr"
     assert pipeline.rerank_window_size == WINDOW
 
 

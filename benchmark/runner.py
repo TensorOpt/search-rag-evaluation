@@ -5,12 +5,13 @@ IDENTICAL ``run_one`` code path; only the :class:`~benchmark.config.PipelineCfg`
 guarantee, §8.0). The runner is a flat loop over the explicit config pipelines (baseline first) —
 there is NO matrix expansion, NO sweep, and NO selection phase.
 
-Setup prelude (§8.0), before any per-pipeline work: load the dataset, build the index (register
-embedder endpoints → ensure_index → bulk_index via the lazily-resolved ``Indexer``), build the
-searcher factory, freeze the shared query set, and build the :class:`QrelIndex` + :class:`Evaluator`
-once. The index-build sequence lives in ONE place — :meth:`ExperimentRunner.build_index` — reused by
-both :meth:`ExperimentRunner.run`'s setup and the ``eval:index`` entry point (``scripts/index.py``),
-so there is a single register/ensure/bulk path (DRY).
+Setup prelude (§8.0), before any per-pipeline work: load the dataset, build the index (instantiate
+the embedder connectors → ensure_index → embed the corpus → bulk_index via the lazily-resolved
+``Indexer``), build the searcher factory (wired to the embedder/reranker connectors), freeze the
+shared query set, and build the :class:`QrelIndex` + :class:`Evaluator` once. The index-build
+sequence lives in ONE place — :meth:`ExperimentRunner.build_index` — reused by both
+:meth:`ExperimentRunner.run`'s setup and the ``eval:index`` entry point (``scripts/index.py``), so
+there is a single ensure/embed/bulk path (DRY).
 
 Imports ONLY the pure consumers (``config``/``metrics``/``stats``/``io_csv``/``models``) — NEVER an
 adapter at import time (§11). The concrete indexer §8.0 names as ``Indexer().build(...)`` arrives
@@ -44,32 +45,39 @@ logger = get_logger(__name__)
 class ExperimentRunner:
     """Runs the whole benchmark for a resolved config, the single execution path (§8.0)."""
 
-    def build_index(self, cfg: ResolvedConfig) -> tuple[Any, Any, Any]:
-        """Build the index (§3.5 register→ensure_index→bulk_index); return (dataset, backend, mapping).
+    def build_index(self, cfg: ResolvedConfig) -> tuple[Any, Any, Any, dict[str, Any]]:
+        """Build the index (§3.5 ensure_index→embed→bulk_index); return (dataset, backend, mapping, embedders).
 
         The ONE index-build path (DRY): reused by :meth:`run`'s setup prelude AND the ``eval:index``
-        entry point. Loads the dataset, builds the ingest backend, and drives the lazily-resolved
-        ``Indexer.build`` (``config.make_index_builder``) over EVERY configured embedder (§8.0 passes
-        ``cfg.services.embedders.values()`` — every embedder gets a ``semantic_text`` field). Returns
-        the dataset (reused by :meth:`run` for the shared query set + qrels), the backend (so the
-        caller can register a reranker endpoint at R0), and the resulting :class:`IndexMapping`.
+        entry point. Loads the dataset, builds the ingest backend, instantiates every configured
+        embedder connector (``config.make_embedders`` — §3.4), and drives the lazily-resolved
+        ``Indexer.build`` (``config.make_index_builder``) over them (each embedder gets a
+        ``dense_vector`` field; the harness embeds the corpus at ingest, §3.5). Returns the dataset
+        (reused by :meth:`run` for the shared query set + qrels), the backend, the resulting
+        :class:`IndexMapping`, and the embedder registry (reused by :meth:`run` for the vector
+        searchers' query embedding).
         """
         dataset = config.load_dataset(cfg.dataset)
-        backend = config.make_indexer(cfg.indexer)  # ingest seam (register/ensure_index/bulk_index)
-        embedders = list(cfg.services.embedders.values())
+        backend = config.make_indexer(cfg.indexer)  # ingest seam (ensure_index/bulk_index)
+        embedders = config.make_embedders(cfg.services)  # name -> Embedder connector (§3.4)
         logger.info(
             "building index %r over %d embedder(s): %s",
             cfg.indexer.get("index"),
             len(embedders),
-            [e.name for e in embedders],
+            sorted(embedders),
         )
-        mapping = config.make_index_builder(cfg.indexer).build(dataset, backend, embedders)
-        return dataset, backend, mapping
+        mapping = config.make_index_builder(cfg.indexer).build(
+            dataset, backend, list(embedders.values())
+        )
+        return dataset, backend, mapping, embedders
 
     def run(self, cfg: ResolvedConfig, *, output_dir: str = DEFAULT_OUTPUT_DIR) -> None:
         """Run every pipeline baseline-first, then the family-wide comparator pass (§8.0)."""
-        dataset, backend, mapping = self.build_index(cfg)
-        factory = config.make_searcher_factory(cfg.indexer)  # ES: Lexical/Vector/ESReranker
+        dataset, backend, mapping, embedders = self.build_index(cfg)
+        rerankers = config.make_rerankers(cfg.services)  # name -> RerankClient connector (§3.4/§5.4)
+        factory = config.make_searcher_factory(
+            cfg.indexer, embedders=embedders, rerankers=rerankers
+        )  # ES: Lexical/Vector/ESReranker, wired to the provider connectors
         queries = list(dataset.queries())  # frozen, shared query set
         query_texts = [q.text for q in queries]
         qrel_index = QrelIndex(dataset.qrels())
@@ -81,15 +89,20 @@ class ExperimentRunner:
         per_query: dict[str, dict[str, Metrics]] = {}
 
         def run_one(pcfg: PipelineCfg) -> None:
-            # R0 — lazy reranker endpoint registration + the W <= top_n cap (§5.3/§8.0).
+            # R0 — the W <= top_n cap (§5.4/§8.0). No endpoint registration: the reranker is a
+            # provider connector (already built in `rerankers`); `top_n` is a plain settings key
+            # capping how many candidates the provider scores per request.
             if pcfg.reranker is not None:
-                endpoint = cfg.services.reranker(pcfg.reranker).as_endpoint()
-                backend.register_inference(endpoint)  # emits service_settings + task_settings
-                top_n = endpoint.task_settings["top_n"]
-                if pcfg.rerank_window_size is None or pcfg.rerank_window_size > top_n:
+                top_n = cfg.services.reranker(pcfg.reranker).settings.get("top_n")
+                if top_n is None:
+                    raise ValueError(
+                        f"pipeline {pcfg.id!r}: reranker {pcfg.reranker!r} has no settings.top_n "
+                        "(required as the W <= top_n cap, §5.4)"
+                    )
+                if pcfg.rerank_window_size is None or pcfg.rerank_window_size > int(top_n):
                     raise ValueError(
                         f"pipeline {pcfg.id!r}: rerank_window_size {pcfg.rerank_window_size} "
-                        f"exceeds reranker {pcfg.reranker!r} top_n {top_n} (§5.3 W <= top_n)"
+                        f"exceeds reranker {pcfg.reranker!r} top_n {top_n} (§5.4 W <= top_n)"
                     )
 
             pipeline = config.build_pipeline(pcfg, cfg.services, mapping, factory)

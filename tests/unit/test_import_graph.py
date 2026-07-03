@@ -32,7 +32,9 @@ _PURE_MODULES = (
 )
 
 #: The adapter package prefixes §11 forbids at import time for the pure modules + config.
-_ADAPTER_PREFIXES = ("benchmark.backends", "benchmark.datasets")
+#: ``benchmark.providers`` (the inference-provider connectors, §3.4) is an adapter too — pure modules
+#: reach it only through ``config``'s lazy factories, never a top-level import.
+_ADAPTER_PREFIXES = ("benchmark.backends", "benchmark.datasets", "benchmark.providers")
 
 # Import ``module``, then print every sys.modules key under an adapter package, one per line.
 _PROBE = (

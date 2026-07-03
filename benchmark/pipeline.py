@@ -119,9 +119,9 @@ class SearchPipeline(Searcher):
         """Batch retrieval over the whole query set; rerank per query (aligned, §3.6/§8.0).
 
         Retrieval is batched via ``retriever.bulk_search`` (so ES leaves batch via ``_msearch``).
-        Reranking stays PER QUERY: the ES ``_inference`` rerank call is per-query, so batching it is
-        a future optimization (§5.3). Without a reranker this is a pass-through to
-        ``retriever.bulk_search``. Results are aligned to ``queries`` by index.
+        Reranking stays PER QUERY: the provider rerank call is per-query, so batching it is a future
+        optimization (§5.4). Without a reranker this is a pass-through to ``retriever.bulk_search``.
+        Results are aligned to ``queries`` by index.
         """
         if self.reranker is None:
             return self.retriever.bulk_search(queries, top_k=top_k)

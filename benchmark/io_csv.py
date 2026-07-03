@@ -22,8 +22,8 @@ Serialization rules (fixed so golden files are stable, §9/CLAUDE.md):
   ``true``/``false``; ``p_value``/``p_value_adjusted`` numeric. A ``None`` delta/CI cell (empty
   paired set) is written EMPTY (§8.1).
 - :func:`write_run_config` serializes the fully-resolved config via ``dataclasses.asdict`` +
-  ``json.dumps`` (deterministic; ``EmbeddingType`` is a ``StrEnum`` and serializes as its string,
-  with ``default=str`` catching any straggler) so it round-trips (§9.1).
+  ``json.dumps`` (deterministic, ``sort_keys=True``, with ``default=str`` catching any non-JSON
+  straggler) so it round-trips (§9.1).
 
 This module imports only ``benchmark.models``/``benchmark.metrics``/``benchmark.stats``/
 ``benchmark.config`` + stdlib — never an adapter (§11); ``config`` does NOT import this module, so
@@ -186,9 +186,9 @@ def write_run_config(
 ) -> Path:
     """Write ``run_config_{ts}.json`` — the fully-resolved config for reproducibility (§9.1).
 
-    Serialized deterministically (``sort_keys=True``) via ``dataclasses.asdict``; ``EmbeddingType``
-    is a ``StrEnum`` (serializes as its string value), and ``default=str`` catches any straggler so
-    the JSON always round-trips. The resolved services registry, the pipelines (baseline + variants),
+    Serialized deterministically (``sort_keys=True``) via ``dataclasses.asdict``, with ``default=str``
+    catching any non-JSON straggler so the JSON always round-trips. The resolved services registry
+    (embedder/reranker/searcher configs), the pipelines (baseline + variants),
     the stats block (bootstrap_B, ci_level, alpha as both the raw threshold and the FDR level q,
     correction, test + wilcoxon zero/tie params, seed), cutoff, top_k, timestamp, and seed are all
     captured (§9.1).

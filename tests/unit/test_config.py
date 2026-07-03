@@ -27,7 +27,6 @@ from benchmark.config import (
     make_searcher_factory,
     resolve_config,
 )
-from benchmark.models import InferenceTaskType
 
 CONFIG_YAML = textwrap.dedent(
     """
@@ -35,9 +34,9 @@ CONFIG_YAML = textwrap.dedent(
       name: wands
       path: ./dataset/wands
     services:
-      - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-      - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
-      - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100 } }
+      - embedder: { name: e5,     provider: voyage, settings: { api_key: "${VOYAGE_KEY}", model_id: voyage-3.5 } }
+      - embedder: { name: cohere, provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
+      - reranker: { name: co-rr,  provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100 } }
       - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
       - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
     indexer:
@@ -73,6 +72,7 @@ CONFIG_YAML = textwrap.dedent(
 def _set_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ES_URL", "http://localhost:9200")
     monkeypatch.setenv("COHERE_KEY", "co-test")
+    monkeypatch.setenv("VOYAGE_KEY", "vo-test")
 
 
 def _parsed() -> dict[str, Any]:
@@ -139,21 +139,38 @@ def test_services_registry_resolves_typed() -> None:
     assert services.searcher("semantic_e5").embedder == "e5"
 
 
-def test_embedder_flattens_to_endpoint() -> None:
-    embedder = resolve_config(_parsed()).services.embedder("e5")
-    endpoint = embedder.as_endpoint()
-    assert endpoint.inference_id == "e5"
-    assert endpoint.task_type is InferenceTaskType.TEXT_EMBEDDING
-    assert endpoint.service == "elasticsearch"
+def test_embedder_cfg_carries_provider_and_settings() -> None:
+    embedder = resolve_config(_parsed()).services.embedder("cohere")
+    assert embedder.name == "cohere"
+    assert embedder.provider == "cohere"
+    assert embedder.settings["model_id"] == "embed-english-v3.0"
+    assert embedder.settings["api_key"] == "co-test"  # ${COHERE_KEY} substituted
 
 
-def test_reranker_flattens_top_n_to_task_settings() -> None:
+def test_reranker_cfg_carries_provider_and_top_n() -> None:
     reranker = resolve_config(_parsed()).services.reranker("co-rr")
-    endpoint = reranker.as_endpoint()
-    assert endpoint.task_type is InferenceTaskType.RERANK
-    assert endpoint.task_settings["top_n"] == 100  # top_n is a task_settings key (§3.4/§5.3)
-    assert "top_n" not in endpoint.service_settings
-    assert endpoint.service_settings["api_key"] == "co-test"  # ${COHERE_KEY} substituted
+    assert reranker.provider == "cohere"
+    assert reranker.settings["top_n"] == 100  # the W <= top_n cap the runner reads at R0 (§5.4)
+    assert reranker.settings["api_key"] == "co-test"  # ${COHERE_KEY} substituted
+
+
+def test_unknown_embedder_provider_raises() -> None:
+    raw = _parsed()
+    raw["services"].append(
+        {"embedder": {"name": "bad", "provider": "elasticsearch", "settings": {"model_id": "x"}}}
+    )
+    with pytest.raises(ConfigError, match="unknown provider"):
+        resolve_config(raw)
+
+
+def test_reranker_openai_provider_raises() -> None:
+    # OpenAI has no reranker — a reranker configured with provider: openai must fail at load (§3.4).
+    raw = _parsed()
+    raw["services"].append(
+        {"reranker": {"name": "bad", "provider": "openai", "settings": {"model_id": "x", "top_n": 10}}}
+    )
+    with pytest.raises(ConfigError, match="openai has no reranker"):
+        resolve_config(raw)
 
 
 def test_duplicate_service_name_raises() -> None:

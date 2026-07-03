@@ -8,20 +8,24 @@ dataset:
   name: wands
   path: ./dataset/wands
 services:                       # named, typed, reusable building blocks
-#  - embedder: { name: e5,     provider: elasticsearch, embedding_type: text_embedding, settings: { model_id: .multilingual-e5-small } }
-  - embedder: { name: cohere, provider: cohere,        embedding_type: text_embedding, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0 } }
-  - reranker: { name: co-rr,  provider: cohere,        settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 25 } }
+  # Embedders/rerankers are PROVIDER CONNECTORS (benchmark/providers.py): the harness calls Cohere /
+  # Voyage / OpenAI directly — ES runs no inference (§1.1/§3.4). `provider` selects the connector;
+  # `model_id`/`api_key`/`rate_limit`/`dims`(optional) live in `settings`. OpenAI has NO reranker.
+  - embedder: { name: cohere, provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0, rate_limit: { requests_per_minute: 90 } } }
+  - reranker: { name: co-rr,  provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 25, rate_limit: { requests_per_minute: 90 } } }
+#  - embedder: { name: voyage, provider: voyage, settings: { api_key: "${VOYAGE_KEY}", model_id: voyage-3.5, rate_limit: { requests_per_minute: 300 } } }
+#  - embedder: { name: openai, provider: openai, settings: { api_key: "${OPENAI_KEY}", model_id: text-embedding-3-small } }
+#  - reranker: { name: vo-rr,  provider: voyage, settings: { api_key: "${VOYAGE_KEY}", model_id: rerank-2.5, top_n: 25, rate_limit: { requests_per_minute: 100 } } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
-#  - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
-# ONE index for everything (ES): a single search_text (BM25) field plus one semantic_text field per
-# embedder referenced by a vector searcher above (via copy_to, §5.2) — semantic_e5/semantic_co are
-# FIELDS in this one index, not separate indices. The indexer learns which embedders to build fields
-# for by scanning the vector searchers.
+# ONE index (ES): a single `search_text` (BM25) `text` field plus one `dense_vector` field per
+# embedder that a vector searcher references (§5.2). semantic_co is a FIELD in this one index, not a
+# separate index. The indexer discovers which embedders to build vector fields for by scanning the
+# vector searchers; the harness embeds each doc's search_text with the connector and stores the vector.
 indexer:
   provider: elasticsearch
   index: wands_bench
-  settings: { url: "${ES_URL}" }
+  settings: { url: "${ES_URL}", bulk_chunk_size: 96, request_timeout: 600 }
 pipelines:
   baseline_id: bm25             # baseline pipeline's artifact id (§9): result_bm25_*, comparison_bm25_*
   baseline:                     # the reference every variant is compared against

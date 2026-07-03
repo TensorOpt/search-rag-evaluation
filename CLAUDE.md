@@ -6,7 +6,9 @@ Guidance for Claude Code when working in this repo.
 
 A reproducible **search-relevance benchmark harness**. It measures how much each retrieval
 strategy improves over a **BM25 baseline** on a fixed dataset + qrel set. First instantiation:
-**WANDS** dataset on **ElasticSearch (>= 8.15)** via native `_inference` endpoints and retrievers.
+**WANDS** dataset on **ElasticSearch** as a plain BM25 + `dense_vector` index. The harness owns
+inference: it computes embeddings and rerank scores via **provider connectors** (Cohere, Voyage,
+OpenAI) in `benchmark/providers.py` — ES runs no `_inference`.
 
 - **`docs/experiment.md`** — authoritative experimental design (abstractions, metrics, statistics).
   **This is the source of truth.** When code and this doc disagree on a name or schema, the doc wins.
