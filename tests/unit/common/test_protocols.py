@@ -3,9 +3,12 @@
 Two seam kinds:
 - structural Protocols (``Embedder``, ``RerankClient``, ``IndexWriter``): a trivial in-test class
   satisfies each (mypy checks data attributes; ``@runtime_checkable`` ``isinstance`` here only
-  verifies method presence). The domain ``Indexer`` is a concrete class now (no Protocol), covered
-  in ``tests/unit/test_indexing.py``; the ``SearcherFactory`` Protocol is deleted (leaves are minted
-  by ``build_searchers``/``build_rerankers``).
+  verifies method presence). These doubles are the DELIBERATE exception to CLAUDE.md's
+  "declare the interface you satisfy" convention: they are intentionally left UNDECLARED (no
+  ``(Embedder)`` base, etc.) precisely to exercise that structural conformance still holds without
+  inheritance — declaring the Protocol here would make the test tautological. The domain ``Indexer``
+  is a concrete class now (no Protocol), covered in ``tests/unit/test_indexing.py``; the
+  ``SearcherFactory`` Protocol is deleted (leaves are minted by ``build_searchers``/``build_rerankers``).
 - ABCs (``Searcher``, ``Fuser``, ``Reranker``, ``Dataset``): a trivial subclass implementing the
   abstract methods instantiates and works; a subclass that does not is uninstantiable. (The
   ``Dataset`` ABC's shared helpers are covered in ``test_wands.py``.)

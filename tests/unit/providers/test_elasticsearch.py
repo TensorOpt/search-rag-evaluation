@@ -27,7 +27,7 @@ from benchmark.common.models import (
     IndexMapping,
     ScoredDoc,
 )
-from benchmark.common.protocols import Dataset, Searcher
+from benchmark.common.protocols import Dataset, Embedder, RerankClient, Searcher
 from benchmark.common.ranking import fuse_rrf_local
 from benchmark.providers import elasticsearch as es
 from benchmark.search import HybridSearch, RRFFuser
@@ -55,7 +55,7 @@ def _writer_with(client: MagicMock) -> es.ESIndexWriter:
 # --- fake provider connectors -----------------------------------------------------------------
 
 
-class _FakeEmbedder:
+class _FakeEmbedder(Embedder):
     """A fake ``Embedder``: fixed-``dim`` canned vectors; records the texts it embedded (no network).
 
     ``embed_queries`` returns a constant vector per input so the ``knn`` body is assertable;
@@ -82,7 +82,7 @@ class _FakeEmbedder:
         return [list(self._query_vector) for _ in texts]
 
 
-class _FakeRerankClient:
+class _FakeRerankClient(RerankClient):
     """A fake ``RerankClient`` returning canned scores aligned to input; records its calls."""
 
     def __init__(self, scores: list[float]) -> None:

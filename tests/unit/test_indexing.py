@@ -16,10 +16,11 @@ import re
 from typing import Any
 
 from benchmark.common.models import Document, FieldRole, FieldSchema, FieldSpec, IndexMapping
+from benchmark.common.protocols import Dataset, Embedder, IndexWriter
 from benchmark.indexing import Indexer
 
 
-class _FakeEmbedder:
+class _FakeEmbedder(Embedder):
     """A fake ``Embedder``: fixed-``dim`` canned per-index document vectors (no network)."""
 
     def __init__(self, embedder_id: str, dim: int = 3) -> None:
@@ -37,7 +38,7 @@ class _FakeEmbedder:
         return [[0.0] * self._dim for _ in texts]
 
 
-class _FakeDataset:
+class _FakeDataset(Dataset):
     """A tiny in-memory dataset with one text + one numeric + one id + one stored field."""
 
     name = "fake"
@@ -64,7 +65,7 @@ class _FakeDataset:
         )
 
 
-class _RecordingWriter:
+class _RecordingWriter(IndexWriter):
     """A fake ``IndexWriter`` recording call order + the mapping/docs it was handed (no ES register).
 
     ``sem_field_name`` mirrors the backend-safe dot-free naming; ``create_mapping`` returns a real

@@ -47,6 +47,14 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 ## Conventions
 
 - Match the style of surrounding code; keep abstractions minimal (favor stdlib/native over deps).
+- **Declare the interface a concrete class satisfies (preferred).** Every concrete implementation —
+  or its shared implementation base — explicitly subclasses the ABC or `Protocol` it fulfills (e.g.
+  `ESIndexWriter(IndexWriter)`, `_BaseEmbedder(_Connector, Embedder)`, `CohereReranker` via
+  `_BaseReranker(_Connector, RerankClient)`, `LexicalSearcher(Searcher)`), **even for structural
+  `Protocol`s** where Python does not require it. This makes the interface→implementations mapping
+  greppable/navigable (find an interface's implementors by its subclasses) and lets mypy verify
+  conformance at the class definition — the lazy dotted-target factories (§11) return `Any`, so an
+  undeclared structural implementation's drift would otherwise go statically unchecked.
 - **Move with certainty.** Prefer resolving unknowns at build time over runtime. If a dependency's
   capability/version/behavior is uncertain, pin the version that guarantees it and call it directly —
   do NOT ship runtime feature-detection (`getattr(mod, "feature", None)` probes) or best-effort

@@ -38,7 +38,7 @@ from benchmark.common.models import (
     IndexMapping,
     ScoredDoc,
 )
-from benchmark.common.protocols import Embedder, Reranker, RerankClient, Searcher
+from benchmark.common.protocols import Embedder, IndexWriter, Reranker, RerankClient, Searcher
 from benchmark.common.ranking import rerank_local
 
 logger = get_logger(__name__)
@@ -131,7 +131,7 @@ def _msearch(
     return results
 
 
-class ESIndexWriter:
+class ESIndexWriter(IndexWriter):
     """The ES ``IndexWriter`` seam the domain ``Indexer`` delegates to (§3.3/§3.5).
 
     Names the ``dense_vector`` field per embedder, builds the §5.2 ``IndexMapping``, creates the

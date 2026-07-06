@@ -32,7 +32,7 @@ from benchmark.common.models import (
     Query,
     ScoredDoc,
 )
-from benchmark.common.protocols import Dataset
+from benchmark.common.protocols import Dataset, Embedder, IndexWriter, RerankClient
 from benchmark.config import (
     EmbedderCfg,
     FuserCfg,
@@ -100,7 +100,7 @@ class FakeDataset(Dataset):
 # --- fake index writer + provider connectors --------------------------------------------------
 
 
-class FakeIndexWriter:
+class FakeIndexWriter(IndexWriter):
     """A fake ``IndexWriter`` recording the §3.5 ingest calls (no ES). ``.client``/``.index`` are
     present so ``eval:index``-style probing works. ES is a plain index writer now — no inference
     registration; the harness embeds the corpus upstream and hands already-embedded documents here.
@@ -135,7 +135,7 @@ class FakeIndexWriter:
         self.indexed = list(docs)
 
 
-class FakeEmbedder:
+class FakeEmbedder(Embedder):
     """A fake embedding connector: fixed-dim canned vectors (no network). ``id``/``dim`` drive the
     real ``Indexer`` mapping; ``embed_documents`` is called at ingest, ``embed_queries`` never here
     (the fake vector leaf is a canned ``FakeSearcher`` that ignores the embedder)."""
@@ -155,7 +155,7 @@ class FakeEmbedder:
         return [[0.0] * self._dim for _ in texts]
 
 
-class FakeRerankClient:
+class FakeRerankClient(RerankClient):
     """A fake rerank connector: canned descending scores aligned to input (no network)."""
 
     def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]:

@@ -35,6 +35,7 @@ import urllib.request
 from typing import Any, Mapping, Sequence
 
 from benchmark.common.logging_setup import get_logger
+from benchmark.common.protocols import Embedder, RerankClient
 
 logger = get_logger(__name__)
 
@@ -213,7 +214,7 @@ def _require_setting(settings: Mapping[str, Any], key: str, provider: str, name:
 # --- embedders ---------------------------------------------------------------------------------
 
 
-class _BaseEmbedder(_Connector):
+class _BaseEmbedder(_Connector, Embedder):
     """Common embedder machinery: batching + one-shot ``dim`` discovery (§3.4/§3.5).
 
     Subclasses implement :meth:`_embed` (one provider call for a within-limit batch, ``is_query``
@@ -322,7 +323,7 @@ class VoyageEmbedder(_BaseEmbedder):
 # --- rerankers ---------------------------------------------------------------------------------
 
 
-class _BaseReranker(_Connector):
+class _BaseReranker(_Connector, RerankClient):
     """Common reranker machinery: request all documents scored, realign to input order (§5.4).
 
     Subclasses implement :meth:`_rerank_response` (one provider call) + :attr:`_results_key` /
