@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 
 from benchmark.config import load_config
-from benchmark.logging_setup import get_logger, setup_logging
+from benchmark.common.logging_setup import get_logger, setup_logging
 from benchmark.runner import ExperimentRunner
 
 log = get_logger(__name__)
@@ -28,8 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     setup_logging(timestamp=cfg.timestamp)
 
-    _dataset, backend, mapping, _embedders = ExperimentRunner().build_index(cfg)
-    doc_count = backend.client.count(index=mapping.index_name)["count"]
+    _dataset, writer, mapping, _embedders = ExperimentRunner().build_index(cfg)
+    doc_count = writer.client.count(index=mapping.index_name)["count"]
     log.info("index %r built and populated: %d docs", mapping.index_name, doc_count)
     return 0
 

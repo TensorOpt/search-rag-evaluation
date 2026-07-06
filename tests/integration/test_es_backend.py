@@ -18,14 +18,14 @@ from collections.abc import Iterator
 
 import pytest
 
-from benchmark.backends.elasticsearch import (
-    ElasticsearchBackend,
+from benchmark.common.models import Document, IndexMapping, ScoredDoc
+from benchmark.providers.elasticsearch import (
+    ESIndexWriter,
     ESReranker,
     LexicalSearcher,
     VectorSearch,
 )
-from benchmark.models import Document, IndexMapping, ScoredDoc
-from benchmark.providers import CohereEmbedder, CohereReranker, ProviderError
+from benchmark.providers.inference import CohereEmbedder, CohereReranker, ProviderError
 
 pytestmark = pytest.mark.integration
 
@@ -41,10 +41,10 @@ def _require_cohere() -> str:
 
 
 @pytest.fixture
-def backend() -> ElasticsearchBackend:
-    """An ``ElasticsearchBackend`` bound to a unique throwaway index; skip if ES is unreachable."""
+def backend() -> ESIndexWriter:
+    """An ``ESIndexWriter`` bound to a unique throwaway index; skip if ES is unreachable."""
     indexer_cfg = {"index": f"es_it_{uuid.uuid4().hex}", "settings": {"url": ES_URL}}
-    backend = ElasticsearchBackend(indexer_cfg)
+    backend = ESIndexWriter(indexer_cfg)
     try:
         if not backend.client.ping():
             pytest.skip(f"ES not reachable at {ES_URL}")
@@ -54,7 +54,7 @@ def backend() -> ElasticsearchBackend:
 
 
 @pytest.fixture
-def mapping(backend: ElasticsearchBackend) -> Iterator[IndexMapping]:
+def mapping(backend: ESIndexWriter) -> Iterator[IndexMapping]:
     """A plain text index (BM25 only); deleted on teardown.
 
     Shared by the lexical searchers and by the reranker's ``mget`` doc-text lookup — neither needs a
@@ -77,7 +77,7 @@ def mapping(backend: ElasticsearchBackend) -> Iterator[IndexMapping]:
 
 
 def test_lexical_round_trip_and_distinctive_token(
-    backend: ElasticsearchBackend, mapping: IndexMapping
+    backend: ESIndexWriter, mapping: IndexMapping
 ) -> None:
     docs = [
         Document(doc_id="p1", fields={"search_text": "blue velvet sofa"}),
@@ -95,7 +95,7 @@ def test_lexical_round_trip_and_distinctive_token(
 
 
 def test_lexical_score_tie_breaks_on_doc_id_asc(
-    backend: ElasticsearchBackend, mapping: IndexMapping
+    backend: ESIndexWriter, mapping: IndexMapping
 ) -> None:
     # Identical text -> identical BM25 score -> a constructed tie; doc_ids chosen so asc order
     # differs from insertion order, proving the client-side (score desc, doc_id asc) tie-break.
@@ -113,7 +113,7 @@ def test_lexical_score_tie_breaks_on_doc_id_asc(
 
 
 def test_lexical_respects_top_k(
-    backend: ElasticsearchBackend, mapping: IndexMapping
+    backend: ESIndexWriter, mapping: IndexMapping
 ) -> None:
     docs = [Document(doc_id=f"p{i}", fields={"search_text": "common term"}) for i in range(5)]
     backend.bulk_index(docs, mapping=mapping)
@@ -125,7 +125,7 @@ def test_lexical_respects_top_k(
 
 
 def test_lexical_bulk_search_aligned_over_several_queries(
-    backend: ElasticsearchBackend, mapping: IndexMapping
+    backend: ESIndexWriter, mapping: IndexMapping
 ) -> None:
     # Distinctive tokens so each query has exactly one obvious match; a small msearch chunk size so
     # the query set spans more than one _msearch round trip.
@@ -146,7 +146,7 @@ def test_lexical_bulk_search_aligned_over_several_queries(
 
 
 def test_bulk_index_more_than_one_chunk_indexes_all_docs(
-    backend: ElasticsearchBackend, mapping: IndexMapping
+    backend: ESIndexWriter, mapping: IndexMapping
 ) -> None:
     # Small chunk size + more docs than one chunk -> multiple streaming_bulk chunks; assert ALL land.
     backend.bulk_chunk_size = 3
@@ -161,7 +161,7 @@ def test_bulk_index_more_than_one_chunk_indexes_all_docs(
 # --- semantic path (client-side embed via connector -> ES knn) --------------------------------
 
 
-def test_vector_search_knn_returns_scored_docs(backend: ElasticsearchBackend) -> None:
+def test_vector_search_knn_returns_scored_docs(backend: ESIndexWriter) -> None:
     api_key = _require_cohere()
     embedder = CohereEmbedder("cohere", {"api_key": api_key, "model_id": "embed-english-v3.0"})
     sem_field = "sem__cohere"
@@ -212,7 +212,7 @@ def test_vector_search_knn_returns_scored_docs(backend: ElasticsearchBackend) ->
 
 
 def test_reranker_reorders_candidates_by_model_score(
-    backend: ElasticsearchBackend, mapping: IndexMapping
+    backend: ESIndexWriter, mapping: IndexMapping
 ) -> None:
     api_key = _require_cohere()
     docs = [

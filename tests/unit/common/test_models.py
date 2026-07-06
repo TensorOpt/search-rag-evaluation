@@ -6,7 +6,7 @@ import dataclasses
 
 import pytest
 
-from benchmark.models import (
+from benchmark.common.models import (
     Document,
     FieldRole,
     FieldSchema,

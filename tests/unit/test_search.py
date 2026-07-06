@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from benchmark.fusion import fuse_rrf_local
-from benchmark.pipeline import HybridSearch, RRFFuser, SearchPipeline
+from benchmark.common.ranking import fuse_rrf_local
+from benchmark.search import HybridSearch, RRFFuser, SearchPipeline
 from tests.conftest import (
     _BM25_DOCS,
     _SEMANTIC_DOCS,

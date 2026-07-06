@@ -23,7 +23,7 @@ import pytest
 from elasticsearch import Elasticsearch
 
 from benchmark.config import resolve_config
-from benchmark.providers import ProviderError
+from benchmark.providers.inference import ProviderError
 from benchmark.runner import ExperimentRunner
 
 from tests.conftest import WANDS_SAMPLE_DIR

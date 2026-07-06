@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 
 from benchmark.config import load_config
-from benchmark.logging_setup import get_logger, setup_logging
+from benchmark.common.logging_setup import get_logger, setup_logging
 from benchmark.runner import ExperimentRunner
 
 log = get_logger(__name__)

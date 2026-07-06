@@ -80,21 +80,26 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 ```
 .
 ├── benchmark/                 # the harness package
-│   ├── models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, IndexMapping
-│   ├── protocols.py           # Searcher/Fuser/Reranker + Dataset ABCs; Embedder, RerankClient, Indexer, SearchBackend, SearcherFactory
-│   ├── providers.py           # provider connectors: OpenAI/Cohere/Voyage embedders + Cohere/Voyage rerankers (stdlib-HTTP)
-│   ├── pipeline.py            # RRFFuser, HybridSearch, SearchPipeline (the composers)
-│   ├── fusion.py              # fuse_rrf_local (client-side RRF, windowed)
-│   ├── rerank.py              # rerank_local (client-side score+reorder helper, windowed)
-│   ├── metrics.py             # Evaluator, Metrics, QrelIndex
-│   ├── stats.py               # Comparator (bootstrap CI, Wilcoxon/permutation, FDR/BH-BY)
-│   ├── runner.py              # ExperimentRunner — the single execution path
-│   ├── io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
-│   ├── config.py              # config value types (PipelineCfg/Services/ResolvedConfig, NO expansion) + build_pipeline; YAML/JSON load + resolve; lazy adapter factories
+│   ├── common/                # (g) shared bottom layer — depends on nothing
+│   │   ├── models.py          # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, IndexMapping, enums
+│   │   ├── protocols.py       # Searcher/Fuser/Reranker + Dataset ABCs; Embedder, RerankClient, IndexWriter Protocols
+│   │   ├── ranking.py         # fuse_rrf_local + rerank_local (pure windowed ranking primitives)
+│   │   └── logging_setup.py   # console + file logging (logs/run_{timestamp}.log)
+│   ├── providers/             # (f) concrete adapters — depend ONLY on common
+│   │   ├── inference.py       # OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib-HTTP)
+│   │   └── elasticsearch.py   # LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter, build_searchers/build_rerankers
+│   ├── embedding.py           # (c) make_embedder + EMBEDDER_PROVIDERS (dispatch provider -> providers.inference)
+│   ├── reranking.py           # (d) make_reranker + RERANKER_PROVIDERS (dispatch provider -> providers.inference)
+│   ├── indexing.py            # (a) Indexer (backend-agnostic build orchestration) + embed-at-ingest streaming
+│   ├── search.py              # (b) RRFFuser, HybridSearch, SearchPipeline (the composers)
+│   ├── evaluation/            # (e) scoring + statistics
+│   │   ├── metrics.py         # Evaluator, Metrics, QrelIndex
+│   │   └── stats.py           # Comparator (bootstrap CI, Wilcoxon/permutation, FDR/BH-BY)
 │   ├── datasets/
 │   │   └── wands.py           # WandsDataset (label→gain, search_text concat)
-│   └── backends/
-│       └── elasticsearch.py   # ElasticsearchBackend, ESIndexer, LexicalSearcher/VectorSearch/ESReranker
+│   ├── config.py              # config value types (PipelineCfg/Services/ResolvedConfig, NO expansion) + build_pipeline; YAML/JSON load + resolve; lazy dotted adapter factories
+│   ├── runner.py              # ExperimentRunner — the single execution path
+│   └── io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
 ├── dataset/
 │   └── wands/                 # query.csv, product.csv, label.csv  (NOT in the repo; see below)
 ├── results/                   # run artifacts land here (gitignored)
@@ -106,7 +111,7 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 └── LICENSE                    # MIT
 ```
 
-Module names and responsibilities follow §11 of the design doc. `pipeline`, `metrics`, `stats`, `runner`, and `io_csv` depend only on `models`/`protocols`; `config.py` (the config layer — value types + `build_pipeline` + loader) imports `pipeline` for the composers, a one-way wiring edge; adapters are selected by `config.py`'s lazy factories.
+Module names and responsibilities follow §11 of the design doc. The `a–g` layers form a strict acyclic engine (`common` ← `providers` ← `embedding`/`reranking` ← `indexing`/`search`/`evaluation`); the domain layers import only `common` abstractions at import time and consume concrete `providers` pieces injected at runtime. `config.py`, `runner.py`, `io_csv.py` are the composition layer above the engine: `config.py` (config value types + `build_pipeline` + loader) imports `search` for the composers, a one-way wiring edge, and selects adapters via its lazy dotted-target factories, so no engine module names an adapter.
 ---
 
 ## Install
@@ -154,7 +159,7 @@ A single-node cluster reports **yellow** (replicas unassigned), which is expecte
 
 ### Configure provider connectors
 
-Embedding and reranker models are **provider connectors** (`benchmark/providers.py`): the harness calls Cohere / Voyage / OpenAI directly over HTTP — ES runs no inference. You declare each as a `services` entry in `config.yaml`; secrets are injected from environment variables at load time. A connector is just a `provider` + a `settings` block (`api_key`, `model_id`, optional `rate_limit.requests_per_minute`, `batch_size`, `dims`). **OpenAI has no reranker** — a `reranker` with `provider: openai` is rejected at load.
+Embedding and reranker models are **provider connectors** (`benchmark/providers/inference.py`): the harness calls Cohere / Voyage / OpenAI directly over HTTP — ES runs no inference. You declare each as a `services` entry in `config.yaml`; secrets are injected from environment variables at load time. A connector is just a `provider` + a `settings` block (`api_key`, `model_id`, optional `rate_limit.requests_per_minute`, `batch_size`, `dims`). **OpenAI has no reranker** — a `reranker` with `provider: openai` is rejected at load.
 
 Set only the variables for providers you actually use:
 

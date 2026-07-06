@@ -46,7 +46,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
-from benchmark.models import Qrel, RankedResult
+from benchmark.common.models import Qrel, RankedResult
 
 #: Evaluation cutoff k (§7).
 DEFAULT_CUTOFF = 10

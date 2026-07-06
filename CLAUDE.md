@@ -8,7 +8,7 @@ A reproducible **search-relevance benchmark harness**. It measures how much each
 strategy improves over a **BM25 baseline** on a fixed dataset + qrel set. First instantiation:
 **WANDS** dataset on **ElasticSearch** as a plain BM25 + `dense_vector` index. The harness owns
 inference: it computes embeddings and rerank scores via **provider connectors** (Cohere, Voyage,
-OpenAI) in `benchmark/providers.py` — ES runs no `_inference`.
+OpenAI) in `benchmark/providers/inference.py` — ES runs no `_inference`.
 
 - **`docs/experiment.md`** — authoritative experimental design (abstractions, metrics, statistics).
   **This is the source of truth.** When code and this doc disagree on a name or schema, the doc wins.
@@ -30,8 +30,10 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   `semantic_rerank`, `hybrid_rerank`) are config rows through a single `SearchPipeline` +
   `ExperimentRunner`. No per-variant code.
 - **Generality.** Swapping dataset, backend/vector index, embedding model, or reranker must be a
-  new adapter + config only — never edits to pipeline/evaluator/stats. ES + WANDS are adapters
-  behind Protocols.
+  new adapter + config only — never edits to the domain engine (`search`/`indexing`/`evaluation`).
+  ES + WANDS are adapters behind Protocols; a new backend is an `IndexWriter` +
+  `build_searchers`/`build_rerankers` in `providers/` + config target-table rows, no per-backend
+  `Indexer`/factory (the domain `Indexer` is backend-agnostic and shared).
 - **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. Binary-relevance
   threshold for precision/recall is `gain >= 0.5` (Partial or Exact). A **MISSING** judgement (no
   qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (§7) — **NOT** treated
@@ -66,7 +68,7 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   "not found; creating it"). If it is *unexpected*, log a `warning`/`error` with context **or** let
   it bubble up. Don't widen the `try` to swallow errors you did not mean to catch. A silent `pass`
   hides both the intent and real failures.
-- **Use logging, not `print()`.** Get a logger via `benchmark.logging_setup.get_logger(__name__)`
+- **Use logging, not `print()`.** Get a logger via `benchmark.common.logging_setup.get_logger(__name__)`
   and call `setup_logging()` once at each entry point — it logs to the console and to
   `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.
 - Before changing a name/schema, check it against `docs/experiment.md` and keep both files consistent.

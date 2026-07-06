@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 
-from benchmark.logging_setup import get_logger, setup_logging
+from benchmark.common.logging_setup import get_logger, setup_logging
 
 log = get_logger(__name__)
 

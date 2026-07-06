@@ -13,13 +13,17 @@ Two seams (§3.4), realized here as concrete connectors:
 - :class:`RerankClient` (``rerank_scores`` → one relevance score per document, aligned to input):
   :class:`CohereReranker`, :class:`VoyageReranker`. A backend ``Reranker`` (ES ``ESReranker``) fetches
   candidate doc-text and calls this over it. **OpenAI has no reranker** — a reranker configured with
-  ``provider: openai`` is rejected (:func:`make_reranker`).
+  ``provider: openai`` is rejected by :func:`benchmark.reranking.make_reranker`.
+
+The provider->class dispatch tables + the ``make_embedder`` / ``make_reranker`` factories live in the
+``benchmark.embedding`` / ``benchmark.reranking`` layers (c/d); this module holds only the concrete
+connectors.
 
 Zero new dependencies (CLAUDE.md — favor stdlib): HTTP is stdlib :mod:`urllib.request` + :mod:`json`.
 The three providers share nearly identical REST shapes, so one :func:`_post_json` (retry/backoff on
 429/5xx, honoring ``Retry-After``) + a :class:`RateLimiter` (``requests_per_minute``) back every
-connector. Imports only ``benchmark.protocols`` (for structural conformance typing, not required at
-runtime) + the cross-cutting ``logging_setup`` + stdlib — never a backend/dataset (§11).
+connector. Imports only the cross-cutting ``benchmark.common.logging_setup`` + stdlib — never a
+backend/dataset (§11).
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Mapping, Sequence
 
-from benchmark.logging_setup import get_logger
+from benchmark.common.logging_setup import get_logger
 
 logger = get_logger(__name__)
 
@@ -372,42 +376,3 @@ class VoyageReranker(_BaseReranker):
     default_url = "https://api.voyageai.com/v1/rerank"
     _results_key = "data"
     _top_param = "top_k"
-
-
-# --- factories (dispatch on provider) ----------------------------------------------------------
-
-#: Embedder providers. Source of truth for config-time validation (config.py mirrors these names).
-_EMBEDDER_CLASSES: Mapping[str, type[_BaseEmbedder]] = {
-    "openai": OpenAIEmbedder,
-    "cohere": CohereEmbedder,
-    "voyage": VoyageEmbedder,
-}
-#: Reranker providers — OpenAI is DELIBERATELY absent (it has no reranker, §3.4).
-_RERANKER_CLASSES: Mapping[str, type[_BaseReranker]] = {
-    "cohere": CohereReranker,
-    "voyage": VoyageReranker,
-}
-
-EMBEDDER_PROVIDERS = frozenset(_EMBEDDER_CLASSES)
-RERANKER_PROVIDERS = frozenset(_RERANKER_CLASSES)
-
-
-def make_embedder(name: str, provider: str, settings: Mapping[str, Any]) -> _BaseEmbedder:
-    """Build the embedding connector for ``provider`` (§3.4). Unknown provider raises (exhaustive)."""
-    cls = _EMBEDDER_CLASSES.get(provider)
-    if cls is None:
-        raise ValueError(
-            f"unknown embedder provider {provider!r}; expected one of {sorted(_EMBEDDER_CLASSES)}"
-        )
-    return cls(name, settings)
-
-
-def make_reranker(name: str, provider: str, settings: Mapping[str, Any]) -> _BaseReranker:
-    """Build the rerank connector for ``provider`` (§5.4). Unknown / openai provider raises."""
-    cls = _RERANKER_CLASSES.get(provider)
-    if cls is None:
-        raise ValueError(
-            f"unknown reranker provider {provider!r}; expected one of {sorted(_RERANKER_CLASSES)} "
-            "(openai has no reranker)"
-        )
-    return cls(name, settings)

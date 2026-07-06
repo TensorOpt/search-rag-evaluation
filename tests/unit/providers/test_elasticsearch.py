@@ -1,12 +1,14 @@
 """Offline unit tests for the ES adapter — the ES client + provider connectors are FAKES (no network).
 
 ES is a plain vector/BM25 index (§1.1): no ``_inference``/``semantic_text``. Covers the ingest seam
-(``ensure_index`` / streamed ``bulk_index``); the searchers — ``LexicalSearcher``'s ``match`` body and
-``VectorSearch``'s embed-query + ``knn`` body, both over the shared ``_search``/``_msearch`` helpers'
-client-side score-desc/doc_id-asc tie-break; ``ESReranker`` (``mget`` doc-text + a provider
-``RerankClient`` + ``rerank_local`` reorder); ``ESIndexer.build`` (dense_vector mapping, dot-free sem
-fields, embed-at-ingest); the ``make_searcher_factory`` builders; and a client-side ``HybridSearch``
-== ``fuse_rrf_local`` cross-check. See docs/experiment.md §3.3-§3.7, §5.
+(``ESIndexWriter``: ``ensure_index`` / streamed ``bulk_index`` + ``create_mapping``/``sem_field_name``);
+the searchers — ``LexicalSearcher``'s ``match`` body and ``VectorSearch``'s embed-query + ``knn`` body,
+both over the shared ``_search``/``_msearch`` helpers' client-side score-desc/doc_id-asc tie-break;
+``ESReranker`` (``mget`` doc-text + a provider ``RerankClient`` + ``rerank_local`` reorder); the
+``build_searchers``/``build_rerankers`` leaf builders (replacing the deleted ``_ESSearcherFactory``); and
+a client-side ``HybridSearch`` == ``fuse_rrf_local`` cross-check. The domain ``Indexer`` orchestration
+(embed-at-ingest, ensure→index call order) is covered in ``tests/unit/test_indexing.py``. See
+docs/experiment.md §3.3-§3.7, §5.
 """
 
 from __future__ import annotations
@@ -17,9 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from elasticsearch.helpers import BulkIndexError
 
-from benchmark.backends import elasticsearch as es
-from benchmark.fusion import fuse_rrf_local
-from benchmark.models import (
+from benchmark.common.models import (
     Document,
     FieldRole,
     FieldSchema,
@@ -27,8 +27,10 @@ from benchmark.models import (
     IndexMapping,
     ScoredDoc,
 )
-from benchmark.pipeline import HybridSearch, RRFFuser
-from benchmark.protocols import Dataset, Searcher
+from benchmark.common.protocols import Dataset, Searcher
+from benchmark.common.ranking import fuse_rrf_local
+from benchmark.providers import elasticsearch as es
+from benchmark.search import HybridSearch, RRFFuser
 
 INDEXER_CFG = {"index": "wands_bench", "settings": {"url": "http://localhost:9200"}}
 
@@ -40,14 +42,14 @@ def _fake_client() -> MagicMock:
     return client
 
 
-def _backend_with(client: MagicMock) -> es.ElasticsearchBackend:
-    """Build an ``ElasticsearchBackend`` without constructing a real client."""
-    backend = es.ElasticsearchBackend.__new__(es.ElasticsearchBackend)
-    backend.index = INDEXER_CFG["index"]
-    backend.client = client
-    backend.bulk_chunk_size = es._BULK_CHUNK_SIZE
-    backend.embed_batch_size = es._EMBED_BATCH_SIZE
-    return backend
+def _writer_with(client: MagicMock) -> es.ESIndexWriter:
+    """Build an ``ESIndexWriter`` without constructing a real client."""
+    writer = es.ESIndexWriter.__new__(es.ESIndexWriter)
+    writer.index = INDEXER_CFG["index"]
+    writer.client = client
+    writer.bulk_chunk_size = es._BULK_CHUNK_SIZE
+    writer.embed_batch_size = es._EMBED_BATCH_SIZE
+    return writer
 
 
 # --- fake provider connectors -----------------------------------------------------------------
@@ -107,9 +109,9 @@ def _mapping() -> IndexMapping:
 def test_ensure_index_creates_with_backend_mapping() -> None:
     client = _fake_client()
     client.indices.exists.return_value = False
-    backend = _backend_with(client)
+    writer = _writer_with(client)
 
-    backend.ensure_index(_mapping())
+    writer.ensure_index(_mapping())
 
     client.indices.create.assert_called_once()
     kwargs = client.indices.create.call_args.kwargs
@@ -120,9 +122,9 @@ def test_ensure_index_creates_with_backend_mapping() -> None:
 def test_ensure_index_idempotent_when_index_exists() -> None:
     client = _fake_client()
     client.indices.exists.return_value = True
-    backend = _backend_with(client)
+    writer = _writer_with(client)
 
-    backend.ensure_index(_mapping())
+    writer.ensure_index(_mapping())
 
     client.indices.create.assert_not_called()  # existing index -> skip, no raise
 
@@ -158,13 +160,13 @@ def test_bulk_index_streams_chunked_actions_then_refreshes(
 ) -> None:
     captured = _capture_bulk_actions(monkeypatch)
     client = _fake_client()
-    backend = _backend_with(client)
+    writer = _writer_with(client)
 
     docs = [
         Document(doc_id="p1", fields={"search_text": "sofa"}),
         Document(doc_id="p2", fields={"search_text": "table"}),
     ]
-    backend.bulk_index(docs, mapping=_mapping())
+    writer.bulk_index(docs, mapping=_mapping())
 
     # one action per doc: {"_op_type": "index", "_index": idx, "_id": doc_id, "_source": fields}
     assert captured == [
@@ -188,8 +190,8 @@ def test_bulk_index_actions_iterable_is_lazy(monkeypatch: pytest.MonkeyPatch) ->
             yield (True, {"index": {"_id": action["_id"]}})
 
     monkeypatch.setattr(es, "streaming_bulk", fake_streaming_bulk)
-    backend = _backend_with(_fake_client())
-    backend.bulk_index([Document(doc_id="p1", fields={"t": "x"})], mapping=_mapping())
+    writer = _writer_with(_fake_client())
+    writer.bulk_index([Document(doc_id="p1", fields={"t": "x"})], mapping=_mapping())
 
     assert seen_type["is_iterator"] is True
     assert seen_type["is_list"] is False
@@ -198,14 +200,14 @@ def test_bulk_index_actions_iterable_is_lazy(monkeypatch: pytest.MonkeyPatch) ->
 def test_bulk_index_failed_item_raises_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
     _capture_bulk_actions(monkeypatch, fail_on="p2")
     client = _fake_client()
-    backend = _backend_with(client)
+    writer = _writer_with(client)
 
     docs = [
         Document(doc_id="p1", fields={"search_text": "sofa"}),
         Document(doc_id="p2", fields={"search_text": "table"}),
     ]
     with pytest.raises(RuntimeError, match="simulated failed item p2"):
-        backend.bulk_index(docs, mapping=_mapping())
+        writer.bulk_index(docs, mapping=_mapping())
     # a failed item aborts before refresh (the error surfaces, exception convention)
     client.indices.refresh.assert_not_called()
 
@@ -226,23 +228,23 @@ def test_bulk_index_logs_per_item_reasons_then_reraises(
         yield  # pragma: no cover - generator marker
 
     monkeypatch.setattr(es, "streaming_bulk", fake_streaming_bulk)
-    backend = _backend_with(_fake_client())
+    writer = _writer_with(_fake_client())
 
     with caplog.at_level("ERROR"):
         with pytest.raises(BulkIndexError):
-            backend.bulk_index([Document(doc_id="p2", fields={"search_text": "x"})], mapping=_mapping())
+            writer.bulk_index([Document(doc_id="p2", fields={"search_text": "x"})], mapping=_mapping())
 
     assert "wrong vector dims" in caplog.text  # the real reason is surfaced
     assert "p2" in caplog.text
-    backend.client.indices.refresh.assert_not_called()  # re-raised before refresh
+    writer.client.indices.refresh.assert_not_called()  # re-raised before refresh
 
 
 def test_bulk_index_no_docs_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     _capture_bulk_actions(monkeypatch)
     client = _fake_client()
-    backend = _backend_with(client)
+    writer = _writer_with(client)
 
-    backend.bulk_index([], mapping=_mapping())
+    writer.bulk_index([], mapping=_mapping())
 
     client.indices.refresh.assert_not_called()  # nothing indexed -> no refresh
 
@@ -354,50 +356,64 @@ def test_lexical_bulk_search_empty_queries_no_round_trip() -> None:
     client.msearch.assert_not_called()
 
 
-# --- make_searcher_factory --------------------------------------------------------------------
+# --- build_searchers / build_rerankers (replacing _ESSearcherFactory) -------------------------
+
+#: A search-side IndexMapping the builders name fields from (search_text + one dense_vector field).
+_SEARCH_MAPPING = IndexMapping(
+    index_name="wands_bench",
+    search_text_field="search_text",
+    sem_fields={"e5": "sem__e5"},
+    backend_mapping={},
+)
 
 
-def _factory(client: MagicMock, monkeypatch: pytest.MonkeyPatch, **kw: Any) -> Any:
+def _patch_client(monkeypatch: pytest.MonkeyPatch, client: MagicMock) -> None:
+    """Route the builders' shared-client ``_open`` at the fake client (clear the process cache)."""
     monkeypatch.setattr(es, "_make_client", lambda cfg: client)
-    embedders = kw.pop("embedders", {})
-    rerankers = kw.pop("rerankers", {})
-    return es.make_searcher_factory(INDEXER_CFG, embedders=embedders, rerankers=rerankers)
+    es._SEARCH_CLIENTS.clear()
 
 
-def test_factory_lexical_builds_lexical_searcher(monkeypatch: pytest.MonkeyPatch) -> None:
-    factory = _factory(_fake_client(), monkeypatch)
-    searcher = factory.lexical(fields=["search_text"])
+def test_build_searchers_lexical(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_client(monkeypatch, _fake_client())
+    out = es.build_searchers(INDEXER_CFG, _SEARCH_MAPPING, [("bm25", "lexical", None)], embedders={})
 
+    searcher = out["bm25"]
     assert isinstance(searcher, es.LexicalSearcher)
     assert searcher.index == "wands_bench"
     assert searcher.field == "search_text"
 
 
-def test_factory_vector_builds_vector_search_with_query_embedder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_build_searchers_vector_attaches_query_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
     embedder = _FakeEmbedder("e5")
-    factory = _factory(_fake_client(), monkeypatch, embedders={"e5": embedder})
+    _patch_client(monkeypatch, _fake_client())
+    out = es.build_searchers(
+        INDEXER_CFG, _SEARCH_MAPPING, [("semantic_e5", "vector", "e5")], embedders={"e5": embedder}
+    )
 
-    searcher = factory.vector(field="sem__e5", embedder_id="e5")
-
+    searcher = out["semantic_e5"]
     assert isinstance(searcher, es.VectorSearch)
     assert searcher.index == "wands_bench"
-    assert searcher.field == "sem__e5"
+    assert searcher.field == "sem__e5"  # mapping.sem_field("e5")
     assert searcher.query_embedder is embedder  # the referenced connector is attached
 
 
-def test_factory_reranker_builds_es_reranker_with_connector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_build_searchers_unknown_kind_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_client(monkeypatch, _fake_client())
+    with pytest.raises(ValueError, match="unknown kind"):
+        es.build_searchers(INDEXER_CFG, _SEARCH_MAPPING, [("bad", "bogus", None)], embedders={})
+
+
+def test_build_rerankers_binds_connector(monkeypatch: pytest.MonkeyPatch) -> None:
     rerank_client = _FakeRerankClient([1.0])
-    factory = _factory(_fake_client(), monkeypatch, rerankers={"co-rr": rerank_client})
+    _patch_client(monkeypatch, _fake_client())
+    out = es.build_rerankers(
+        INDEXER_CFG, _SEARCH_MAPPING, ["co-rr"], rerank_clients={"co-rr": rerank_client}
+    )
 
-    reranker = factory.reranker("co-rr", "search_text")
-
+    reranker = out["co-rr"]
     assert isinstance(reranker, es.ESReranker)
     assert reranker.index == "wands_bench"
-    assert reranker.field == "search_text"
+    assert reranker.field == "search_text"  # mapping.search_text_field
     assert reranker.rerank_client is rerank_client  # the referenced connector is attached
 
 
@@ -549,7 +565,7 @@ def test_reranker_empty_candidates_no_round_trip() -> None:
     assert rerank_client.calls == []
 
 
-# --- ESIndexer.build (dense_vector mapping + embed-at-ingest) ----------------------------------
+# --- ESIndexWriter.create_mapping + sem_field_name (dense_vector mapping) ----------------------
 
 
 class _FakeDataset(Dataset):
@@ -579,40 +595,26 @@ class _FakeDataset(Dataset):
         )
 
 
-class _RecordingBackend:
-    """A fake ``SearchBackend`` recording call order + the mapping/docs it was handed (no register)."""
-
-    def __init__(self) -> None:
-        self.index = "wands_bench"
-        self.embed_batch_size = es._EMBED_BATCH_SIZE
-        self.calls: list[str] = []
-        self.ensured_mapping: Any = None
-        self.indexed_docs: list[Document] = []
-
-    def ensure_index(self, mapping: Any) -> None:
-        self.calls.append("ensure")
-        self.ensured_mapping = mapping
-
-    def bulk_index(self, docs: Any, *, mapping: Any) -> None:
-        self.calls.append("index")
-        self.indexed_docs = list(docs)  # drive the streamed generator
-
-
-def test_indexer_builds_dense_vector_mapping_and_embeds_at_ingest() -> None:
-    backend = _RecordingBackend()
+def test_writer_sem_field_name_is_dot_free() -> None:
+    writer = _writer_with(_fake_client())
     # embedder id carries dots -> the dense_vector field name must be dot-free.
-    embedders = [_FakeEmbedder("e5.small.v1", dim=4)]
+    assert writer.sem_field_name("e5.small.v1") == "sem__e5_small_v1"
+    assert "." not in writer.sem_field_name("e5.small.v1")
 
-    mapping = es.ESIndexer().build(_FakeDataset(), backend, embedders)
 
-    # ensure BEFORE index (no register step — ES is a plain index)
-    assert backend.calls == ["ensure", "index"]
+def test_writer_create_mapping_dense_vector_and_roles() -> None:
+    writer = _writer_with(_fake_client())
+    schema = _FakeDataset().field_schema()
+    sem_field = writer.sem_field_name("e5.small.v1")
+    sem_fields = {"e5.small.v1": sem_field}
+    vector_dims = {sem_field: 4}
+
+    mapping = writer.create_mapping(schema, sem_fields, vector_dims)
 
     props = mapping.backend_mapping["properties"]
-    sem_field = "sem__e5_small_v1"  # dots -> "_", prefixed
     # search_text is a plain text field — NO copy_to, NO semantic_text (§5.2)
     assert props["search_text"] == {"type": "text"}
-    # one dense_vector field per embedder (dims from embedder.dim, cosine, indexed)
+    # one dense_vector field per embedder (dims from vector_dims, cosine, indexed)
     assert props[sem_field] == {
         "type": "dense_vector",
         "dims": 4,
@@ -632,28 +634,22 @@ def test_indexer_builds_dense_vector_mapping_and_embeds_at_ingest() -> None:
     assert mapping.search_text_field == "search_text"
     assert mapping.index_name == "wands_bench"
 
-    # the corpus was embedded at ingest: each indexed doc carries its dense_vector under the sem field
-    assert [d.doc_id for d in backend.indexed_docs] == ["p1"]
-    stored = backend.indexed_docs[0].fields[sem_field]
-    assert stored == [0.0, 0.0, 0.0, 0.0]  # _FakeEmbedder's index-0 vector, dim 4
-    assert backend.indexed_docs[0].fields["search_text"] == "sofa"  # original field preserved
-    assert backend.ensured_mapping is mapping
 
+def test_writer_create_mapping_multiple_embedders_one_dense_vector_each() -> None:
+    writer = _writer_with(_fake_client())
+    schema = _FakeDataset().field_schema()
+    sem_fields = {
+        "e5-small": writer.sem_field_name("e5-small"),
+        "elser": writer.sem_field_name("elser"),
+    }
+    vector_dims = {sem_fields["e5-small"]: 3, sem_fields["elser"]: 5}
 
-def test_indexer_multiple_embedders_one_dense_vector_each() -> None:
-    backend = _RecordingBackend()
-    embedders = [_FakeEmbedder("e5-small", dim=3), _FakeEmbedder("elser", dim=5)]
-
-    mapping = es.ESIndexer().build(_FakeDataset(), backend, embedders)
+    mapping = writer.create_mapping(schema, sem_fields, vector_dims)
 
     props = mapping.backend_mapping["properties"]
     assert props["sem__e5_small"]["type"] == "dense_vector" and props["sem__e5_small"]["dims"] == 3
     assert props["sem__elser"]["type"] == "dense_vector" and props["sem__elser"]["dims"] == 5
     assert mapping.sem_field("elser") == "sem__elser"
-    # each indexed doc carries BOTH embedders' vectors
-    doc_fields = backend.indexed_docs[0].fields
-    assert len(doc_fields["sem__e5_small"]) == 3
-    assert len(doc_fields["sem__elser"]) == 5
 
 
 # --- client-side hybrid cross-check (fakes, no live models) -----------------------------------

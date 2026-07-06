@@ -14,8 +14,8 @@ from typing import Sequence
 
 import pytest
 
-from benchmark.models import ScoredDoc
-from benchmark.protocols import Reranker, Searcher
+from benchmark.common.models import ScoredDoc
+from benchmark.common.protocols import Reranker, Searcher
 
 TESTS_DIR = Path(__file__).parent
 FIXTURES_DIR = TESTS_DIR / "fixtures"

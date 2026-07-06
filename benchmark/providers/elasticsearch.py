@@ -1,19 +1,21 @@
-"""ES adapter: LexicalSearcher, VectorSearch, ESReranker, ESIndexer, ElasticsearchBackend (ingest).
+"""ES adapter: LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter + build_searchers/build_rerankers.
 
 docs/experiment.md §3.3, §3.4, §3.5, §5. ES is a **plain vector/BM25 index** (§1.1) — it is NOT an
 inference gateway. The harness computes embeddings via the provider connectors
-(``benchmark.providers``, §3.4) and stores them in ``dense_vector`` fields; there is no
+(``benchmark.providers.inference``, §3.4) and stores them in ``dense_vector`` fields; there is no
 ``_inference`` endpoint, no ``semantic_text`` field, and no ``register_inference``.
 
-- Ingest (:class:`ElasticsearchBackend` + :class:`ESIndexer`): the indexer embeds the corpus with
-  each :class:`~benchmark.protocols.Embedder` (batched, §3.5) and writes one ``dense_vector`` field
-  per embedder alongside the BM25 ``search_text`` field; ``bulk_index`` streams via
-  ``helpers.streaming_bulk``.
+- Ingest (:class:`ESIndexWriter`, the ``IndexWriter`` seam the domain ``Indexer`` delegates to): names
+  the ``dense_vector`` field per embedder, builds the §5.2 mapping, creates the index, and streams
+  already-embedded documents via ``helpers.streaming_bulk``.
 - Lexical retrieval (:class:`LexicalSearcher`): a ``match`` query on ``search_text``.
 - Vector retrieval (:class:`VectorSearch`): embed the query with the embedder, then an ES ``knn``
   query over that embedder's ``dense_vector`` field — batched via the shared ``_msearch``.
 - Rerank (:class:`ESReranker`): fetch candidate doc-text (``mget``) and score it with a provider
-  :class:`~benchmark.protocols.RerankClient`, reordering client-side via ``rerank_local``.
+  :class:`~benchmark.common.protocols.RerankClient`, reordering client-side via ``rerank_local``.
+- Leaf builders (:func:`build_searchers` / :func:`build_rerankers`): mint the full configured set of
+  leaf ``Searcher``s / ``Reranker``s over ONE shared ES client (§4), replacing the deleted
+  ``_ESSearcherFactory``.
 
 Fusion stays client-side (``RRFFuser``) — no server-side ``rrf``. The ES client
 (``elasticsearch>=8.15,<9``) is pinned, so its API is called DIRECTLY — no ``getattr``/``hasattr``
@@ -28,16 +30,16 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import BulkIndexError, streaming_bulk
 
-from benchmark.logging_setup import get_logger
-from benchmark.models import (
+from benchmark.common.logging_setup import get_logger
+from benchmark.common.models import (
     Document,
     FieldRole,
     FieldSchema,
     IndexMapping,
     ScoredDoc,
 )
-from benchmark.protocols import Dataset, Embedder, Reranker, RerankClient, Searcher
-from benchmark.rerank import rerank_local
+from benchmark.common.protocols import Embedder, Reranker, RerankClient, Searcher
+from benchmark.common.ranking import rerank_local
 
 logger = get_logger(__name__)
 
@@ -129,13 +131,14 @@ def _msearch(
     return results
 
 
-class ElasticsearchBackend:
-    """The ES ingest seam used by ``Indexer.build`` (``SearchBackend``, §3.3/§3.5).
+class ESIndexWriter:
+    """The ES ``IndexWriter`` seam the domain ``Indexer`` delegates to (§3.3/§3.5).
 
-    Creates the index mapping and bulk-indexes documents. ES is a plain index writer — the harness
-    embeds the corpus client-side (:class:`~benchmark.protocols.Embedder`) and hands documents whose
-    field bag already carries the ``dense_vector`` values; no inference runs server-side. Both ingest
-    methods are idempotent so a re-run over an existing index is a no-op.
+    Names the ``dense_vector`` field per embedder, builds the §5.2 ``IndexMapping``, creates the
+    index, and bulk-indexes documents. ES is a plain index writer — the harness embeds the corpus
+    client-side (:class:`~benchmark.common.protocols.Embedder`) and hands documents whose field bag
+    already carries the ``dense_vector`` values; no inference runs server-side. Both ingest methods
+    are idempotent so a re-run over an existing index is a no-op.
     """
 
     def __init__(self, indexer_cfg: Mapping[str, Any]) -> None:
@@ -144,6 +147,30 @@ class ElasticsearchBackend:
         settings = indexer_cfg["settings"]
         self.bulk_chunk_size: int = int(settings.get("bulk_chunk_size", _BULK_CHUNK_SIZE))
         self.embed_batch_size: int = int(settings.get("embed_batch_size", _EMBED_BATCH_SIZE))
+
+    def sem_field_name(self, embedder_id: str) -> str:
+        """The backend-safe ``dense_vector`` field name for ``embedder_id`` (§5.2)."""
+        return _sem_field_name(embedder_id)
+
+    def create_mapping(
+        self,
+        schema: FieldSchema,
+        sem_fields: Mapping[str, str],
+        vector_dims: Mapping[str, int],
+    ) -> IndexMapping:
+        """Translate ``schema`` (+ per-field vector dims) into the §5.2 ``IndexMapping``.
+
+        ``sem_fields`` maps embedder id -> its ``dense_vector`` field name; ``vector_dims`` maps that
+        field name -> the embedder's output dim. Produces the same ``{"properties": {...}}`` body the
+        former free ``_schema_to_mapping`` built, wrapped in an ``IndexMapping`` naming this index.
+        """
+        backend_mapping = _schema_to_mapping(schema, vector_dims)
+        return IndexMapping(
+            index_name=self.index,
+            search_text_field=schema.search_text_field,
+            sem_fields=dict(sem_fields),
+            backend_mapping=backend_mapping,
+        )
 
     def ensure_index(self, mapping: IndexMapping) -> None:
         """Create ``mapping.index_name`` with the §5.2 mappings body; skip if it exists (idempotent)."""
@@ -305,12 +332,12 @@ class VectorSearch(Searcher):
 
 
 class ESReranker(Reranker):
-    """Client-side ``Reranker`` over a provider :class:`~benchmark.protocols.RerankClient` (§3.7, §5.4).
+    """Client-side ``Reranker`` over a provider :class:`~benchmark.common.protocols.RerankClient` (§3.7, §5.4).
 
     ``field`` is the doc-text field (``search_text``) whose value is fed to the reranker.
     ``rerank_client`` is the provider connector (Cohere/Voyage, §3.4). ``rerank`` fetches each
     candidate's text by id (one ``mget``), then delegates the windowed reorder to
-    :func:`benchmark.rerank.rerank_local`: ``score_fn`` calls ``rerank_client.rerank_scores`` over the
+    :func:`benchmark.common.ranking.rerank_local`: ``score_fn`` calls ``rerank_client.rerank_scores`` over the
     candidate doc-text (scores returned ALIGNED to input, higher = more relevant).
     """
 
@@ -373,104 +400,6 @@ def _sem_field_name(embedder_id: str) -> str:
     return _SEM_FIELD_PREFIX + re.sub(r"[^0-9a-zA-Z]+", "_", embedder_id)
 
 
-def _embed_documents(
-    docs: Iterable[Document],
-    embedders: Sequence[Embedder],
-    sem_fields: Mapping[str, str],
-    search_text_field: str,
-    batch_size: int,
-) -> Iterator[Document]:
-    """Stream ``docs``, attaching each embedder's document vector under its ``dense_vector`` field (§3.5).
-
-    Buffers ``batch_size`` docs, embeds their ``search_text`` with EACH embedder in one provider call
-    per batch (the connector sub-chunks to its own limit), and yields COPIES of the docs enriched with
-    the vectors — STAYS LAZY (bounded buffer; the corpus is never fully materialized). A doc missing
-    the ``search_text`` field RAISES (never silently embeds empty).
-    """
-    batch: list[Document] = []
-    for doc in docs:
-        batch.append(doc)
-        if len(batch) >= batch_size:
-            yield from _embed_batch(batch, embedders, sem_fields, search_text_field)
-            batch = []
-    if batch:
-        yield from _embed_batch(batch, embedders, sem_fields, search_text_field)
-
-
-def _embed_batch(
-    batch: Sequence[Document],
-    embedders: Sequence[Embedder],
-    sem_fields: Mapping[str, str],
-    search_text_field: str,
-) -> Iterator[Document]:
-    """Embed one buffered batch with every embedder; yield the docs enriched with their vectors."""
-    texts: list[str] = []
-    for doc in batch:
-        if search_text_field not in doc.fields:
-            raise KeyError(
-                f"document {doc.doc_id!r} has no {search_text_field!r} field to embed"
-            )
-        texts.append(doc.fields[search_text_field])
-    vectors_by_embedder = {embedder.id: embedder.embed_documents(texts) for embedder in embedders}
-    for offset, doc in enumerate(batch):
-        fields = dict(doc.fields)
-        for embedder in embedders:
-            fields[sem_fields[embedder.id]] = vectors_by_embedder[embedder.id][offset]
-        yield Document(doc_id=doc.doc_id, fields=fields)
-
-
-class ESIndexer:
-    """Builds the single ES index from a dataset + embedder connectors (``Indexer``, §3.5).
-
-    Lifecycle: discover each embedder's output ``dim`` (probe / ``settings.dims``), translate the
-    dataset ``FieldSchema`` into the §5.2 mapping (a plain ``text`` ``search_text`` field + one
-    ``dense_vector`` field per embedder), then stream the corpus THROUGH the embedders
-    (:func:`_embed_documents`) so each document lands with its vectors. No inference endpoints are
-    registered (ES is a plain index, §1.1).
-    """
-
-    def build(
-        self,
-        dataset: Dataset,
-        backend: Any,
-        embeddings: Sequence[Embedder],
-    ) -> IndexMapping:
-        embedders = list(embeddings)
-
-        # 1. sem_fields: embedder id -> dense_vector field name. Discover each dim (probes the
-        #    provider or reads settings.dims) — needed to map the dense_vector field before ingest.
-        sem_fields: dict[str, str] = {embedder.id: _sem_field_name(embedder.id) for embedder in embedders}
-        vector_field_dims: dict[str, int] = {
-            sem_fields[embedder.id]: embedder.dim for embedder in embedders
-        }
-        logger.info(
-            "index %r: %d embedder(s) -> dense_vector fields %s",
-            backend.index, len(embedders), vector_field_dims,
-        )
-
-        # 2. Translate the dataset field schema into the ES "properties" body (§5.2).
-        schema = dataset.field_schema()
-        backend_mapping = _schema_to_mapping(schema, vector_field_dims)
-        mapping = IndexMapping(
-            index_name=backend.index,
-            search_text_field=schema.search_text_field,
-            sem_fields=sem_fields,
-            backend_mapping=backend_mapping,
-        )
-
-        # 3. Create the index, then stream the corpus through the embedders so each doc lands with
-        #    its dense_vector values. embed_batch_size is the ingest buffering granularity (§3.5).
-        backend.ensure_index(mapping)
-        embed_batch_size = getattr(backend, "embed_batch_size", _EMBED_BATCH_SIZE)
-        enriched = _embed_documents(
-            dataset.documents(), embedders, sem_fields, schema.search_text_field, embed_batch_size
-        )
-        backend.bulk_index(enriched, mapping=mapping)
-
-        # 4. Return the mapping so leaf Searchers can name fields without re-deriving them.
-        return mapping
-
-
 def _schema_to_mapping(
     schema: FieldSchema, vector_field_dims: Mapping[str, int]
 ) -> dict[str, Any]:
@@ -509,73 +438,89 @@ def _schema_to_mapping(
     return {"properties": properties}
 
 
-class _ESSearcherFactory:
-    """Backend-bound ``SearcherFactory`` (§4): builds leaf ``Searcher``s + the ``Reranker`` on the
-    ES client + index, wiring in the provider connectors.
+#: (name, kind, embedder_id-or-None) — the flat searcher spec ``config`` translates ``Services`` into
+#: so this adapter never imports ``config`` (§11). ``embedder_id`` is set only for ``kind == "vector"``.
+SearcherSpec = tuple[str, str, str | None]
 
-    Holds the resolved ``embedders`` (id -> ``Embedder``) and ``rerankers`` (name -> ``RerankClient``)
-    so ``vector`` can attach the right query embedder and ``reranker`` the right rerank connector.
+#: One ES client per ``url`` per process, SHARED by :func:`build_searchers` + :func:`build_rerankers`
+#: so a run's search phase opens exactly one client (as the deleted ``_ESSearcherFactory`` did, §4).
+#: ponytail: process-global cache; a single-run CLI reuses the client — swap for an explicit per-run
+#: connection object only if the harness ever runs multiple configs concurrently in one process.
+_SEARCH_CLIENTS: dict[str, Elasticsearch] = {}
+
+
+def _open(indexer_cfg: Mapping[str, Any]) -> tuple[Elasticsearch, int, int]:
+    """Open (or reuse) the shared search-side ES client + read the §10 search tuning knobs.
+
+    Returns ``(client, msearch_chunk_size, knn_num_candidates)``. The client is memoized by
+    ``settings.url`` so :func:`build_searchers` and :func:`build_rerankers` share ONE client per run.
     """
-
-    def __init__(
-        self,
-        client: Elasticsearch,
-        index: str,
-        *,
-        embedders: Mapping[str, Embedder],
-        rerankers: Mapping[str, RerankClient],
-        msearch_chunk_size: int = _MSEARCH_CHUNK_SIZE,
-        num_candidates: int = _KNN_NUM_CANDIDATES,
-    ) -> None:
-        self.client = client
-        self.index = index
-        self.embedders = embedders
-        self.rerankers = rerankers
-        self.msearch_chunk_size = msearch_chunk_size
-        self.num_candidates = num_candidates
-
-    def lexical(self, *, fields: Sequence[str]) -> Searcher:
-        return LexicalSearcher(
-            self.client, self.index, fields, msearch_chunk_size=self.msearch_chunk_size
-        )
-
-    def vector(self, *, field: str, embedder_id: str) -> Searcher:
-        return VectorSearch(
-            self.client,
-            self.index,
-            field,
-            self.embedders[embedder_id],
-            msearch_chunk_size=self.msearch_chunk_size,
-            num_candidates=self.num_candidates,
-        )
-
-    def reranker(self, name: str, field: str) -> Reranker:
-        return ESReranker(self.client, self.index, field, self.rerankers[name])
-
-
-def make_searcher_factory(
-    indexer_cfg: Mapping[str, Any],
-    *,
-    embedders: Mapping[str, Embedder],
-    rerankers: Mapping[str, RerankClient],
-) -> _ESSearcherFactory:
-    """Build the ES ``SearcherFactory`` bound to a client + index + the provider connectors (§4, §11).
-
-    ``build_pipeline`` (``config.py``) uses this seam to assemble a pipeline's leaf ``Searcher``s /
-    ``Reranker`` without importing this adapter: ``factory.lexical`` -> ``LexicalSearcher``,
-    ``factory.vector`` -> ``VectorSearch`` (with the referenced query embedder), ``factory.reranker``
-    -> ``ESReranker`` (with the referenced rerank connector). ``embedders``/``rerankers`` are the
-    connector registries the runner builds via ``config.make_embedders``/``make_rerankers``.
-    """
-    backend = ElasticsearchBackend(indexer_cfg)
     settings = indexer_cfg["settings"]
+    url = settings["url"]
+    client = _SEARCH_CLIENTS.get(url)
+    if client is None:
+        client = _make_client(indexer_cfg)
+        _SEARCH_CLIENTS[url] = client
     msearch_chunk_size = int(settings.get("msearch_chunk_size", _MSEARCH_CHUNK_SIZE))
     num_candidates = int(settings.get("knn_num_candidates", _KNN_NUM_CANDIDATES))
-    return _ESSearcherFactory(
-        backend.client,
-        backend.index,
-        embedders=embedders,
-        rerankers=rerankers,
-        msearch_chunk_size=msearch_chunk_size,
-        num_candidates=num_candidates,
-    )
+    return client, msearch_chunk_size, num_candidates
+
+
+def build_searchers(
+    indexer_cfg: Mapping[str, Any],
+    mapping: IndexMapping,
+    specs: Sequence[SearcherSpec],
+    *,
+    embedders: Mapping[str, Embedder],
+) -> dict[str, Searcher]:
+    """Mint the configured leaf ``Searcher``s over the shared ES client (§4), keyed by service name.
+
+    Each spec is ``(name, kind, embedder_id)``: a ``lexical`` spec -> ``LexicalSearcher`` on
+    ``mapping.search_text_field``; a ``vector`` spec -> ``VectorSearch`` on that embedder's
+    ``dense_vector`` field (``mapping.sem_field(embedder_id)``) with the referenced query embedder.
+    Exhaustive on ``kind`` — an unknown kind raises (never a silent default).
+    """
+    client, msearch_chunk_size, num_candidates = _open(indexer_cfg)
+    index = mapping.index_name
+    out: dict[str, Searcher] = {}
+    for name, kind, embedder_id in specs:
+        if kind == "lexical":
+            out[name] = LexicalSearcher(
+                client, index, [mapping.search_text_field], msearch_chunk_size=msearch_chunk_size
+            )
+        elif kind == "vector":
+            if embedder_id is None:
+                raise ValueError(f"vector searcher {name!r} has no embedder reference")
+            out[name] = VectorSearch(
+                client,
+                index,
+                mapping.sem_field(embedder_id),
+                embedders[embedder_id],
+                msearch_chunk_size=msearch_chunk_size,
+                num_candidates=num_candidates,
+            )
+        else:
+            raise ValueError(
+                f"searcher {name!r}: unknown kind {kind!r}; expected 'lexical' or 'vector'"
+            )
+    return out
+
+
+def build_rerankers(
+    indexer_cfg: Mapping[str, Any],
+    mapping: IndexMapping,
+    names: Sequence[str],
+    *,
+    rerank_clients: Mapping[str, RerankClient],
+) -> dict[str, Reranker]:
+    """Mint the configured ``ESReranker``s over the shared ES client (§4), keyed by service name.
+
+    Each name -> an ``ESReranker`` on ``mapping.search_text_field`` (the fixed §5.3 rerank field)
+    wired to that name's provider ``RerankClient`` connector (built by ``config.make_rerankers``).
+    """
+    client, _, _ = _open(indexer_cfg)
+    index = mapping.index_name
+    return {
+        name: ESReranker(client, index, mapping.search_text_field, rerank_clients[name])
+        for name in names
+    }

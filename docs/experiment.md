@@ -46,7 +46,7 @@ writes two named pipelines by hand.
 ```mermaid
 flowchart LR
   DS[Dataset] -->|documents + field_schema| IDX[Indexer]
-  IDX --> BK[(SearchBackend / Index)]
+  IDX --> BK[(IndexWriter / Index)]
   DS -->|queries| HARNESS[ExperimentRunner]
   CFG[Config: explicit named pipelines] --> HARNESS
   HARNESS -->|SearchPipeline object graph per named pipeline| PIPE[SearchPipeline]
@@ -71,7 +71,7 @@ flowchart LR
 | **Reranker** | Behavioral: rescores + reorders a candidate list for a query, client-side: `rerank(query, candidates) -> [ScoredDoc]` (§3.4). |
 | **Metric** | A per-query scalar over a run given qrels: `avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`. |
 | **Baseline** | The reference variant (`bm25`) all comparisons subtract from. |
-| **Connector** | A direct client to an inference provider (embedding or rerank). The harness owns inference (§3.4): an `Embedder` (Cohere/Voyage/OpenAI) turns text into dense vectors; a `RerankClient` (Cohere/Voyage) scores candidate docs. Realized in `benchmark.providers`; configured by a `provider` + `settings` (`api_key`, `model_id`, reranker `top_n`, …). |
+| **Connector** | A direct client to an inference provider (embedding or rerank). The harness owns inference (§3.4): an `Embedder` (Cohere/Voyage/OpenAI) turns text into dense vectors; a `RerankClient` (Cohere/Voyage) scores candidate docs. Realized in `benchmark.providers.inference`; configured by a `provider` + `settings` (`api_key`, `model_id`, reranker `top_n`, …). |
 | **CI (here)** | A per-comparison percentile bootstrap interval reported as **effect-size context only** — *not* a significance gate (§8.2/§8.3). |
 
 ---
@@ -82,7 +82,7 @@ The harness is built around small Python ABCs / `Protocol`s that pin the seams w
 
 - **Behavioral ABCs for retrieval** — `Searcher`, `Fuser`, `Reranker` (§3.3/§3.4). Everything that produces a ranked list is a `Searcher`; a variant is an **object graph** of these (a natural OOP composite that mirrors a real search pipeline). Fusion is **client-side** (`RRFFuser` over materialized result lists); reranking is a client-side `rerank()` pass.
 - **The `Dataset` ABC** (§3.2) — the base every dataset adapter derives from; it carries two shared concrete helpers (`build_search_text`, `map_label`) over the four abstract methods.
-- **Structural Protocols** — `Embedder` and `RerankClient` (the provider connectors, §3.4, realized in `benchmark.providers`), `Indexer`, and `SearchBackend` (the index-writer/ingest seam used by `Indexer.build`).
+- **Structural Protocols** — `Embedder` and `RerankClient` (the provider connectors, §3.4, realized in `benchmark.providers.inference`) and `IndexWriter` (the index-writer/ingest seam the domain `indexing.Indexer.build` delegates to, §3.5). The domain `Indexer` itself is a single concrete backend-agnostic class (§3.5), so it is not a Protocol.
 
 Concrete adapters (WANDS, ElasticSearch) implement these and live behind the boundary; the composers, evaluator, and comparator depend **only** on the abstractions.
 
@@ -99,20 +99,22 @@ flowchart TB
   subgraph "Ingest seams (structural Protocols)"
     DSP[Dataset]
     EMP[Embedder / RerankClient - provider connectors]
-    IXP[Indexer]
-    SBP[SearchBackend - ensure_index/bulk_index]
+    IWP[IndexWriter - sem_field_name/create_mapping/ensure_index/bulk_index]
+  end
+  subgraph "Domain OOP"
+    IDXR[indexing.Indexer - backend-agnostic]
   end
   subgraph "Adapters (concrete, today)"
     WANDS[WandsDataset] -.implements.-> DSP
     ESL[LexicalSearcher] -.implements.-> SRC
     ESV[VectorSearch] -.implements.-> SRC
     ESR[ESReranker] -.implements.-> RRK
-    ESIX[ESIndexer] -.implements.-> IXP
-    ESB[ElasticsearchBackend] -.implements.-> SBP
+    ESIW[ESIndexWriter] -.implements.-> IWP
   end
+  IDXR -.delegates to.-> IWP
 ```
 
-> Note: `Embedder` and `RerankClient` are **provider connectors** (§3.4), realized in `benchmark.providers` — the harness calls Cohere / Voyage / OpenAI directly, ES runs no inference. The indexer embeds the corpus with each `Embedder` and writes `dense_vector` fields; there is **no** `register_inference` and **no** `semantic_text`. `Reranker` is **behavioral** (§3.4) — a concrete reranker (e.g. ES `ESReranker`) fetches candidate doc-text and scores it via a `RerankClient` inside `rerank()`.
+> Note: `Embedder` and `RerankClient` are **provider connectors** (§3.4), realized in `benchmark.providers.inference` — the harness calls Cohere / Voyage / OpenAI directly, ES runs no inference. The indexer embeds the corpus with each `Embedder` and writes `dense_vector` fields; there is **no** `register_inference` and **no** `semantic_text`. `Reranker` is **behavioral** (§3.4) — a concrete reranker (e.g. ES `ESReranker`) fetches candidate doc-text and scores it via a `RerankClient` inside `rerank()`.
 
 ### 3.1 Data models (plain frozen dataclasses)
 
@@ -259,13 +261,22 @@ class Reranker(ABC):
 
 > **Design note — why a composite of `Searcher`s.** A variant is a natural object graph: `bm25` is a leaf `Searcher`; `hybrid` is a `HybridSearch(Searcher)` holding several leaf `Searcher`s + a `Fuser`; every variant is wrapped in a top-level `SearchPipeline(Searcher)` that optionally applies a `Reranker` (§3.6). No declarative spec layer, no `capabilities()` branching, no server-side-vs-fallback fork — fusion and rerank are **always client-side**, so any backend that can produce ranked leaf lists gets hybrid + rerank for free with identical `rank_window_size` semantics.
 
-**The ingest seam.** Writing the index still needs a wire-format-aware seam. `SearchBackend` is now exactly that — the index-writer used by `Indexer.build` (§3.5); retrieval methods are gone.
+**The ingest seam.** Writing the index still needs a wire-format-aware seam. `IndexWriter` is now
+exactly that — the index-writer the domain `indexing.Indexer.build` (§3.5) delegates all
+backend-specific work to; retrieval methods are gone. It carries the backend-safe field-naming +
+mapping bits (`sem_field_name`/`create_mapping`) that used to be ES free functions, plus the ingest
+buffering granularity (`embed_batch_size`).
 
 ```python
-class SearchBackend(Protocol):
+@runtime_checkable
+class IndexWriter(Protocol):
     # index-writer / ingest seam (retrieval moved to Searcher/Fuser/Reranker)
     # ES is a plain index writer: the harness embeds the corpus client-side and hands
     # documents whose field bag already carries the dense_vector values — no inference here.
+    embed_batch_size: int                                    # ingest buffering granularity (§3.5)
+    def sem_field_name(self, embedder_id: str) -> str: ...   # backend-safe dense_vector field name
+    def create_mapping(self, schema: FieldSchema, sem_fields: Mapping[str, str],
+                       vector_dims: Mapping[str, int]) -> "IndexMapping": ...
     def ensure_index(self, mapping: "IndexMapping") -> None: ...
     def bulk_index(self, docs: Iterable[Document], *, mapping: "IndexMapping") -> None: ...
 ```
@@ -293,7 +304,7 @@ class Reranker(ABC):                       # BEHAVIORAL — rescores at query ti
     def rerank(self, query: str, candidates: Sequence[ScoredDoc]) -> list[ScoredDoc]: ...
 ```
 
-The harness **owns inference** (§1.1): ES is a plain index, so embeddings and reranking are computed by **provider connectors** the harness calls directly — realized in `benchmark.providers` and typed by two structural `Protocol`s:
+The harness **owns inference** (§1.1): ES is a plain index, so embeddings and reranking are computed by **provider connectors** the harness calls directly — realized in `benchmark.providers.inference` and typed by two structural `Protocol`s:
 
 - **`Embedder`** — a dense-embedding connector. `embed_documents` embeds the corpus at ingest (§3.5) into `dense_vector` fields; `embed_queries` embeds each query at search time so `VectorSearch` can run ES `knn` (§5.3). `id` is the config service name (the sem-field naming key, §3.5); `dim` is the output dimensionality the `dense_vector` mapping needs before ingest — taken from `settings.dims` when given (move-with-certainty) else discovered once by embedding a probe text (the authoritative source is the provider). Shipped: `OpenAIEmbedder`, `CohereEmbedder`, `VoyageEmbedder` — Cohere/Voyage carry a document-vs-query `input_type`, OpenAI has none.
 - **`RerankClient`** — a rerank connector: `rerank_scores(query, documents)` returns one relevance score per document, **aligned 1:1 to `documents`** (higher = more relevant), realigning the provider's relevance-ordered response back to input order by `index`. Shipped: `CohereReranker`, `VoyageReranker`. **OpenAI has no reranker** — a reranker configured with `provider: openai` is rejected both at config load (§10) and by `make_reranker` (§5.4).
@@ -316,12 +327,19 @@ class IndexMapping:
     def sem_field(self, embedder_id: str) -> str:
         return self.sem_fields[embedder_id]
 
-class Indexer(Protocol):
-    def build(self, dataset: Dataset, backend: SearchBackend,
-              embeddings: Sequence[Embedder]) -> "IndexMapping": ...
+class Indexer:                                 # benchmark/indexing.py — concrete, backend-agnostic
+    def __init__(self, writer: IndexWriter, embedders: Sequence[Embedder]) -> None: ...
+    def build(self, dataset: Dataset) -> "IndexMapping": ...
 ```
 
-**What `IndexMapping` is for.** It is the value returned by `Indexer.build(...)` and is the **single source of truth for the concrete field names each leaf `Searcher` must query**. The composers are dataset- and backend-agnostic, so nothing upstream knows that ES named the `dense_vector` field for embedder `cohere` `"sem__cohere"`; `IndexMapping` hands it those names. `build_pipeline(pcfg, services, mapping, factory)` (§4) reads exactly two things from it — `mapping.search_text_field` (the lexical target) and `mapping.sem_field(embedder)` (the `dense_vector` field for a given embedder) — to build the leaf `Searcher`s without re-deriving any backend-specific naming. `backend_mapping` is the raw ES mapping body used to create the index (§5.2); `index_name` is where documents land.
+`Indexer` is a single concrete domain object (not a Protocol — there is exactly one implementation).
+Its `build` discovers dims → asks the injected `IndexWriter` for the `IndexMapping`
+(`create_mapping`) → `ensure_index` → streams the corpus through the embedders (the
+`_embed_documents`/`_embed_batch` bounded-buffer streaming lives here, as domain code that only
+touches `Document` + `Embedder`) → `bulk_index`. All backend-specific mapping / field-naming is
+delegated to the `IndexWriter` (ES: `ESIndexWriter`), so the same `Indexer` drives any backend.
+
+**What `IndexMapping` is for.** It is the value returned by `Indexer.build(...)` and is the **single source of truth for the concrete field names each leaf `Searcher` must query**. The composers are dataset- and backend-agnostic, so nothing upstream knows that ES named the `dense_vector` field for embedder `cohere` `"sem__cohere"`; `IndexMapping` hands it those names. the ES adapter's `build_searchers` (§3.3, called before `build_pipeline`) reads exactly two things from it — `mapping.search_text_field` (the lexical target) and `mapping.sem_field(embedder)` (the `dense_vector` field for a given embedder) — to build the leaf `Searcher`s without re-deriving any backend-specific naming. `backend_mapping` is the raw ES mapping body used to create the index (§5.2); `index_name` is where documents land.
 
 **Worked example** (the WANDS index built for three embedders):
 
@@ -352,7 +370,7 @@ The indexer is **dataset- and model-agnostic**: everything specific arrives via 
 
 ### 3.6 The composers (`RRFFuser` / `HybridSearch` / `SearchPipeline`)
 
-Three backend-agnostic composers (in `pipeline.py`) wire leaf `Searcher`s into the six variants. They import only `models`/`protocols`/`fusion` + stdlib — no adapters, no numpy.
+Three backend-agnostic composers (in `search.py`) wire leaf `Searcher`s into the six variants. They import only `common.models`/`common.protocols`/`common.ranking` + stdlib — no adapters, no numpy.
 
 ```python
 class RRFFuser(Fuser):
@@ -450,7 +468,7 @@ def rerank_local(query: Query, candidates: Sequence[ScoredDoc], *,
 
 Every variant is a **`SearchPipeline` object graph** built from the same composers (§3.6). No variant has bespoke code; the config (§10) declares each pipeline explicitly as a `PipelineCfg`, and `build_pipeline` assembles the graph. There is **no matrix expansion** — the pipelines run are exactly the ones written in the config.
 
-> `build_pipeline` lives in **`config.py`** (§11 — the config layer holds the config value types + the pipeline-assembly) and is built in **Phase 6**, not with the pipeline: it maps a `PipelineCfg` → a `SearchPipeline`, so keeping it in `config.py` (which already imports `pipeline` for the composers) avoids a `pipeline`→`config` forward dependency. `pipeline.py` (Phase 5) defines only the composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`). `build_pipeline` takes a `searcher_factory` that builds the backend-specific leaf `Searcher`s / `Reranker` (the ES `LexicalSearcher`/`VectorSearch`/`ESReranker` land in Phase 9/10) and the typed `Services` registry (§10) so it stays backend-agnostic (no adapter import). The six strategies below are the conceptual shapes; each is an *example a user writes* as a named pipeline, not something auto-expanded.
+> `build_pipeline` lives in **`config.py`** (§11 — the config layer holds the config value types + the pipeline-assembly) and is built in **Phase 6**, not with the composers: it maps a `PipelineCfg` → a `SearchPipeline`, so keeping it in `config.py` (which already imports `search` for the composers) avoids a `search`→`config` forward dependency. `search.py` (Phase 5) defines only the composers (`RRFFuser`/`HybridSearch`/`SearchPipeline`). The backend-specific leaf `Searcher`s / `Reranker` (the ES `LexicalSearcher`/`VectorSearch`/`ESReranker`, Phase 9/10) are pre-built by the adapter's `build_searchers`/`build_rerankers` free functions from the resolved `Services` + `IndexMapping`; `build_pipeline` then just composes the object graph over those plain `{name: Searcher}` / `{name: Reranker}` maps, so it stays backend-agnostic (no adapter import). There is no `SearcherFactory` — `_ESSearcherFactory`/`make_searcher_factory` are gone. The six strategies below are the conceptual shapes; each is an *example a user writes* as a named pipeline, not something auto-expanded.
 
 | Strategy | retriever graph | reranker |
 |----------|-----------------|----------|
@@ -462,16 +480,9 @@ Every variant is a **`SearchPipeline` object graph** built from the same compose
 | `hybrid_rerank` | `HybridSearch([Lexical, Vector], RRFFuser(k), W)` | `ESReranker(r), rerank_window_size=W` |
 
 ```python
-def build_pipeline(pcfg: PipelineCfg, services: Services,
-                   mapping: IndexMapping, factory: SearcherFactory) -> SearchPipeline:
-    leaves: list[Searcher] = []
-    for name in pcfg.retrievers:                      # each name is a searcher SERVICE (§10)
-        searcher = services.searcher(name)
-        if searcher.kind == "lexical":
-            leaves.append(factory.lexical(fields=[mapping.search_text_field]))
-        else:                                          # "vector" -> resolve its embedder service
-            embedder = services.embedder(searcher.embedder)
-            leaves.append(factory.vector(field=mapping.sem_field(embedder.name)))
+def build_pipeline(pcfg: PipelineCfg, searchers: Mapping[str, Searcher],
+                   rerankers: Mapping[str, Reranker]) -> SearchPipeline:
+    leaves = [searchers[name] for name in pcfg.retrievers]   # leaves pre-built by build_searchers
 
     if pcfg.fuser is not None:                         # 2+ retrievers require a fuser (§10)
         retriever: Searcher = HybridSearch(retrievers=leaves,
@@ -482,10 +493,17 @@ def build_pipeline(pcfg: PipelineCfg, services: Services,
 
     if pcfg.reranker is not None:
         return SearchPipeline(retriever=retriever,
-                              reranker=factory.reranker(pcfg.reranker, mapping.search_text_field),
+                              reranker=rerankers[pcfg.reranker],
                               rerank_window_size=pcfg.rerank_window_size)
     return SearchPipeline(retriever=retriever)
 ```
+
+> The leaf `Searcher`s and `Reranker`s are minted up front by the ES adapter's
+> `build_searchers(indexer_cfg, mapping, specs, *, embedders)` / `build_rerankers(indexer_cfg,
+> mapping, names, *, rerank_clients)` free functions (§3.3) — they own the `kind` dispatch
+> (`lexical` → `LexicalSearcher(fields=[mapping.search_text_field])`, `vector` →
+> `VectorSearch(field=mapping.sem_field(embedder))`) and the `ESReranker` construction that the old
+> factory did. `build_pipeline` then only composes the object graph over the resulting plain maps.
 
 > All six shapes reuse the *same* composition; they differ only in how many retrievers a pipeline lists, `RRFFuser`'s `rank_constant`, and whether a reranker is set. Adding "semantic+rerank" costs zero new pipeline code — only a named `pipelines.variants` entry. `pcfg.fuser.rank_constant` is a concrete integer read straight from the config — `build_pipeline` never performs any selection.
 
@@ -513,7 +531,7 @@ A canonical **`search_text`** field is built by concatenating the values of ever
 ### 5.2 One `dense_vector` field per embedder (verified shape)
 With ElasticSearch there is exactly **ONE index** (`indexer.index`, e.g. `wands_bench`) — **not** one index per embedder. Inside that single index live a single **`search_text`** field (the BM25 target, §5.1) **plus one `dense_vector` field per embedder** that a **vector searcher** references. So in the §10 config, `semantic_co` (and any second `semantic_*`) are **fields in the same index, not separate indices**: each is a `dense_vector` field the harness populates by embedding the doc's `search_text` with that embedder's connector **at ingest** and writing the resulting vector into the field (§3.5). ES computes **no** embeddings — there is no `semantic_text` field and no `copy_to`; the vectors arrive already-computed in each document's `_source`.
 
-**Where and which (how the indexer is driven).** The indexer learns **WHERE** to build from `indexer.{provider, index, settings}` (§10). It learns **WHICH** embedders to build `dense_vector` fields for from the `Embedder`s passed to `Indexer.build` — the runner instantiates one per configured `embedder` service (§11). The dataset's `FieldSchema` (§3.2) says **which columns feed `search_text`**. This single-`indexer`-block model works because ES is one store that holds BM25 + all vector fields together; a per-store model (§12/§13) is only needed for a pure vector store.
+**Where and which (how the indexer is driven).** The indexer learns **WHERE** to build from `indexer.{provider, index, settings}` (§10). It learns **WHICH** embedders to build `dense_vector` fields for from the `Embedder`s passed to the `indexing.Indexer(writer, embedders)` constructor — the runner instantiates one per configured `embedder` service (§11). The dataset's `FieldSchema` (§3.2) says **which columns feed `search_text`**. This single-`indexer`-block model works because ES is one store that holds BM25 + all vector fields together; a per-store model (§12/§13) is only needed for a pure vector store.
 
 ```jsonc
 // mapping (the harness embeds the corpus client-side; ES only stores + searches the vectors):
@@ -529,11 +547,11 @@ With ElasticSearch there is exactly **ONE index** (`indexer.index`, e.g. `wands_
 
 Each `dense_vector` field is `index: true` with `similarity: cosine` (cosine suits the normalized embeddings these providers emit); its `dims` is that embedder's output dimensionality (probed once, or `settings.dims`, §3.4). Adding an embedding model = add one `embedder` service + a `vector` searcher + one `dense_vector` field + reindex (the new field must be embedded for the whole corpus). A full reindex is the clean path for an existing corpus and is recorded in run metadata.
 
-**Vector field naming (dot-free).** The `dense_vector` field name for an embedder is `"sem__"` + the embedder `id` with every non-alphanumeric run replaced by `_` (`ESIndexer` builds it; e.g. `voyage-3.5` → `sem__voyage_3_5`). ES field names cannot contain `.` (dots denote subfields), so the sanitization is load-bearing, not cosmetic. `IndexMapping.sem_fields` maps each embedder `id` → its `dense_vector` field name so `sem_field(embedder_id)` resolves the name the vector searcher queries.
+**Vector field naming (dot-free).** The `dense_vector` field name for an embedder is `"sem__"` + the embedder `id` with every non-alphanumeric run replaced by `_` (`ESIndexWriter.sem_field_name` builds it; e.g. `voyage-3.5` → `sem__voyage_3_5`). ES field names cannot contain `.` (dots denote subfields), so the sanitization is load-bearing, not cosmetic. `IndexMapping.sem_fields` maps each embedder `id` → its `dense_vector` field name so `sem_field(embedder_id)` resolves the name the vector searcher queries.
 
 > **No ES ML-memory constraint.** Because embeddings and reranking run in the **provider** (not on an ES ML node), the old single-node ML-memory ceiling — where a co-deployed embedder + reranker could exhaust the ML budget and return HTTP 429 "Could not start deployment" — **no longer applies**. ES deploys no model; it only stores and searches vectors. The capacity concern shifts to the **provider's rate limits and cost** (§13), handled by the connector's `RateLimiter` + retry/backoff on 429 (§3.4/§5.4).
 
-**Bulk ingest is streamed + chunked.** `ElasticsearchBackend.bulk_index` writes via `elasticsearch.helpers.streaming_bulk(client, actions, chunk_size=...)` over a **lazy** actions generator (each `{"_op_type": "index", "_index": …, "_id": doc.doc_id, "_source": dict(doc.fields)}`), so the corpus streams through in fixed-size chunks and is never fully materialized — required for 43K-doc (WANDS) / ~1M-doc (ESCI) corpora that would break a single `bulk()` body. `chunk_size` is a module constant (the ES helpers default, 500) overridable via `indexer.settings.bulk_chunk_size`. `raise_on_error=True` so a failed item surfaces a `BulkIndexError` (**errors surface, not swallowed**); the index is refreshed once at the end; empty input is a logged no-op.
+**Bulk ingest is streamed + chunked.** `ESIndexWriter.bulk_index` writes via `elasticsearch.helpers.streaming_bulk(client, actions, chunk_size=...)` over a **lazy** actions generator (each `{"_op_type": "index", "_index": …, "_id": doc.doc_id, "_source": dict(doc.fields)}`), so the corpus streams through in fixed-size chunks and is never fully materialized — required for 43K-doc (WANDS) / ~1M-doc (ESCI) corpora that would break a single `bulk()` body. `chunk_size` is a module constant (the ES helpers default, 500) overridable via `indexer.settings.bulk_chunk_size`. `raise_on_error=True` so a failed item surfaces a `BulkIndexError` (**errors surface, not swallowed**); the index is refreshed once at the end; empty input is a logged no-op.
 
 ### 5.3 ES `Searcher` / `Reranker` implementations
 Each retriever is realized as its **own ES query** and returns a materialized `list[ScoredDoc]`; hybrid fusion and rerank happen **client-side** in the harness (§3.6/§3.7). There are no nested `rrf` / `text_similarity_reranker` retriever trees, and no `server_side` capability. (Change from the v4 draft: ES server-side `rrf` and `text_similarity_reranker` are dropped in favor of client-side composition; one-round-trip server-side fusion is noted as a deferred performance optimization in §13.)
@@ -562,7 +580,7 @@ Each retriever is realized as its **own ES query** and returns a materialized `l
 > - The rerank doc text must be a real stored field; we use `search_text`.
 
 ### 5.4 Provider connectors & failure model
-Embeddings and reranking are computed by direct **provider connectors** in `benchmark.providers` (§3.4) — the harness calls Cohere / Voyage / OpenAI over stdlib `urllib.request` + `json` (zero new dependencies). One shared `_post_json` (bearer auth) + a `RateLimiter` back every connector:
+Embeddings and reranking are computed by direct **provider connectors** in `benchmark.providers.inference` (§3.4) — the harness calls Cohere / Voyage / OpenAI over stdlib `urllib.request` + `json` (zero new dependencies). One shared `_post_json` (bearer auth) + a `RateLimiter` back every connector:
 
 - **Embedders** (`OpenAIEmbedder` / `CohereEmbedder` / `VoyageEmbedder`): `embed_documents` / `embed_queries` sub-chunk arbitrary input to a per-provider `batch_size` (OpenAI 2048 / Cohere 96 / Voyage 128, overridable via `settings.batch_size`) so a 43K-doc corpus never exceeds a provider's per-request cap. Cohere/Voyage send a document-vs-query `input_type`; OpenAI has none. `dim` is `settings.dims` when given, else discovered once via a probe embed. A provider returning the wrong number of vectors raises (never pads).
 - **Rerankers** (`CohereReranker` / `VoyageReranker`): `rerank_scores(query, documents)` requests a score for **every** document (`top_n` / `top_k` = `len(documents)`) and realigns the provider's relevance-ordered response back to input order by `index`; a missing index (a truncated response) raises rather than defaulting to `0`. **OpenAI has no reranker** — `make_reranker("…", "openai", …)` raises (§3.4).
@@ -638,11 +656,12 @@ Two per-query counts are recorded:
 class ExperimentRunner:
     def run(self, cfg: ResolvedConfig) -> None:
         dataset = load_dataset(cfg.dataset)
-        indexer = make_indexer(cfg.indexer)          # ingest seam (ensure_index/bulk_index)
+        writer = make_index_writer(cfg.indexer)      # IndexWriter ingest seam (§3.3), lazily built
         embedders = make_embedders(cfg.services)     # {name: Embedder connector} (§3.4), lazily built
-        mapping = Indexer().build(dataset, indexer, list(embedders.values()))  # embeds corpus -> dense_vector (§3.5)
+        mapping = Indexer(writer, list(embedders.values())).build(dataset)  # embeds corpus -> dense_vector (§3.5)
         rerankers = make_rerankers(cfg.services)     # {name: RerankClient connector} (§3.4/§5.4)
-        factory = make_searcher_factory(cfg.indexer, embedders=embedders, rerankers=rerankers)  # ES: Lexical/Vector/ESReranker
+        searchers = make_searchers(cfg.indexer, cfg.services, mapping, embedders=embedders)   # ES build_searchers -> {name: Searcher}
+        reranker_objs = make_rerankers_bound(cfg.indexer, cfg.services, mapping, rerank_clients=rerankers)  # ES build_rerankers -> {name: Reranker}
         queries = list(dataset.queries())            # frozen, shared query set
         qrels   = QrelIndex(dataset.qrels())
 
@@ -654,7 +673,7 @@ class ExperimentRunner:
             if pcfg.reranker:                        # R0: the W <= top_n cap only — no endpoint registration
                 top_n = cfg.services.reranker(pcfg.reranker).settings["top_n"]   # a plain settings key (§5.4)
                 assert pcfg.rerank_window_size <= top_n   # W <= top_n (§5.4)
-            pipeline = build_pipeline(pcfg, cfg.services, mapping, factory)   # a SearchPipeline graph (§4)
+            pipeline = build_pipeline(pcfg, searchers, reranker_objs)   # a SearchPipeline graph (§4)
             # Batch the frozen query set through one pipeline.bulk_search — retrieval leaves batch
             # via _msearch (§5.3) instead of one round trip per query; result[i] aligns to queries[i].
             query_texts = [q.text for q in queries]
@@ -832,7 +851,7 @@ top_k: 100                       # results retrieved per query
 **`indexer`** — a **single** block naming ONE ES index (`indexer.index`) and how to reach it
 (`provider`, `settings.url`). With ES this one index holds everything (§5.2): a single `search_text`
 BM25 field **plus one `dense_vector` field per embedder that a `vector` searcher references** — the
-indexer builds a field for each `Embedder` the runner passes to `Indexer.build` (one per configured
+indexer builds a field for each `Embedder` the runner passes to the `indexing.Indexer` constructor (one per configured
 `embedder` service), and reaches ES from this block. It does **not** index one-per-embedder. (A pure
 vector store would need a per-store indexing model instead — deferred, §12/§13.)
 
@@ -860,26 +879,52 @@ from axes is a possible future convenience, deliberately omitted here for config
 
 ```
 benchmark/
-  models.py              # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, IndexMapping
-  protocols.py           # Searcher/Fuser/Reranker ABCs; Dataset ABC (abstract queries/documents/qrels/field_schema + shared build_search_text/map_label helpers); Embedder, RerankClient, Indexer, SearchBackend (ingest), SearcherFactory Protocols
-  providers.py           # provider connectors: OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib-HTTP; embeddings + rerank)
-  pipeline.py            # RRFFuser, HybridSearch, SearchPipeline (the composers)
-  fusion.py              # fuse_rrf_local (client-side RRF, windowed)
-  rerank.py              # rerank_local (client-side score+reorder helper, windowed)
-  metrics.py             # Evaluator, Metrics, QrelIndex (ndcg/recall/precision/avg_relevance)
-  stats.py               # Comparator (unadjusted bootstrap CI, Wilcoxon/permutation, FDR/BH-BY; degenerate-set handling)
-  runner.py              # ExperimentRunner (the single execution path, §8.0)
-  io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
-  config.py              # the config layer: EmbedderCfg/RerankerCfg/SearcherCfg/Services/FuserCfg/PipelineCfg/ResolvedConfig value types (NO expansion); build_pipeline (assemble a SearchPipeline from an explicit named pipeline); YAML/JSON load + resolve; lazy adapter factories (load_dataset / make_indexer / make_searcher_factory)
-  logging_setup.py       # cross-cutting: console + file logging (logs/run_{timestamp}.log); use instead of print()
-  datasets/
-    wands.py             # WandsDataset (implements Dataset; label->gain; search_text concat)
-  backends/
-    elasticsearch.py     # LexicalSearcher, VectorSearch, ESReranker, ESIndexer, ElasticsearchBackend (ingest)
+  common/              # (g) shared bottom layer, depends on nothing
+    models.py          #   Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, IndexMapping, enums
+    protocols.py       #   Searcher/Fuser/Reranker + Dataset ABCs; Embedder, RerankClient, IndexWriter Protocols
+    ranking.py         #   fuse_rrf_local + rerank_local (pure windowed ranking primitives)
+    logging_setup.py   #   console + file logging (logs/run_{timestamp}.log); use instead of print()
+  providers/           # (f) concrete adapters, depend ONLY on common
+    inference.py       #   OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib HTTP)
+    elasticsearch.py   #   LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter, build_searchers/build_rerankers
+  embedding.py         # (c) make_embedder + EMBEDDER_PROVIDERS (dispatch provider -> providers.inference)
+  reranking.py         # (d) make_reranker + RERANKER_PROVIDERS (dispatch provider -> providers.inference)
+  indexing.py          # (a) Indexer (build orchestration) + embed-at-ingest streaming
+  search.py            # (b) RRFFuser, HybridSearch, SearchPipeline (the composers)
+  evaluation/          # (e) scoring + statistics
+    metrics.py         #   Evaluator, Metrics, QrelIndex
+    stats.py           #   Comparator, StatsCfg, ComparisonResult (bootstrap CI, Wilcoxon/permutation, FDR/BH-BY)
+  datasets/wands.py    #   WandsDataset (implements Dataset; label->gain; search_text concat)
+  config.py            #   config value types + YAML load/resolve + build_pipeline + lazy dotted adapter factories
+  runner.py            #   ExperimentRunner (the single execution path, §8.0)
+  io_csv.py            #   write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
 docs/experiment.md
-dataset/wands/           # query.csv, product.csv, label.csv (gitignored)
+dataset/wands/         # query.csv, product.csv, label.csv (gitignored)
 ```
-`pipeline`, `metrics`, `stats`, `runner`, `io_csv` import only `models`/`protocols` (plus the cross-cutting leaf `logging_setup`, which itself imports only the stdlib; `pipeline` also imports the leaf `fusion`) — never `datasets/*` or `backends/*`. `config.py` is the config layer: it holds the pure resolved-config value types (`EmbedderCfg`/`RerankerCfg`/`SearcherCfg`/`Services` registry + `FuserCfg`/`PipelineCfg`/`ResolvedConfig`) **and** `build_pipeline`, parses the §10 YAML into them, and owns the lazy adapter factories (`load_dataset`, `make_indexer`, and the `searcher_factory` that builds leaf `Searcher`/`Reranker`). Because `build_pipeline` builds the composers, `config` imports `pipeline` (`RRFFuser`/`HybridSearch`/`SearchPipeline`) — a one-way wiring edge (§4; `pipeline` never imports `config`); `config` still imports **no adapter** at import time (the factories resolve dotted targets lazily). `runner`/`io_csv` import `ResolvedConfig`/`build_pipeline` from `config`. This enforces success criterion §1.4(3). The degenerate-paired-set handling (§8.1) lives entirely in `stats.py` and is dataset-agnostic (operates on paired delta arrays only).
+
+**Layers.** `a–g` form a strict acyclic engine: `common` (g) ← `providers` (f) ← `embedding`(c)/
+`reranking`(d) ← `indexing`(a)/`search`(b)/`evaluation`(e). Domain layers (a/b/e) import only
+`common` abstractions at import time; they consume concrete `providers` pieces (index writer, leaf
+searchers, reranker) and embedders/rerank-clients **injected** at runtime — Dependency Inversion is
+what makes "indexing/search need providers" hold without a backward import edge. `config`, `runner`,
+`io_csv` are the composition layer above the engine: they wire it together and own the lazy
+dotted-target factories, so no engine module names an adapter.
+
+**The clean-OOP seams.** Indexing is a backend-agnostic `indexing.Indexer(writer, embedders)` whose
+`build()` discovers dims → asks the `IndexWriter` for the `IndexMapping` → `ensure_index` → streams
+the corpus through the embedders → `bulk_index`. Search is composed by `build_pipeline`
+(`config.py`) from plain leaf `Searcher`s + a `Reranker` that the ES adapter's `build_searchers`/
+`build_rerankers` mint from the resolved `Services` + `IndexMapping`. There is no
+`SearcherFactory`/`_ESSearcherFactory` and no `ElasticsearchBackend` god-object; the ES pieces are
+ordinary provider classes.
+
+**Import-graph rule (enforced by `test_import_graph.py`).** `search`, `indexing`,
+`evaluation.metrics`, `evaluation.stats`, `runner`, `io_csv`, and `config` import **no**
+`benchmark.providers.*` / `benchmark.datasets.*` / `benchmark.embedding` / `benchmark.reranking` at
+import time; `config` imports `search` (composers) + `evaluation.stats` (`StatsCfg`) only. The lazy
+factories resolve dotted targets at call time. This is success criterion §1.4(3). The
+degenerate-paired-set handling (§8.1) lives entirely in `evaluation/stats.py` and is dataset-agnostic
+(operates on paired delta arrays only).
 
 ---
 
@@ -897,13 +942,25 @@ The abstract interface is deliberately format-agnostic; the intended next target
 
 None of these touch the pipeline/indexer/evaluator/stats — each is an adapter + config change, and `build_search_text` is reused across all three.
 
-**Add a backend (Vespa, OpenSearch, Qdrant, FAISS, …):** implement (a) the ingest `SearchBackend` (`ensure_index`, `bulk_index`) + an `Indexer` that writes the harness-computed vectors, and (b) the leaf retrieval seams — a lexical `Searcher`, a vector `Searcher`, and a `Reranker` — in `backends/`, wired through the `searcher_factory`. `HybridSearch` + `RRFFuser` + `SearchPipeline` (client-side, §3.6/§3.7) compose those leaves into `hybrid`/`*_rerank` with no new code, reproducing ES's `rank_window_size` semantics. The `Reranker` uses the `rerank_local` helper over a `RerankClient`. Set `indexer.provider`.
+**Add a backend (Vespa, OpenSearch, Qdrant, FAISS, …):** in `providers/`, implement (a) an
+`IndexWriter` (§3.3) — `ensure_index`, `bulk_index`, plus the backend-safe `sem_field_name` /
+`create_mapping` and the `embed_batch_size` buffering knob — that writes the harness-computed
+vectors; and (b) the leaf builders `build_searchers` / `build_rerankers` (§3.3): free functions that
+turn the resolved `Services` + `IndexMapping` into `{name: Searcher}` / `{name: Reranker}` maps,
+doing the exhaustive `kind` dispatch to concrete leaf `Searcher`s (lexical + vector) and a `Reranker`.
+The domain `indexing.Indexer` is **backend-agnostic and shared** — you do **not** write a per-backend
+`Indexer` or a factory; there is no `SearcherFactory`/`_ESSearcherFactory` and no "backend"
+god-object. Register the three in `config.py`'s target tables (`INDEX_WRITER_TARGETS`,
+`SEARCHER_BUILDER_TARGETS`, `RERANKER_BUILDER_TARGETS`) and set `indexer.provider`. `HybridSearch` +
+`RRFFuser` + `SearchPipeline` (client-side, §3.6/§3.7) then compose those leaves into
+`hybrid`/`*_rerank` with no new code, reproducing ES's `rank_window_size` semantics; the `Reranker`
+uses the `rerank_local` helper (§3.7) over a `RerankClient`.
 
 > **Multiple vector stores (e.g. Qdrant) — a per-store indexing model, deferred (§13).** The single-`indexer`-block, one-ES-index model (§5.2) works because ES is one store holding BM25 + every `dense_vector` field together. A **pure vector store** (Qdrant, FAISS) has **no BM25** and needs **one collection per embedding** (different embedders have different vector dims), so that model does not carry over. The good news: the **client-side `Searcher`/`Fuser` composition already fuses across stores** (each leaf `Searcher` just returns a ranked list), so mixing an ES lexical leaf with a Qdrant vector leaf is a clean future extension — what it needs is a **per-store indexing model** (each searcher/embedder carrying its own store/collection settings) rather than the single `indexer` block that indexes everything at once (true only for ES). There is **no Qdrant adapter today (YAGNI)**; this is deferred (§13).
 
-**Add an embedder:** add an `embedder` service (`provider` ∈ Cohere / Voyage / OpenAI — all three connectors are shipped, §3.4) and a `vector` `searcher` that references it → the indexer adds one `dense_vector` field and the harness embeds the corpus into it at reindex. No code change unless the provider is new — then add one `Embedder` connector in `benchmark.providers`. Reference the new searcher from whatever named pipelines you want it in.
+**Add an embedder:** add an `embedder` service (`provider` ∈ Cohere / Voyage / OpenAI — all three connectors are shipped, §3.4) and a `vector` `searcher` that references it → the indexer adds one `dense_vector` field and the harness embeds the corpus into it at reindex. No code change unless the provider is new — then add one `Embedder` connector in `benchmark.providers.inference` and its dispatch entry in `benchmark.embedding` (`EMBEDDER_PROVIDERS`). Reference the new searcher from whatever named pipelines you want it in.
 
-**Add a reranker:** add a `reranker` service (`provider` ∈ Cohere / Voyage — OpenAI has no reranker, §3.4; with `settings.top_n >= rerank_window_size`) → reference it from the pipelines that should rerank. No code change unless the provider is new — then add one `RerankClient` connector in `benchmark.providers`.
+**Add a reranker:** add a `reranker` service (`provider` ∈ Cohere / Voyage — OpenAI has no reranker, §3.4; with `settings.top_n >= rerank_window_size`) → reference it from the pipelines that should rerank. No code change unless the provider is new — then add one `RerankClient` connector in `benchmark.providers.inference` and its dispatch entry in `benchmark.reranking` (`RERANKER_PROVIDERS`).
 
 ---
 

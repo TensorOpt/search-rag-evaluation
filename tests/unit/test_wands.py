@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from benchmark.datasets.wands import WANDS_GAINS, WandsDataset
-from benchmark.models import (
+from benchmark.common.models import (
     Document,
     FieldRole,
     FieldSchema,
@@ -16,7 +16,7 @@ from benchmark.models import (
     Qrel,
     Query,
 )
-from benchmark.protocols import Dataset
+from benchmark.common.protocols import Dataset
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "wands_sample"
 

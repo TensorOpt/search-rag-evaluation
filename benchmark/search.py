@@ -8,19 +8,19 @@ into the six retrieval shapes as object graphs — no declarative spec layer, no
 - ``HybridSearch`` — a ``Searcher`` that runs N retrievers and fuses their lists client-side.
 - ``SearchPipeline`` — the top-level ``Searcher``: an optional rerank pass over a retriever.
 
-Imports only ``benchmark.models`` / ``benchmark.protocols`` / ``benchmark.fusion`` + stdlib —
-never adapters, ``config``, or numpy (§11). ``build_pipeline`` (``PipelineCfg`` -> ``SearchPipeline``
-object graph) lives in ``config.py`` (Phase 6), not here, to avoid a pipeline->config forward
-dependency (§4); ``config`` importing ``pipeline`` for ``build_pipeline`` is the one-way wiring edge.
+Imports only ``benchmark.common.models`` / ``benchmark.common.protocols`` / ``benchmark.common.ranking``
++ stdlib — never adapters, ``config``, or numpy (§11). ``build_pipeline`` (``PipelineCfg`` ->
+``SearchPipeline`` object graph) lives in ``config.py``, not here, to avoid a search->config forward
+dependency (§4); ``config`` importing ``search`` for ``build_pipeline`` is the one-way wiring edge.
 """
 
 from __future__ import annotations
 
 from typing import Sequence
 
-from benchmark.fusion import fuse_rrf_local
-from benchmark.models import ScoredDoc
-from benchmark.protocols import Fuser, Reranker, Searcher
+from benchmark.common.models import ScoredDoc
+from benchmark.common.protocols import Fuser, Reranker, Searcher
+from benchmark.common.ranking import fuse_rrf_local
 
 
 class RRFFuser(Fuser):

@@ -15,7 +15,7 @@ import pytest
 
 from benchmark.config import (
     DATASET_TARGETS,
-    INDEXER_TARGETS,
+    INDEX_WRITER_TARGETS,
     ConfigError,
     EmbedderCfg,
     PipelineCfg,
@@ -23,8 +23,8 @@ from benchmark.config import (
     SearcherCfg,
     load_config,
     load_dataset,
-    make_indexer,
-    make_searcher_factory,
+    make_index_writer,
+    make_searchers,
     resolve_config,
 )
 
@@ -284,8 +284,8 @@ def test_dataset_registry_maps_wands_to_dotted_target() -> None:
     assert DATASET_TARGETS["wands"] == "benchmark.datasets.wands:WandsDataset"
 
 
-def test_indexer_registry_maps_elasticsearch_to_dotted_target() -> None:
-    assert INDEXER_TARGETS["elasticsearch"] == "benchmark.backends.elasticsearch:ElasticsearchBackend"
+def test_index_writer_registry_maps_elasticsearch_to_dotted_target() -> None:
+    assert INDEX_WRITER_TARGETS["elasticsearch"] == "benchmark.providers.elasticsearch:ESIndexWriter"
 
 
 def test_unknown_dataset_name_raises() -> None:
@@ -293,11 +293,12 @@ def test_unknown_dataset_name_raises() -> None:
         load_dataset({"name": "sqamble"})
 
 
-def test_unknown_indexer_provider_raises() -> None:
+def test_unknown_index_writer_provider_raises() -> None:
     with pytest.raises(ConfigError, match="unknown indexer provider"):
-        make_indexer({"provider": "vespa"})
+        make_index_writer({"provider": "vespa"})
 
 
-def test_unknown_searcher_factory_provider_raises() -> None:
+def test_unknown_searchers_provider_raises() -> None:
+    # The unknown-provider dispatch guard fires before mapping/services are touched.
     with pytest.raises(ConfigError, match="unknown indexer provider"):
-        make_searcher_factory({"provider": "vespa"})
+        make_searchers({"provider": "vespa"}, None, None, embedders={})

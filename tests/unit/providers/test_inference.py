@@ -19,8 +19,9 @@ from typing import Any
 
 import pytest
 
-from benchmark import providers
-from benchmark.providers import (
+from benchmark.embedding import make_embedder
+from benchmark.providers import inference as providers
+from benchmark.providers.inference import (
     CohereEmbedder,
     CohereReranker,
     OpenAIEmbedder,
@@ -28,9 +29,8 @@ from benchmark.providers import (
     RateLimiter,
     VoyageEmbedder,
     VoyageReranker,
-    make_embedder,
-    make_reranker,
 )
+from benchmark.reranking import make_reranker
 
 
 class _Resp:

@@ -12,8 +12,8 @@ import math
 
 import pytest
 
-from benchmark.metrics import Evaluator, Metrics, QrelIndex
-from benchmark.models import Qrel, RankedResult, ScoredDoc
+from benchmark.common.models import Qrel, RankedResult, ScoredDoc
+from benchmark.evaluation.metrics import Evaluator, Metrics, QrelIndex
 
 
 def _rr(query_id: str, doc_ids: list[str]) -> RankedResult:

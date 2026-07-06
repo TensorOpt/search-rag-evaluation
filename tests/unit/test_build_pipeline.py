@@ -1,8 +1,10 @@
 """build_pipeline object-graph tests (docs/experiment.md §4, §10, plan Phase 6).
 
 Builds each explicit pipeline shape (single lexical/vector leaf; HybridSearch+RRFFuser; +reranker
-with rerank_window_size) via a fake SearcherFactory + a fake Services registry, asserting the
-resulting SearchPipeline object graph. There is NO expansion/sweep — pipelines are explicit.
+with rerank_window_size) from pre-built fake ``{name: Searcher}`` / ``{name: Reranker}`` maps passed
+straight to :func:`build_pipeline` (the ``_ESSearcherFactory`` seam is gone — the leaves are minted by
+the ES adapter's ``build_searchers``/``build_rerankers`` and selected by name here). Asserts the
+resulting ``SearchPipeline`` object graph. There is NO expansion/sweep — pipelines are explicit.
 """
 
 from __future__ import annotations
@@ -11,18 +13,10 @@ from typing import Sequence
 
 import pytest
 
-from benchmark.config import (
-    EmbedderCfg,
-    FuserCfg,
-    PipelineCfg,
-    RerankerCfg,
-    SearcherCfg,
-    Services,
-    build_pipeline,
-)
-from benchmark.models import IndexMapping, ScoredDoc
-from benchmark.pipeline import HybridSearch, SearchPipeline
-from benchmark.protocols import Reranker, Searcher
+from benchmark.common.models import ScoredDoc
+from benchmark.common.protocols import Reranker, Searcher
+from benchmark.config import FuserCfg, PipelineCfg, build_pipeline
+from benchmark.search import HybridSearch, SearchPipeline
 
 WINDOW = 100
 
@@ -46,40 +40,20 @@ class _FakeReranker(Reranker):
         return list(candidates)
 
 
-class _FakeFactory:
-    def lexical(self, *, fields: Sequence[str]) -> Searcher:
-        return _FakeSearcher("lexical", list(fields))
-
-    def vector(self, *, field: str, embedder_id: str) -> Searcher:
-        return _FakeSearcher("vector", field, embedder_id)
-
-    def reranker(self, name: str, field: str) -> Reranker:
-        return _FakeReranker(name, field)
-
-
-SERVICES = Services(
-    embedders={
-        "e5": EmbedderCfg("e5", "cohere", {"model_id": "embed-english-v3.0"}),
-    },
-    rerankers={
-        "co-rr": RerankerCfg("co-rr", "cohere", {"top_n": 100}),
-    },
-    searchers={
-        "bm25": SearcherCfg("bm25", "elasticsearch", "lexical", None),
-        "semantic_e5": SearcherCfg("semantic_e5", "elasticsearch", "vector", "e5"),
-    },
-)
-
-MAPPING = IndexMapping(
-    index_name="wands_bench",
-    search_text_field="search_text",
-    sem_fields={"e5": "sem__e5"},
-    backend_mapping={},
-)
+# Pre-built leaf maps keyed by service name (what build_searchers/build_rerankers would mint). The
+# leaf attributes below mirror what the ES builders attach (lexical field, vector sem-field + query
+# embedder id, reranker field/name) so the graph-shape assertions are identical to before.
+SEARCHERS: dict[str, Searcher] = {
+    "bm25": _FakeSearcher("lexical", ["search_text"]),
+    "semantic_e5": _FakeSearcher("vector", "sem__e5", "e5"),
+}
+RERANKERS: dict[str, Reranker] = {
+    "co-rr": _FakeReranker("co-rr", "search_text"),
+}
 
 
 def _build(pcfg: PipelineCfg) -> SearchPipeline:
-    return build_pipeline(pcfg, SERVICES, MAPPING, _FakeFactory())
+    return build_pipeline(pcfg, SEARCHERS, RERANKERS)
 
 
 def _pcfg(**kw: object) -> PipelineCfg:

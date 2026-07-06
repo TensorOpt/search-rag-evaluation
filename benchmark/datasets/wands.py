@@ -7,8 +7,8 @@ label->gain mapping (§7, via ``Dataset.map_label``) and the ``search_text`` con
 ``Dataset.build_search_text``) are applied here so the rest of the harness only ever sees float gains
 and a single canonical text field.
 
-Imports ``benchmark.models`` + ``benchmark.protocols`` (the ``Dataset`` ABC) + stdlib
-(``csv``/``pathlib``); no backend/pipeline (§11).
+Imports ``benchmark.common.models`` + ``benchmark.common.protocols`` (the ``Dataset`` ABC) + stdlib
+(``csv``/``pathlib``); no backend/search (§11).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import csv
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
-from benchmark.models import (
+from benchmark.common.models import (
     Document,
     FieldRole,
     FieldSchema,
@@ -25,7 +25,7 @@ from benchmark.models import (
     Qrel,
     Query,
 )
-from benchmark.protocols import Dataset
+from benchmark.common.protocols import Dataset
 
 #: label.csv string label -> float relevance gain (§7). Exhaustive; unknown -> ValueError.
 WANDS_GAINS: Mapping[str, float] = {"Exact": 1.0, "Partial": 0.5, "Irrelevant": 0.0}

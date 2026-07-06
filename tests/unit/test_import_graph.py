@@ -1,16 +1,18 @@
 """Import-graph test — automates the §11 module-layout invariant (§1.4(3) Generality).
 
-docs/experiment.md §11: "pipeline, metrics, stats, runner, io_csv import only models/protocols
-(plus the cross-cutting leaf logging_setup ...; pipeline also imports the leaf fusion) — never
-datasets/* or backends/*." and config.py "still imports no adapter at import time (the factories
-resolve dotted targets lazily)."
+docs/experiment.md §11: "search, indexing, evaluation.metrics, evaluation.stats, runner, io_csv
+import only common (models/protocols/ranking + the cross-cutting leaf logging_setup) — never
+datasets/*, providers/*, embedding, or reranking." and config.py "imports search (the composers) +
+evaluation.stats + common only, and still imports no adapter at import time (the factories resolve
+dotted targets lazily)."
 
 We assert this at IMPORT TIME, not by reading source: each pure module is imported in a FRESH
 interpreter (``sys.executable -c``) and we inspect that interpreter's ``sys.modules`` for any
-``benchmark.backends.*`` / ``benchmark.datasets.*`` key. A fresh subprocess is the robust probe —
-importing in-process would see modules other tests already pulled in. If someone reintroduces a
-top-level adapter import in ``runner`` (e.g. ``from benchmark.backends.elasticsearch import
-ESIndexer``), that key appears in the subprocess's ``sys.modules`` and the assertion fails.
+``benchmark.providers.*`` / ``benchmark.datasets.*`` / ``benchmark.embedding`` / ``benchmark.reranking``
+key. A fresh subprocess is the robust probe — importing in-process would see modules other tests
+already pulled in. If someone reintroduces a top-level adapter import in ``runner`` (e.g. ``from
+benchmark.providers.elasticsearch import ESIndexWriter``), that key appears in the subprocess's
+``sys.modules`` and the assertion fails.
 """
 
 from __future__ import annotations
@@ -20,21 +22,26 @@ import sys
 
 import pytest
 
-#: Pure modules (§11): may pull in models/protocols/logging_setup/fusion — NEVER an adapter.
+#: Pure modules (§11): may pull in common (models/protocols/ranking/logging_setup) — NEVER an adapter.
 _PURE_MODULES = (
-    "benchmark.pipeline",
-    "benchmark.metrics",
-    "benchmark.stats",
+    "benchmark.search",
+    "benchmark.indexing",
+    "benchmark.evaluation.metrics",
+    "benchmark.evaluation.stats",
     "benchmark.runner",
     "benchmark.io_csv",
-    "benchmark.fusion",
-    "benchmark.rerank",
 )
 
 #: The adapter package prefixes §11 forbids at import time for the pure modules + config.
-#: ``benchmark.providers`` (the inference-provider connectors, §3.4) is an adapter too — pure modules
-#: reach it only through ``config``'s lazy factories, never a top-level import.
-_ADAPTER_PREFIXES = ("benchmark.backends", "benchmark.datasets", "benchmark.providers")
+#: ``benchmark.providers`` (ES adapter + the inference-provider connectors, §3.4) and the
+#: provider-dispatch factories ``benchmark.embedding``/``benchmark.reranking`` are adapters too — pure
+#: modules reach them only through ``config``'s lazy factories, never a top-level import.
+_ADAPTER_PREFIXES = (
+    "benchmark.providers",
+    "benchmark.datasets",
+    "benchmark.embedding",
+    "benchmark.reranking",
+)
 
 # Import ``module``, then print every sys.modules key under an adapter package, one per line.
 _PROBE = (
@@ -66,14 +73,14 @@ def test_pure_module_imports_no_adapter(module: str) -> None:
     )
 
 
-def test_config_imports_pipeline_but_no_adapter() -> None:
-    """config.py imports pipeline (the one wiring edge) but NO adapter at import time (§11)."""
+def test_config_imports_search_but_no_adapter() -> None:
+    """config.py imports search (the one wiring edge) but NO adapter at import time (§11)."""
     proc = subprocess.run(
         [
             sys.executable,
             "-c",
             "import sys, benchmark.config\n"
-            "print('benchmark.pipeline' in sys.modules)\n"
+            "print('benchmark.search' in sys.modules)\n"
             "print('\\n'.join(k for k in sys.modules\n"
             f"                 if any(k == p or k.startswith(p + '.') for p in {_ADAPTER_PREFIXES!r})))\n",
         ],
@@ -82,7 +89,7 @@ def test_config_imports_pipeline_but_no_adapter() -> None:
         check=True,
     )
     lines = proc.stdout.splitlines()
-    assert lines[0] == "True", "config.py must import benchmark.pipeline (the build_pipeline edge, §11)"
+    assert lines[0] == "True", "config.py must import benchmark.search (the build_pipeline edge, §11)"
     pulled = {line for line in lines[1:] if line}
     assert pulled == set(), (
         f"config.py pulled adapter modules at import time: {sorted(pulled)} — "

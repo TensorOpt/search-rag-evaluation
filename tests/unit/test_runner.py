@@ -1,11 +1,12 @@
 """Offline ExperimentRunner tests (docs/experiment.md §8.0, plan Phase 11).
 
 Drives :class:`benchmark.runner.ExperimentRunner` with FAKES — NO ES, NO network. The lazy config
-factories (``load_dataset``/``make_indexer``/``make_searcher_factory``) are monkeypatched to return a
-tiny in-memory :class:`Dataset`, a fake ingest backend, and a fake ``SearcherFactory`` whose
-lexical/vector leaves are conftest :class:`FakeSearcher` and whose reranker is a conftest
-:class:`FakeReranker`. The real ``ESIndexer().build`` runs against the fake backend (so the §3.5
-register→ensure→bulk sequence is exercised, not stubbed).
+factories (``load_dataset`` / ``make_index_writer`` / ``make_embedders`` / ``make_rerankers`` /
+``make_searchers`` / ``make_rerankers_bound``) are monkeypatched on ``config`` to return a tiny
+in-memory :class:`Dataset`, a fake :class:`IndexWriter`, fake embedder/rerank connectors, and fake
+``{name: Searcher}`` / ``{name: Reranker}`` leaf maps (conftest :class:`FakeSearcher` /
+:class:`FakeReranker`). The real domain ``indexing.Indexer(writer, embedders).build`` runs against the
+fake writer (so the §3.5 ensure→embed→bulk sequence is exercised, not stubbed).
 
 Asserts: every pipeline traverses the single ``run_one`` path (all produce artifacts); all three CSV
 types + run_config land in the tmp output dir; the baseline is written first and is NOT in the
@@ -16,11 +17,22 @@ writes nothing.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import pytest
 
 import benchmark.config as config
+from benchmark.common.models import (
+    Document,
+    FieldRole,
+    FieldSchema,
+    FieldSpec,
+    IndexMapping,
+    Qrel,
+    Query,
+    ScoredDoc,
+)
+from benchmark.common.protocols import Dataset
 from benchmark.config import (
     EmbedderCfg,
     FuserCfg,
@@ -30,17 +42,7 @@ from benchmark.config import (
     SearcherCfg,
     Services,
 )
-from benchmark.models import (
-    Document,
-    FieldRole,
-    FieldSchema,
-    FieldSpec,
-    Qrel,
-    Query,
-    ScoredDoc,
-)
-from benchmark.protocols import Dataset, Reranker, Searcher
-from benchmark.stats import StatsCfg
+from benchmark.evaluation.stats import StatsCfg
 
 from tests.conftest import FakeReranker, FakeSearcher
 
@@ -76,7 +78,7 @@ _QRELS = [
 
 
 class FakeDataset(Dataset):
-    """A tiny in-memory dataset (real ``Dataset`` so ``field_schema`` feeds the real ``ESIndexer``)."""
+    """A tiny in-memory dataset (real ``Dataset`` so ``field_schema`` feeds the real ``Indexer``)."""
 
     def __init__(self, dataset_cfg: Any = None) -> None:
         self.name = "fake"
@@ -95,19 +97,36 @@ class FakeDataset(Dataset):
         return _SCHEMA
 
 
-# --- fake ingest backend + searcher factory ---------------------------------------------------
+# --- fake index writer + provider connectors --------------------------------------------------
 
 
-class FakeBackend:
-    """A fake ``SearchBackend`` recording the §3.5 ingest calls (no ES). ``.client``/``.index`` are
+class FakeIndexWriter:
+    """A fake ``IndexWriter`` recording the §3.5 ingest calls (no ES). ``.client``/``.index`` are
     present so ``eval:index``-style probing works. ES is a plain index writer now — no inference
     registration; the harness embeds the corpus upstream and hands already-embedded documents here.
+    ``sem_field_name``/``create_mapping`` let the real domain ``Indexer`` name fields + build a
+    real ``IndexMapping`` against this fake.
     """
+
+    embed_batch_size = 96
 
     def __init__(self, indexer_cfg: Any = None) -> None:
         self.index = "fake_index"
         self.ensured = False
         self.indexed: list[Document] = []
+
+    def sem_field_name(self, embedder_id: str) -> str:
+        return "sem__" + embedder_id
+
+    def create_mapping(
+        self, schema: FieldSchema, sem_fields: Mapping[str, str], vector_dims: Mapping[str, int]
+    ) -> IndexMapping:
+        return IndexMapping(
+            index_name=self.index,
+            search_text_field=schema.search_text_field,
+            sem_fields=dict(sem_fields),
+            backend_mapping={"properties": {}},
+        )
 
     def ensure_index(self, mapping: Any) -> None:
         self.ensured = True
@@ -118,8 +137,8 @@ class FakeBackend:
 
 class FakeEmbedder:
     """A fake embedding connector: fixed-dim canned vectors (no network). ``id``/``dim`` drive the
-    real ``ESIndexer`` mapping; ``embed_documents`` is called at ingest, ``embed_queries`` never here
-    (the FakeFactory's vector leaf is a canned ``FakeSearcher`` that ignores the embedder)."""
+    real ``Indexer`` mapping; ``embed_documents`` is called at ingest, ``embed_queries`` never here
+    (the fake vector leaf is a canned ``FakeSearcher`` that ignores the embedder)."""
 
     def __init__(self, name: str, dim: int = 3) -> None:
         self.id = name
@@ -149,18 +168,25 @@ _LEXICAL_DOCS = [ScoredDoc("d1", 5.0), ScoredDoc("d2", 4.0), ScoredDoc("d3", 3.0
 _VECTOR_DOCS = [ScoredDoc("d2", 0.9), ScoredDoc("d4", 0.8), ScoredDoc("d1", 0.7), ScoredDoc("d3", 0.6)]
 
 
-class FakeFactory:
-    """A fake ``SearcherFactory`` (§4): lexical/vector -> conftest ``FakeSearcher``, reranker ->
-    conftest ``FakeReranker``. Uses the ABC's default per-query ``bulk_search`` (no ES batching)."""
+def _fake_searchers(
+    indexer_cfg: Any, mapping: Any, services: Services, *, embedders: Mapping[str, Any]
+) -> dict[str, FakeSearcher]:
+    """Stand-in for ``build_searchers``: one conftest ``FakeSearcher`` per configured searcher.
 
-    def lexical(self, *, fields: Sequence[str]) -> Searcher:
-        return FakeSearcher(_LEXICAL_DOCS)
+    Lexical -> the lexical canned list, vector -> the vector canned list (so the fused/reranked
+    outputs differ). Uses the ABC's default per-query ``bulk_search`` (no ES batching)."""
+    out: dict[str, FakeSearcher] = {}
+    for name, searcher_cfg in services.searchers.items():
+        docs = _LEXICAL_DOCS if searcher_cfg.kind == "lexical" else _VECTOR_DOCS
+        out[name] = FakeSearcher(docs)
+    return out
 
-    def vector(self, *, field: str, embedder_id: str) -> Searcher:
-        return FakeSearcher(_VECTOR_DOCS)
 
-    def reranker(self, name: str, field: str) -> Reranker:
-        return FakeReranker()
+def _fake_rerankers_bound(
+    indexer_cfg: Any, mapping: Any, services: Services, *, rerank_clients: Mapping[str, Any]
+) -> dict[str, FakeReranker]:
+    """Stand-in for ``build_rerankers``: one conftest ``FakeReranker`` per configured reranker."""
+    return {name: FakeReranker() for name in services.rerankers}
 
 
 # --- resolved-config builder ------------------------------------------------------------------
@@ -203,36 +229,35 @@ def _config(
     )
 
 
-def patch_runner_factories(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
-    """Point the runner's ``config`` factories at the in-memory fakes; return the fake backend.
+def patch_runner_factories(monkeypatch: pytest.MonkeyPatch) -> FakeIndexWriter:
+    """Point the runner's ``config`` factories at the in-memory fakes; return the fake index writer.
 
     Reused by the ``patched_factories`` fixture AND the schema-lint / reproducibility tests (one
-    patching path). ``make_index_builder`` returns the REAL :class:`ESIndexer` (run against the fake
-    backend), so the §3.5 register→ensure→bulk sequence is exercised, not stubbed — matching the
-    pre-Phase-12 flow where the runner imported ``ESIndexer`` directly. All four factories are patched
-    on ``config`` so no adapter is imported/instantiated live.
+    patching path). ``make_index_writer`` returns a fake :class:`IndexWriter`; the runner drives the
+    REAL :class:`~benchmark.indexing.Indexer` over it (so the §3.5 ensure→embed→bulk sequence is
+    exercised, not stubbed). ``make_searchers`` / ``make_rerankers_bound`` return the fake leaf maps
+    (bypassing the deleted ``_ESSearcherFactory``); all factories are patched on ``config`` so no
+    adapter is imported/instantiated live.
     """
-    from benchmark.backends.elasticsearch import ESIndexer
-
-    backend = FakeBackend()
+    writer = FakeIndexWriter()
     monkeypatch.setattr(config, "load_dataset", lambda dataset_cfg: FakeDataset())
-    monkeypatch.setattr(config, "make_indexer", lambda indexer_cfg: backend)
-    monkeypatch.setattr(config, "make_index_builder", lambda indexer_cfg: ESIndexer())
-    # Embedder/reranker connectors are FAKES (no network): the real ESIndexer embeds the corpus with
-    # these at ingest; the FakeFactory's vector leaf is canned, so it ignores the query embedder.
+    monkeypatch.setattr(config, "make_index_writer", lambda indexer_cfg: writer)
+    # Embedder/reranker connectors are FAKES (no network): the real Indexer embeds the corpus with
+    # these at ingest; the fake vector leaf is canned, so it ignores the query embedder.
     monkeypatch.setattr(
         config, "make_embedders", lambda services: {name: FakeEmbedder(name) for name in services.embedders}
     )
     monkeypatch.setattr(
         config, "make_rerankers", lambda services: {name: FakeRerankClient() for name in services.rerankers}
     )
-    monkeypatch.setattr(config, "make_searcher_factory", lambda indexer_cfg, **kwargs: FakeFactory())
-    return backend
+    monkeypatch.setattr(config, "make_searchers", _fake_searchers)
+    monkeypatch.setattr(config, "make_rerankers_bound", _fake_rerankers_bound)
+    return writer
 
 
 @pytest.fixture
-def patched_factories(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
-    """Fixture wrapper over :func:`patch_runner_factories` (return the fake ingest backend)."""
+def patched_factories(monkeypatch: pytest.MonkeyPatch) -> FakeIndexWriter:
+    """Fixture wrapper over :func:`patch_runner_factories` (return the fake index writer)."""
     return patch_runner_factories(monkeypatch)
 
 
@@ -244,7 +269,7 @@ def _artifacts(output_dir: Path, prefix: str, timestamp: str) -> list[str]:
 
 
 def test_run_produces_all_artifacts_baseline_first(
-    patched_factories: FakeBackend, tmp_path: Path
+    patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
     from benchmark.runner import ExperimentRunner
 
@@ -296,7 +321,7 @@ def test_run_produces_all_artifacts_baseline_first(
 
 
 def test_run_result_csv_is_first_written_for_baseline(
-    patched_factories: FakeBackend, tmp_path: Path
+    patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
     from benchmark.runner import ExperimentRunner
 
@@ -316,7 +341,7 @@ def test_run_result_csv_is_first_written_for_baseline(
 
 
 def test_r0_asserts_when_rerank_window_exceeds_top_n(
-    patched_factories: FakeBackend, tmp_path: Path
+    patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
     from benchmark.runner import ExperimentRunner
 
@@ -331,19 +356,19 @@ def test_r0_asserts_when_rerank_window_exceeds_top_n(
 
 
 def test_build_index_reuses_single_ingest_path(
-    patched_factories: FakeBackend, tmp_path: Path
+    patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
     from benchmark.runner import ExperimentRunner
 
     cfg = _config(variants=[], timestamp="20260702T030000Z")
-    dataset, backend, mapping, embedders = ExperimentRunner().build_index(cfg)
+    dataset, writer, mapping, embedders = ExperimentRunner().build_index(cfg)
 
     assert isinstance(dataset, FakeDataset)
-    assert backend is patched_factories
+    assert writer is patched_factories
     # One dense_vector field per embedder (§5.2); doc _id-keyed ingest happened.
     assert mapping.sem_fields == {"e5": "sem__e5"}
     assert set(embedders) == {"e5"}  # the embedder connector registry the runner reuses (§8.0)
-    assert backend.ensured is True
+    assert writer.ensured is True
 
 
 def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

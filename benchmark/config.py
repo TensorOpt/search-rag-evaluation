@@ -6,23 +6,24 @@ This module is the whole configuration layer. It holds:
   + the :class:`Services` registry, :class:`FuserCfg`, :class:`PipelineCfg`, :class:`ResolvedConfig`.
   Pipelines are named + explicit (§10): the config declares one ``baseline`` plus a map of named
   ``variants``, each resolved into a :class:`PipelineCfg`. There is NO matrix expansion and NO sweep.
-- :func:`build_pipeline`, which assembles one ``PipelineCfg`` into a ``SearchPipeline`` object graph
-  (§4) via a ``SearcherFactory`` seam, reading concrete field names from ``IndexMapping``.
+- :func:`build_pipeline`, which composes one ``PipelineCfg`` into a ``SearchPipeline`` object graph
+  (§4) from the pre-built leaf ``Searcher`` / ``Reranker`` maps — no factory object.
 - The loader: parses the explicit §10 YAML (``dataset`` / ``services`` / ``indexer`` / ``pipelines`` /
   ``stats`` / ``cutoff`` / ``top_k``), substitutes whole-value ``${VAR}`` environment placeholders at
   load (secrets never live in the file), validates it, and resolves it into a :class:`ResolvedConfig`.
   Embedders/rerankers are provider connectors (Cohere/Voyage/OpenAI, §3.4): the config validates the
   ``provider`` offline (no network) and the runner instantiates them lazily via :func:`make_embedders`
   / :func:`make_rerankers`.
-- The lazy factories ``load_dataset`` / ``make_indexer`` / ``make_searcher_factory`` /
-  ``make_embedders`` / ``make_rerankers``, which dispatch on ``dataset.name`` / ``indexer.provider`` /
-  the connector ``provider`` to a dotted-path target. They do NOT import the adapter or
-  ``benchmark.providers`` at import time (offline, §11); the live import + construct resolves at CALL
-  time. An unknown name/provider raises.
+- The lazy factories ``load_dataset`` / ``make_index_writer`` / ``make_searchers`` /
+  ``make_rerankers_bound`` / ``make_embedders`` / ``make_rerankers``, which dispatch on
+  ``dataset.name`` / ``indexer.provider`` / the connector ``provider`` to a dotted-path target. They do
+  NOT import the adapter or ``benchmark.providers`` at import time (offline, §11); the live import +
+  construct resolves at CALL time. An unknown name/provider raises.
 
-Imports ``benchmark.models`` / ``benchmark.protocols`` / ``benchmark.stats`` / ``benchmark.pipeline``
-(the composers, for :func:`build_pipeline` — a one-way wiring edge, §11) + pyyaml + stdlib. It NEVER
-imports an adapter module at import time (§11): the factories resolve their dotted targets lazily.
+Imports ``benchmark.common.models`` / ``benchmark.common.protocols`` / ``benchmark.evaluation.stats`` /
+``benchmark.search`` (the composers, for :func:`build_pipeline` — a one-way wiring edge, §11) + pyyaml
++ stdlib. It NEVER imports an adapter module at import time (§11): the factories resolve their dotted
+targets lazily.
 """
 
 from __future__ import annotations
@@ -36,11 +37,11 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from benchmark.logging_setup import get_logger
-from benchmark.models import IndexMapping
-from benchmark.pipeline import HybridSearch, RRFFuser, SearchPipeline
-from benchmark.protocols import Searcher, SearcherFactory
-from benchmark.stats import StatsCfg
+from benchmark.common.logging_setup import get_logger
+from benchmark.common.models import IndexMapping
+from benchmark.common.protocols import Embedder, Reranker, RerankClient, Searcher
+from benchmark.evaluation.stats import StatsCfg
+from benchmark.search import HybridSearch, RRFFuser, SearchPipeline
 
 logger = get_logger(__name__)
 
@@ -59,16 +60,18 @@ _ENV_PLACEHOLDER = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 DATASET_TARGETS: Mapping[str, str] = {
     "wands": "benchmark.datasets.wands:WandsDataset",
 }
-INDEXER_TARGETS: Mapping[str, str] = {
-    "elasticsearch": "benchmark.backends.elasticsearch:ElasticsearchBackend",
+#: The ``IndexWriter`` (§3.5) per provider — the domain ``Indexer`` (built by the runner) delegates
+#: mapping/field-naming/ingest to it. Resolved LAZILY so swapping the backend is a config-only edit.
+INDEX_WRITER_TARGETS: Mapping[str, str] = {
+    "elasticsearch": "benchmark.providers.elasticsearch:ESIndexWriter",
 }
-#: The concrete ``Indexer`` (§3.5 ``build``) per provider — resolved LAZILY like the others so the
-#: runner names no adapter and swapping the backend is a config-only edit (§1.4(3), §11).
-INDEX_BUILDER_TARGETS: Mapping[str, str] = {
-    "elasticsearch": "benchmark.backends.elasticsearch:ESIndexer",
+#: The leaf ``Searcher`` / ``Reranker`` builders per provider — mint the full configured set over one
+#: shared client (§4). Resolved LAZILY like the others so ``config`` names no adapter at import time.
+SEARCHER_BUILDER_TARGETS: Mapping[str, str] = {
+    "elasticsearch": "benchmark.providers.elasticsearch:build_searchers",
 }
-SEARCHER_FACTORY_TARGETS: Mapping[str, str] = {
-    "elasticsearch": "benchmark.backends.elasticsearch:make_searcher_factory",
+RERANKER_BUILDER_TARGETS: Mapping[str, str] = {
+    "elasticsearch": "benchmark.providers.elasticsearch:build_rerankers",
 }
 
 #: Valid searcher kinds (§10). Exhaustive — anything else is a ConfigError.
@@ -217,26 +220,20 @@ class ResolvedConfig:
 
 def build_pipeline(
     pcfg: PipelineCfg,
-    services: Services,
-    mapping: IndexMapping,
-    factory: SearcherFactory,
+    searchers: Mapping[str, Searcher],
+    rerankers: Mapping[str, Reranker],
 ) -> SearchPipeline:
-    """Assemble ``pcfg``'s ``SearchPipeline`` object graph via the ``SearcherFactory`` (§4).
+    """Compose ``pcfg``'s ``SearchPipeline`` object graph from the pre-built leaf maps (§4).
 
-    Each retriever name resolves to its :class:`SearcherCfg` in ``services``; a lexical searcher
-    becomes ``factory.lexical(fields=[mapping.search_text_field])`` and a vector searcher becomes
-    ``factory.vector(field=mapping.sem_field(embedder_name), embedder_id=embedder_name)``. With a ``fuser`` the leaves are
-    wrapped in a ``HybridSearch`` (RRF at ``fuser.rank_constant``, window ``fuser.window``); without
-    one, exactly one leaf is expected (else ``ValueError``). A ``reranker`` wraps the retriever in a
-    ``SearchPipeline`` with a rerank pass at ``rerank_window_size``; else a bare pass-through pipeline.
-
-    The reranker's doc-text field is ``mapping.search_text_field`` — ``IndexMapping`` carries only
-    that canonical text field, and §5.3 fixes the ES rerank field to that same ``search_text``.
+    Each retriever name indexes a leaf ``Searcher`` in ``searchers`` (built once by
+    :func:`make_searchers`). With a ``fuser`` the leaves are wrapped in a ``HybridSearch`` (RRF at
+    ``fuser.rank_constant``, window ``fuser.window``); without one, exactly one leaf is expected
+    (else ``ValueError``). A ``reranker`` name indexes a ``Reranker`` in ``rerankers`` and wraps the
+    retriever in a ``SearchPipeline`` with a rerank pass at ``rerank_window_size``; else a bare
+    pass-through pipeline. This is pure composition over plain provider objects — no factory, no
+    adapter import.
     """
-    leaves: list[Searcher] = [
-        _build_leaf(services.searcher(name), services, mapping, factory)
-        for name in pcfg.retrievers
-    ]
+    leaves = [searchers[name] for name in pcfg.retrievers]
 
     if pcfg.fuser is not None:
         if pcfg.fuser.type != "rrf":
@@ -259,28 +256,25 @@ def build_pipeline(
     if pcfg.reranker is not None:
         return SearchPipeline(
             retriever=retriever,
-            reranker=factory.reranker(pcfg.reranker, mapping.search_text_field),
+            reranker=rerankers[pcfg.reranker],
             rerank_window_size=pcfg.rerank_window_size,
         )
     return SearchPipeline(retriever=retriever)
 
 
-def _build_leaf(
-    searcher: SearcherCfg,
-    services: Services,
-    mapping: IndexMapping,
-    factory: SearcherFactory,
-) -> Searcher:
-    """Resolve one searcher service to a leaf ``Searcher`` (§4). Exhaustive on ``kind``."""
+def _searcher_spec(searcher: SearcherCfg, services: Services) -> tuple[str, str, str | None]:
+    """Translate one searcher service into a backend-agnostic ``(name, kind, embedder_id)`` spec (§4).
+
+    Resolves a vector searcher's ``embedder_id`` via ``services.embedder`` (as the old ``_build_leaf``
+    did); lexical searchers carry ``None``. Exhaustive on ``kind`` — an unknown kind raises.
+    """
     if searcher.kind == "lexical":
-        return factory.lexical(fields=[mapping.search_text_field])
+        return (searcher.name, "lexical", None)
     if searcher.kind == "vector":
         if searcher.embedder is None:
             raise ValueError(f"vector searcher {searcher.name!r} has no embedder reference")
         embedder: EmbedderCfg = services.embedder(searcher.embedder)
-        return factory.vector(
-            field=mapping.sem_field(embedder.name), embedder_id=embedder.name
-        )
+        return (searcher.name, "vector", embedder.name)
     raise ValueError(
         f"searcher {searcher.name!r} has unknown kind {searcher.kind!r}; expected 'lexical' or 'vector'"
     )
@@ -616,59 +610,86 @@ def load_dataset(dataset_cfg: Mapping[str, Any]) -> Any:
     return _resolve_target(target)(dataset_cfg)
 
 
-def make_indexer(indexer_cfg: Mapping[str, Any]) -> Any:
-    """Dispatch ``indexer.provider`` -> the ingest backend adapter, lazily imported (§11, Phase 11)."""
+def make_index_writer(indexer_cfg: Mapping[str, Any]) -> Any:
+    """Dispatch ``indexer.provider`` -> the ``IndexWriter`` adapter, lazily imported (§3.5, §11).
+
+    The returned writer (ES ``ESIndexWriter``) exposes ``sem_field_name`` / ``create_mapping`` /
+    ``ensure_index`` / ``bulk_index`` + ``embed_batch_size``; the runner injects it into the domain
+    ``indexing.Indexer`` (so the backend is swappable via config alone, §1.4(3)).
+    """
     provider = _require(indexer_cfg, "provider", "indexer")
-    target = INDEXER_TARGETS.get(provider)
+    target = INDEX_WRITER_TARGETS.get(provider)
     if target is None:
-        raise ConfigError(f"unknown indexer provider {provider!r}; known: {sorted(INDEXER_TARGETS)}")
+        raise ConfigError(
+            f"unknown indexer provider {provider!r}; known: {sorted(INDEX_WRITER_TARGETS)}"
+        )
     return _resolve_target(target)(indexer_cfg)
 
 
-def make_index_builder(indexer_cfg: Mapping[str, Any]) -> Any:
-    """Dispatch ``indexer.provider`` -> the concrete ``Indexer`` (§3.5), lazily imported (§11).
+def make_searchers(
+    indexer_cfg: Mapping[str, Any],
+    mapping: IndexMapping,
+    services: Services,
+    *,
+    embedders: Mapping[str, Embedder],
+) -> dict[str, Searcher]:
+    """Build the FULL configured leaf ``Searcher`` set once, keyed by service name (§4, §11).
 
-    Mirrors :func:`make_indexer`/:func:`make_searcher_factory`: resolves the dotted target at CALL
-    time so ``config`` imports no adapter at import time. The returned object exposes
-    ``build(dataset, backend, embedders) -> IndexMapping`` — the single ensure_index→embed-corpus→
-    bulk_index path the runner drives (so the backend is swappable via config alone, §1.4(3)).
+    Translates every :class:`SearcherCfg` in ``services`` into a backend-agnostic
+    ``(name, kind, embedder_id)`` spec (:func:`_searcher_spec`), then dispatches ``indexer.provider``
+    -> the backend's lazily-imported ``build_searchers``. The resulting map is shared across all
+    pipelines (a pipeline just selects its leaves by name in :func:`build_pipeline`).
     """
     provider = _require(indexer_cfg, "provider", "indexer")
-    target = INDEX_BUILDER_TARGETS.get(provider)
+    target = SEARCHER_BUILDER_TARGETS.get(provider)
     if target is None:
         raise ConfigError(
-            f"unknown indexer provider {provider!r}; known: {sorted(INDEX_BUILDER_TARGETS)}"
+            f"unknown indexer provider {provider!r}; known: {sorted(SEARCHER_BUILDER_TARGETS)}"
         )
-    return _resolve_target(target)()
+    specs = [_searcher_spec(cfg, services) for cfg in services.searchers.values()]
+    return _resolve_target(target)(indexer_cfg, mapping, specs, embedders=embedders)
 
 
-def make_searcher_factory(indexer_cfg: Mapping[str, Any], *args: Any, **kwargs: Any) -> Any:
-    """Dispatch ``indexer.provider`` -> the backend's ``searcher_factory`` builder (§4, §11, Phase 11)."""
+def make_rerankers_bound(
+    indexer_cfg: Mapping[str, Any],
+    mapping: IndexMapping,
+    services: Services,
+    *,
+    rerank_clients: Mapping[str, RerankClient],
+) -> dict[str, Reranker]:
+    """Build the FULL configured ``Reranker`` set once, keyed by service name (§4, §11).
+
+    Dispatches ``indexer.provider`` -> the backend's lazily-imported ``build_rerankers``, binding each
+    reranker service name to its provider ``RerankClient`` connector (in ``rerank_clients``). Shared
+    across pipelines (a pipeline selects its reranker by name in :func:`build_pipeline`).
+    """
     provider = _require(indexer_cfg, "provider", "indexer")
-    target = SEARCHER_FACTORY_TARGETS.get(provider)
+    target = RERANKER_BUILDER_TARGETS.get(provider)
     if target is None:
         raise ConfigError(
-            f"unknown indexer provider {provider!r}; known: {sorted(SEARCHER_FACTORY_TARGETS)}"
+            f"unknown indexer provider {provider!r}; known: {sorted(RERANKER_BUILDER_TARGETS)}"
         )
-    return _resolve_target(target)(indexer_cfg, *args, **kwargs)
+    return _resolve_target(target)(
+        indexer_cfg, mapping, list(services.rerankers), rerank_clients=rerank_clients
+    )
 
 
 def make_embedders(services: Services) -> dict[str, Any]:
     """Instantiate every configured embedder connector, keyed by service name (§3.4).
 
-    ``benchmark.providers`` is resolved at CALL time (not imported at config-module import time, §11)
+    ``benchmark.embedding`` is resolved at CALL time (not imported at config-module import time, §11)
     so config validation stays offline. Returns ``{name: Embedder}``; the provider was validated
     against ``_EMBEDDER_PROVIDERS`` at config load.
     """
-    make = _resolve_target("benchmark.providers:make_embedder")
+    make = _resolve_target("benchmark.embedding:make_embedder")
     return {name: make(cfg.name, cfg.provider, cfg.settings) for name, cfg in services.embedders.items()}
 
 
 def make_rerankers(services: Services) -> dict[str, Any]:
     """Instantiate every configured rerank connector, keyed by service name (§3.4/§5.4).
 
-    Resolves ``benchmark.providers`` at CALL time (§11). Returns ``{name: RerankClient}``; the
+    Resolves ``benchmark.reranking`` at CALL time (§11). Returns ``{name: RerankClient}``; the
     provider was validated against ``_RERANKER_PROVIDERS`` at config load.
     """
-    make = _resolve_target("benchmark.providers:make_reranker")
+    make = _resolve_target("benchmark.reranking:make_reranker")
     return {name: make(cfg.name, cfg.provider, cfg.settings) for name, cfg in services.rerankers.items()}

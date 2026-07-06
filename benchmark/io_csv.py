@@ -25,9 +25,9 @@ Serialization rules (fixed so golden files are stable, §9/CLAUDE.md):
   ``json.dumps`` (deterministic, ``sort_keys=True``, with ``default=str`` catching any non-JSON
   straggler) so it round-trips (§9.1).
 
-This module imports only ``benchmark.models``/``benchmark.metrics``/``benchmark.stats``/
-``benchmark.config`` + stdlib — never an adapter (§11); ``config`` does NOT import this module, so
-there is no cycle.
+This module imports only ``benchmark.common.models``/``benchmark.evaluation.metrics``/
+``benchmark.evaluation.stats``/``benchmark.config`` + stdlib — never an adapter (§11); ``config`` does
+NOT import this module, so there is no cycle.
 """
 
 from __future__ import annotations
@@ -39,10 +39,10 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from benchmark.common.models import RankedResult
 from benchmark.config import PipelineCfg, ResolvedConfig
-from benchmark.metrics import Metrics
-from benchmark.models import RankedResult
-from benchmark.stats import ComparisonResult
+from benchmark.evaluation.metrics import Metrics
+from benchmark.evaluation.stats import ComparisonResult
 
 #: Default artifact output directory (§9). The runner may override.
 DEFAULT_OUTPUT_DIR = "results"

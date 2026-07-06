@@ -18,8 +18,8 @@ import math
 import numpy as np
 import pytest
 
-from benchmark import stats as stats_mod
-from benchmark.stats import (
+from benchmark.evaluation import stats as stats_mod
+from benchmark.evaluation.stats import (
     CANONICAL_METRICS,
     Comparator,
     ComparisonResult,

@@ -1,9 +1,11 @@
-"""Phase 1 unit tests for benchmark.protocols (docs/experiment.md §3.2-§3.5).
+"""Unit tests for benchmark.common.protocols (docs/experiment.md §3.2-§3.5).
 
 Two seam kinds:
-- structural Protocols (``Embedder``, ``RerankClient``, ``Indexer``, ``SearchBackend``):
-  a trivial in-test class satisfies each (mypy checks data attributes; ``@runtime_checkable``
-  ``isinstance`` here only verifies method presence).
+- structural Protocols (``Embedder``, ``RerankClient``, ``IndexWriter``): a trivial in-test class
+  satisfies each (mypy checks data attributes; ``@runtime_checkable`` ``isinstance`` here only
+  verifies method presence). The domain ``Indexer`` is a concrete class now (no Protocol), covered
+  in ``tests/unit/test_indexing.py``; the ``SearcherFactory`` Protocol is deleted (leaves are minted
+  by ``build_searchers``/``build_rerankers``).
 - ABCs (``Searcher``, ``Fuser``, ``Reranker``, ``Dataset``): a trivial subclass implementing the
   abstract methods instantiates and works; a subclass that does not is uninstantiable. (The
   ``Dataset`` ABC's shared helpers are covered in ``test_wands.py``.)
@@ -15,7 +17,7 @@ from typing import Iterable, Sequence
 
 import pytest
 
-from benchmark.models import (
+from benchmark.common.models import (
     Document,
     FieldSchema,
     IndexMapping,
@@ -23,15 +25,14 @@ from benchmark.models import (
     Query,
     ScoredDoc,
 )
-from benchmark.protocols import (
+from benchmark.common.protocols import (
     Dataset,
     Embedder,
     Fuser,
-    Indexer,
+    IndexWriter,
     Reranker,
     RerankClient,
     Searcher,
-    SearchBackend,
 )
 
 
@@ -76,24 +77,27 @@ class _RerankClient:
         return [float(len(documents) - i) for i in range(len(documents))]
 
 
-class _Backend:
-    """A trivial ingest seam: ensure_index / bulk_index only (no inference registration)."""
+class _Writer:
+    """A trivial ``IndexWriter`` seam: field-naming + mapping + ensure_index/bulk_index (no register)."""
+
+    embed_batch_size = 96
+
+    def sem_field_name(self, embedder_id: str) -> str:
+        return "sem__" + embedder_id
+
+    def create_mapping(
+        self,
+        schema: FieldSchema,
+        sem_fields: "dict[str, str]",
+        vector_dims: "dict[str, int]",
+    ) -> IndexMapping:
+        return IndexMapping("i", schema.search_text_field, dict(sem_fields), {})
 
     def ensure_index(self, mapping: IndexMapping) -> None:
         return None
 
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None:
         return None
-
-
-class _Indexer:
-    def build(
-        self,
-        dataset: Dataset,
-        backend: SearchBackend,
-        embeddings: Sequence[Embedder],
-    ) -> IndexMapping:
-        return IndexMapping("i", "search_text", {}, {})
 
 
 # --- trivial ABC subclasses -------------------------------------------------------------------
@@ -121,16 +125,15 @@ class _Reranker(Reranker):
 
 def test_static_structural_conformance() -> None:
     dataset: Dataset = _Dataset()
-    backend: SearchBackend = _Backend()
+    writer: IndexWriter = _Writer()
     embedder: Embedder = _Embedder()
     rerank_client: RerankClient = _RerankClient()
-    indexer: Indexer = _Indexer()
     assert dataset.name == "fake"
     assert embedder.id == "cohere" and embedder.dim == 3
     assert embedder.embed_queries(["q"]) == [[0.0, 1.0, 0.0]]
     assert rerank_client.rerank_scores("q", ["a", "b"]) == [2.0, 1.0]
-    backend.ensure_index(IndexMapping("i", "search_text", {}, {}))
-    assert isinstance(indexer.build(dataset, backend, [embedder]), IndexMapping)
+    assert writer.sem_field_name("e5") == "sem__e5"
+    writer.ensure_index(IndexMapping("i", "search_text", {}, {}))
 
 
 # --- runtime isinstance checks against @runtime_checkable ingest Protocols ---------------------
@@ -138,18 +141,17 @@ def test_static_structural_conformance() -> None:
 
 def test_runtime_isinstance_method_protocols() -> None:
     assert isinstance(_Dataset(), Dataset)
-    assert isinstance(_Backend(), SearchBackend)
+    assert isinstance(_Writer(), IndexWriter)
     assert isinstance(_Embedder(), Embedder)
     assert isinstance(_RerankClient(), RerankClient)
-    assert isinstance(_Indexer(), Indexer)
 
 
 def test_runtime_isinstance_negative() -> None:
-    class _NotABackend:
+    class _NotAWriter:
         pass
 
-    assert not isinstance(_NotABackend(), SearchBackend)
-    assert not isinstance(_NotABackend(), Dataset)
+    assert not isinstance(_NotAWriter(), IndexWriter)
+    assert not isinstance(_NotAWriter(), Dataset)
 
 
 # --- behavioral ABCs: trivial subclasses satisfy them -----------------------------------------

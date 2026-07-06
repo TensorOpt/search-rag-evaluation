@@ -8,10 +8,10 @@ Two kinds of seam live here:
   derives from (§3.2). ``Dataset`` is an ABC (not a Protocol) so it can carry the two shared
   concrete helpers (``build_search_text``, ``map_label``) every adapter reuses.
 - **Structural Protocols** for the rest of the ingest/inference side: ``Embedder`` and
-  ``RerankClient`` (the provider connectors, realized in ``benchmark.providers``), ``Indexer``, and
-  ``SearchBackend`` (the index-writer/ingest seam used by ``Indexer.build``).
+  ``RerankClient`` (the provider connectors, realized in ``benchmark.providers.inference``) and
+  ``IndexWriter`` (the index-writer/ingest seam the domain ``Indexer`` delegates to).
 
-Data models are imported from ``benchmark.models``. Structural Protocols are ``@runtime_checkable``
+Data models are imported from ``benchmark.common.models``. Structural Protocols are ``@runtime_checkable``
 so tests can do ``isinstance`` checks (note: that only verifies method presence, not data
 attributes — rely on mypy for full structural conformance).
 """
@@ -21,7 +21,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
-from benchmark.models import (
+from benchmark.common.models import (
     Document,
     FieldRole,
     FieldSchema,
@@ -187,43 +187,30 @@ class RerankClient(Protocol):
 
 
 @runtime_checkable
-class Indexer(Protocol):
-    """Builds a backend index from a dataset + embedder connectors (§3.5)."""
+class IndexWriter(Protocol):
+    """The index-writer / ingest seam the domain ``Indexer`` delegates to (§3.3/§3.5).
 
-    def build(
-        self,
-        dataset: Dataset,
-        backend: SearchBackend,
-        embeddings: Sequence[Embedder],
-    ) -> IndexMapping: ...
+    This is the only place that knows a wire format for WRITING: it names the backend-safe
+    ``dense_vector`` field per embedder, builds the backend index mapping, creates the index, and
+    bulk-indexes documents. ES is a plain index writer — the harness embeds the corpus client-side
+    (``Embedder``) and stores the vectors in ``dense_vector`` fields; no inference runs server-side.
+    RETRIEVAL is not here — it is the ``Searcher`` / ``Fuser`` / ``Reranker`` composite model
+    (§3.3/§3.6), realized as concrete provider classes (ES ``LexicalSearcher`` / ``VectorSearch`` /
+    ``ESReranker``).
 
-
-@runtime_checkable
-class SearchBackend(Protocol):
-    """The index-writer / ingest seam used by ``Indexer.build`` (§3.3/§3.5).
-
-    This is the only place that knows a wire format for WRITING: it creates the index mapping and
-    bulk-indexes documents. ES is a plain index writer now — the harness embeds the corpus
-    client-side (``Embedder``) and stores the vectors in ``dense_vector`` fields; no inference runs
-    server-side. RETRIEVAL is no longer here — it moved to the ``Searcher`` / ``Fuser`` /
-    ``Reranker`` composite model (§3.3/§3.6); a backend realizes those as concrete
-    ``Searcher``/``Reranker`` implementations (e.g. ES ``LexicalSearcher`` / ``VectorSearch`` /
-    ``ESReranker`` in Phase 9/10).
+    ``embed_batch_size`` is the ingest buffering granularity the ``Indexer`` streams the corpus at;
+    ``sem_field_name`` maps an embedder id to its backend-safe field name; ``create_mapping``
+    translates the dataset ``FieldSchema`` (+ the per-field vector dims) into the ``IndexMapping``.
     """
 
+    embed_batch_size: int
+
+    def sem_field_name(self, embedder_id: str) -> str: ...
+    def create_mapping(
+        self,
+        schema: FieldSchema,
+        sem_fields: Mapping[str, str],
+        vector_dims: Mapping[str, int],
+    ) -> IndexMapping: ...
     def ensure_index(self, mapping: IndexMapping) -> None: ...
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None: ...
-
-
-@runtime_checkable
-class SearcherFactory(Protocol):
-    """Backend-agnostic builder of leaf ``Searcher``s / the ``Reranker`` (§4).
-
-    ``build_pipeline`` (``config.py``) uses this seam to assemble a pipeline's ``SearchPipeline`` object
-    graph without importing any adapter: the backend supplies a factory that binds these to its
-    client + ``IndexMapping`` (ES ``LexicalSearcher``/``VectorSearch``/``ESReranker``, Phase 9/10).
-    """
-
-    def lexical(self, *, fields: Sequence[str]) -> Searcher: ...
-    def vector(self, *, field: str, embedder_id: str) -> Searcher: ...
-    def reranker(self, name: str, field: str) -> Reranker: ...

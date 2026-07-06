@@ -6,18 +6,18 @@ guarantee, §8.0). The runner is a flat loop over the explicit config pipelines 
 there is NO matrix expansion, NO sweep, and NO selection phase.
 
 Setup prelude (§8.0), before any per-pipeline work: load the dataset, build the index (instantiate
-the embedder connectors → ensure_index → embed the corpus → bulk_index via the lazily-resolved
-``Indexer``), build the searcher factory (wired to the embedder/reranker connectors), freeze the
-shared query set, and build the :class:`QrelIndex` + :class:`Evaluator` once. The index-build
-sequence lives in ONE place — :meth:`ExperimentRunner.build_index` — reused by both
-:meth:`ExperimentRunner.run`'s setup and the ``eval:index`` entry point (``scripts/index.py``), so
-there is a single ensure/embed/bulk path (DRY).
+the embedder connectors → the domain ``indexing.Indexer`` discovers dims → ensure_index → embed the
+corpus → bulk_index, delegating backend bits to the injected ``IndexWriter``), build the full leaf
+``Searcher`` / ``Reranker`` maps (wired to the embedder/reranker connectors), freeze the shared query
+set, and build the :class:`QrelIndex` + :class:`Evaluator` once. The index-build sequence lives in
+ONE place — :meth:`ExperimentRunner.build_index` — reused by both :meth:`ExperimentRunner.run`'s setup
+and the ``eval:index`` entry point (``scripts/index.py``), so there is a single ensure/embed/bulk path (DRY).
 
-Imports ONLY the pure consumers (``config``/``metrics``/``stats``/``io_csv``/``models``) — NEVER an
-adapter at import time (§11). The concrete indexer §8.0 names as ``Indexer().build(...)`` arrives
-through the lazy ``config.make_index_builder`` factory, symmetric with
-``load_dataset``/``make_indexer``/``make_searcher_factory``; all four are referenced through the
-``config`` module so tests can monkeypatch them with in-memory fakes (no ES, no network). Because the
+Imports the pure consumers (``config``/``evaluation``/``io_csv``/``common``) + the domain
+``indexing.Indexer`` — NEVER an adapter at import time (§11). The concrete ``IndexWriter`` + leaf
+``Searcher`` / ``Reranker`` maps arrive through the lazy ``config.make_index_writer`` /
+``config.make_searchers`` / ``config.make_rerankers_bound`` factories (all referenced through the
+``config`` module so tests can monkeypatch them with in-memory fakes — no ES, no network). Because the
 runner names no backend, swapping the backend is a config-only edit (the §1.4(3) Generality criterion).
 """
 
@@ -26,7 +26,12 @@ from __future__ import annotations
 from typing import Any
 
 import benchmark.config as config
+from benchmark.common.logging_setup import get_logger
+from benchmark.common.models import RankedResult
 from benchmark.config import PipelineCfg, ResolvedConfig
+from benchmark.evaluation.metrics import Evaluator, Metrics, QrelIndex
+from benchmark.evaluation.stats import Comparator
+from benchmark.indexing import Indexer
 from benchmark.io_csv import (
     DEFAULT_OUTPUT_DIR,
     write_comparison_csv,
@@ -34,10 +39,6 @@ from benchmark.io_csv import (
     write_result_csv,
     write_run_config,
 )
-from benchmark.logging_setup import get_logger
-from benchmark.metrics import Evaluator, Metrics, QrelIndex
-from benchmark.models import RankedResult
-from benchmark.stats import Comparator
 
 logger = get_logger(__name__)
 
@@ -46,19 +47,19 @@ class ExperimentRunner:
     """Runs the whole benchmark for a resolved config, the single execution path (§8.0)."""
 
     def build_index(self, cfg: ResolvedConfig) -> tuple[Any, Any, Any, dict[str, Any]]:
-        """Build the index (§3.5 ensure_index→embed→bulk_index); return (dataset, backend, mapping, embedders).
+        """Build the index (§3.5 ensure_index→embed→bulk_index); return (dataset, writer, mapping, embedders).
 
         The ONE index-build path (DRY): reused by :meth:`run`'s setup prelude AND the ``eval:index``
-        entry point. Loads the dataset, builds the ingest backend, instantiates every configured
-        embedder connector (``config.make_embedders`` — §3.4), and drives the lazily-resolved
-        ``Indexer.build`` (``config.make_index_builder``) over them (each embedder gets a
+        entry point. Loads the dataset, builds the ``IndexWriter`` (``config.make_index_writer``),
+        instantiates every configured embedder connector (``config.make_embedders`` — §3.4), and
+        drives the domain :class:`~benchmark.indexing.Indexer` over them (each embedder gets a
         ``dense_vector`` field; the harness embeds the corpus at ingest, §3.5). Returns the dataset
-        (reused by :meth:`run` for the shared query set + qrels), the backend, the resulting
-        :class:`IndexMapping`, and the embedder registry (reused by :meth:`run` for the vector
-        searchers' query embedding).
+        (reused by :meth:`run` for the shared query set + qrels), the writer (its ``.client`` reused by
+        ``eval:index`` for the doc-count check), the resulting :class:`IndexMapping`, and the embedder
+        registry (reused by :meth:`run` for the vector searchers' query embedding).
         """
         dataset = config.load_dataset(cfg.dataset)
-        backend = config.make_indexer(cfg.indexer)  # ingest seam (ensure_index/bulk_index)
+        writer = config.make_index_writer(cfg.indexer)  # IndexWriter (mapping/ensure_index/bulk_index)
         embedders = config.make_embedders(cfg.services)  # name -> Embedder connector (§3.4)
         logger.info(
             "building index %r over %d embedder(s): %s",
@@ -66,18 +67,20 @@ class ExperimentRunner:
             len(embedders),
             sorted(embedders),
         )
-        mapping = config.make_index_builder(cfg.indexer).build(
-            dataset, backend, list(embedders.values())
-        )
-        return dataset, backend, mapping, embedders
+        mapping = Indexer(writer, list(embedders.values())).build(dataset)
+        return dataset, writer, mapping, embedders
 
     def run(self, cfg: ResolvedConfig, *, output_dir: str = DEFAULT_OUTPUT_DIR) -> None:
         """Run every pipeline baseline-first, then the family-wide comparator pass (§8.0)."""
-        dataset, backend, mapping, embedders = self.build_index(cfg)
-        rerankers = config.make_rerankers(cfg.services)  # name -> RerankClient connector (§3.4/§5.4)
-        factory = config.make_searcher_factory(
-            cfg.indexer, embedders=embedders, rerankers=rerankers
-        )  # ES: Lexical/Vector/ESReranker, wired to the provider connectors
+        dataset, writer, mapping, embedders = self.build_index(cfg)
+        rerank_clients = config.make_rerankers(cfg.services)  # name -> RerankClient connector (§3.4/§5.4)
+        # Build the FULL configured leaf-searcher + reranker sets ONCE, shared across all pipelines
+        # (each pipeline selects its leaves/reranker by name in build_pipeline). ES: Lexical/Vector/
+        # ESReranker over one shared client, wired to the provider connectors.
+        searchers = config.make_searchers(cfg.indexer, mapping, cfg.services, embedders=embedders)
+        rerankers = config.make_rerankers_bound(
+            cfg.indexer, mapping, cfg.services, rerank_clients=rerank_clients
+        )
         queries = list(dataset.queries())  # frozen, shared query set
         query_texts = [q.text for q in queries]
         qrel_index = QrelIndex(dataset.qrels())
@@ -105,7 +108,7 @@ class ExperimentRunner:
                         f"exceeds reranker {pcfg.reranker!r} top_n {top_n} (§5.4 W <= top_n)"
                     )
 
-            pipeline = config.build_pipeline(pcfg, cfg.services, mapping, factory)
+            pipeline = config.build_pipeline(pcfg, searchers, rerankers)
             # ONE bulk_search over the frozen shared query set — retrieval leaves batch via _msearch
             # (§5.3) rather than one round trip per query; result[i] aligns to queries[i].
             ranked = pipeline.bulk_search(query_texts, top_k=cfg.top_k)

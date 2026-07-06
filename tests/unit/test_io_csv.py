@@ -29,9 +29,9 @@ from benchmark.io_csv import (
     write_result_csv,
     write_run_config,
 )
-from benchmark.metrics import Metrics
-from benchmark.models import RankedResult, ScoredDoc
-from benchmark.stats import ComparisonResult, StatsCfg
+from benchmark.common.models import RankedResult, ScoredDoc
+from benchmark.evaluation.metrics import Metrics
+from benchmark.evaluation.stats import ComparisonResult, StatsCfg
 
 TIMESTAMP = "20260101T000000Z"
 
