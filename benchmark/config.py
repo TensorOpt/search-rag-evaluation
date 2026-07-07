@@ -31,12 +31,14 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import yaml
 
+from benchmark.common.cache import CachingEmbedder, CachingRerankClient, DiskCache
 from benchmark.common.logging_setup import get_logger
 from benchmark.common.models import IndexMapping
 from benchmark.common.protocols import Embedder, Reranker, RerankClient, Searcher
@@ -188,6 +190,21 @@ class PipelineCfg:
 
 
 @dataclass(frozen=True)
+class CacheCfg:
+    """Persistent inference/result cache config (docs/caching_design.md §9).
+
+    ``enabled`` is opt-in — a config with the ``cache`` block ABSENT is disabled (a clean cold run
+    by default). ``dir`` is the cache directory (gitignored). A pure config value: it rides in
+    ``run_config_{ts}.json`` as provenance but never affects metrics (the cache changes speed, not
+    numbers). The live :class:`~benchmark.common.cache.DiskCache` is opened by the runner via
+    :func:`open_cache`, never held here (this must serialize cleanly via ``dataclasses.asdict``).
+    """
+
+    enabled: bool = False
+    dir: str = ".cache"
+
+
+@dataclass(frozen=True)
 class ResolvedConfig:
     """The fully-resolved run configuration (§10, §9.1 run metadata).
 
@@ -196,6 +213,8 @@ class ResolvedConfig:
     is the typed registry. ``baseline`` is the reference pipeline; ``variants`` is the ORDERED list
     of explicit variant pipelines (iterate ``baseline`` first, then ``variants``, via
     :meth:`pipelines`). ``cutoff`` is the metric depth k; ``top_k`` is the retrieval depth.
+    ``cache`` is the persistent-cache config (LAST + defaulted so keyword constructors — including
+    the test helper — keep working without passing it; disabled by default).
     """
 
     dataset: Mapping[str, object]
@@ -209,6 +228,7 @@ class ResolvedConfig:
     baseline_id: str
     timestamp: str
     seed: int
+    cache: CacheCfg = CacheCfg()
 
     def pipelines(self) -> list[PipelineCfg]:
         """The run's pipelines, baseline first (§8.0)."""
@@ -344,6 +364,12 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
     baseline, variants = _resolve_pipelines(_require(cfg, "pipelines", "config"), services)
     stats = _resolve_stats(_require(cfg, "stats", "config"))
 
+    raw_cache = cfg.get("cache") or {}  # block absent -> disabled (opt-in, no behavior change)
+    cache = CacheCfg(
+        enabled=bool(raw_cache.get("enabled", False)),
+        dir=str(raw_cache.get("dir", ".cache")),
+    )
+
     return ResolvedConfig(
         dataset=dataset,
         indexer=indexer,
@@ -356,6 +382,7 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
         baseline_id=baseline.id,
         timestamp=timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         seed=int(stats.seed),
+        cache=cache,
     )
 
 
@@ -626,19 +653,42 @@ def make_index_writer(indexer_cfg: Mapping[str, Any]) -> Any:
     return _resolve_target(target)(indexer_cfg)
 
 
+def open_cache(cache_cfg: CacheCfg) -> DiskCache | None:
+    """Open the live persistent cache from ``cache_cfg``, or ``None`` (docs/caching_design.md §5/§7).
+
+    Returns ``None`` when disabled (the factories then skip wrapping entirely — a true bypass) AND
+    the single place §7's whole-DB degradation lives: a corrupt/unopenable ``inference.sqlite``
+    (:class:`sqlite3.DatabaseError`) is logged as a ``warning`` and the run proceeds WITHOUT the
+    cache (correctness preserved, only the speedup lost) rather than crashing the benchmark.
+    """
+    if not cache_cfg.enabled:
+        return None
+    try:
+        return DiskCache(cache_cfg.dir)
+    except sqlite3.DatabaseError as exc:  # corrupt / unopenable DB (§7) — unexpected, caught here only
+        logger.warning(
+            "cache at %s unusable (%s); running without it — `rm -rf %s` to reset",
+            cache_cfg.dir, exc, cache_cfg.dir,
+        )
+        return None  # run WITHOUT the cache: correct, just no speedup
+
+
 def make_searchers(
     indexer_cfg: Mapping[str, Any],
     mapping: IndexMapping,
     services: Services,
     *,
     embedders: Mapping[str, Embedder],
+    cache: DiskCache | None = None,
 ) -> dict[str, Searcher]:
     """Build the FULL configured leaf ``Searcher`` set once, keyed by service name (§4, §11).
 
     Translates every :class:`SearcherCfg` in ``services`` into a backend-agnostic
     ``(name, kind, embedder_id)`` spec (:func:`_searcher_spec`), then dispatches ``indexer.provider``
     -> the backend's lazily-imported ``build_searchers``. The resulting map is shared across all
-    pipelines (a pipeline just selects its leaves by name in :func:`build_pipeline`).
+    pipelines (a pipeline just selects its leaves by name in :func:`build_pipeline`). ``cache`` is
+    threaded to the backend's ``build_searchers`` (which fetches the index fingerprint + builds each
+    leaf's identity + wraps in ``CachingSearcher``); ``None`` bypasses wrapping (docs/caching_design.md §5).
     """
     provider = _require(indexer_cfg, "provider", "indexer")
     target = SEARCHER_BUILDER_TARGETS.get(provider)
@@ -647,7 +697,7 @@ def make_searchers(
             f"unknown indexer provider {provider!r}; known: {sorted(SEARCHER_BUILDER_TARGETS)}"
         )
     specs = [_searcher_spec(cfg, services) for cfg in services.searchers.values()]
-    return _resolve_target(target)(indexer_cfg, mapping, specs, embedders=embedders)
+    return _resolve_target(target)(indexer_cfg, mapping, specs, embedders=embedders, cache=cache)
 
 
 def make_rerankers_bound(
@@ -674,22 +724,54 @@ def make_rerankers_bound(
     )
 
 
-def make_embedders(services: Services) -> dict[str, Any]:
+def make_embedders(services: Services, *, cache: DiskCache | None = None) -> dict[str, Any]:
     """Instantiate every configured embedder connector, keyed by service name (§3.4).
 
     ``benchmark.embedding`` is resolved at CALL time (not imported at config-module import time, §11)
     so config validation stays offline. Returns ``{name: Embedder}``; the provider was validated
-    against ``_EMBEDDER_PROVIDERS`` at config load.
+    against ``_EMBEDDER_PROVIDERS`` at config load. When ``cache`` is set each connector is wrapped in
+    a :class:`~benchmark.common.cache.CachingEmbedder` (query/doc vectors memoized on disk);
+    ``cache is None`` bypasses wrapping ENTIRELY (docs/caching_design.md §5). ``provider``/``model_id``/
+    ``endpoint``/``dims`` are passed EXPLICITLY from the ``EmbedderCfg`` (the ``Embedder`` Protocol
+    exposes none of them) so the airtight key stays honest.
     """
     make = _resolve_target("benchmark.embedding:make_embedder")
-    return {name: make(cfg.name, cfg.provider, cfg.settings) for name, cfg in services.embedders.items()}
+    out: dict[str, Any] = {}
+    for name, cfg in services.embedders.items():
+        inner = make(cfg.name, cfg.provider, cfg.settings)  # unchanged
+        if cache is None:
+            out[name] = inner  # disable flag bypasses wrapping entirely
+        else:
+            dims = cfg.settings.get("dims")
+            out[name] = CachingEmbedder(
+                inner, cache,
+                provider=cfg.provider,
+                model_id=str(cfg.settings["model_id"]),  # present iff make(...) succeeded
+                endpoint=cfg.settings.get("base_url"),  # None -> connector default (§6)
+                dims=int(dims) if dims is not None else None,
+            )
+    return out
 
 
-def make_rerankers(services: Services) -> dict[str, Any]:
+def make_rerankers(services: Services, *, cache: DiskCache | None = None) -> dict[str, Any]:
     """Instantiate every configured rerank connector, keyed by service name (§3.4/§5.4).
 
     Resolves ``benchmark.reranking`` at CALL time (§11). Returns ``{name: RerankClient}``; the
-    provider was validated against ``_RERANKER_PROVIDERS`` at config load.
+    provider was validated against ``_RERANKER_PROVIDERS`` at config load. When ``cache`` is set each
+    connector is wrapped in a :class:`~benchmark.common.cache.CachingRerankClient` (per-``(query,
+    doc)`` scores memoized); ``cache is None`` bypasses wrapping ENTIRELY (docs/caching_design.md §5).
     """
     make = _resolve_target("benchmark.reranking:make_reranker")
-    return {name: make(cfg.name, cfg.provider, cfg.settings) for name, cfg in services.rerankers.items()}
+    out: dict[str, Any] = {}
+    for name, cfg in services.rerankers.items():
+        inner = make(cfg.name, cfg.provider, cfg.settings)
+        if cache is None:
+            out[name] = inner
+        else:
+            out[name] = CachingRerankClient(
+                inner, cache,
+                provider=cfg.provider,
+                model_id=str(cfg.settings["model_id"]),
+                endpoint=cfg.settings.get("base_url"),
+            )
+    return out

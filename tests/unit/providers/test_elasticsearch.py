@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from elasticsearch.helpers import BulkIndexError
 
+from benchmark.common.cache import CachingEmbedder, CachingSearcher, DiskCache
 from benchmark.common.models import (
     Document,
     FieldRole,
@@ -420,6 +421,50 @@ def test_build_searchers_unknown_kind_raises(monkeypatch: pytest.MonkeyPatch) ->
     _patch_client(monkeypatch, _fake_client())
     with pytest.raises(ValueError, match="unknown kind"):
         es.build_searchers(INDEXER_CFG, _SEARCH_MAPPING, [("bad", "bogus", None)], embedders={})
+
+
+def test_build_searchers_cache_active_wraps_and_fingerprints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # The cache-ACTIVE path (all other build_searchers tests pass cache=None): a real DiskCache + a
+    # CachingEmbedder-wrapped embedder -> both leaves wrapped in CachingSearcher, the vector leaf's
+    # identity carries the embedder's cache_identity, and the index fingerprint is fetched ONCE.
+    client = _fake_client()
+    client.indices.get.return_value = {"wands_bench": {"settings": {"index": {"uuid": "abc123"}}}}
+    client.count.return_value = {"count": 5}
+    _patch_client(monkeypatch, client)
+
+    cache = DiskCache(str(tmp_path))
+    embedder = CachingEmbedder(
+        _FakeEmbedder("e5"), cache,
+        provider="cohere", model_id="embed-english-v3.0", endpoint=None, dims=None,
+    )
+    out = es.build_searchers(
+        INDEXER_CFG,
+        _SEARCH_MAPPING,
+        [("bm25", "lexical", None), ("semantic_e5", "vector", "e5")],
+        embedders={"e5": embedder},
+        cache=cache,
+    )
+
+    # (a) both leaves are CachingSearcher instances
+    assert isinstance(out["bm25"], CachingSearcher)
+    assert isinstance(out["semantic_e5"], CachingSearcher)
+
+    # (b) vector-leaf identity: knn:{field}:num_candidates={n}:emb={embedder.cache_identity}
+    assert (
+        out["semantic_e5"]._identity
+        == f"knn:sem__e5:num_candidates={es._KNN_NUM_CANDIDATES}:emb={embedder.cache_identity}"
+    )
+    assert embedder.cache_identity in out["semantic_e5"]._identity  # folds in the embedder identity
+    assert out["bm25"]._identity == "match:search_text"
+
+    # (c) index_version == "{uuid}:{doc_count}", fetched ONCE (settings + count) — not per leaf
+    assert out["bm25"]._index_version == "abc123:5"
+    assert out["semantic_e5"]._index_version == "abc123:5"
+    assert client.indices.get.call_count == 1
+    assert client.count.call_count == 1
+    cache.close()
 
 
 def test_build_rerankers_binds_connector(monkeypatch: pytest.MonkeyPatch) -> None:

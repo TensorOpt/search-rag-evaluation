@@ -25,11 +25,12 @@ feature probing (CLAUDE.md move-with-certainty).
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence, cast
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import BulkIndexError, streaming_bulk
 
+from benchmark.common.cache import CachingEmbedder, CachingSearcher, DiskCache
 from benchmark.common.logging_setup import get_logger
 from benchmark.common.models import (
     Document,
@@ -489,6 +490,7 @@ def build_searchers(
     specs: Sequence[SearcherSpec],
     *,
     embedders: Mapping[str, Embedder],
+    cache: DiskCache | None = None,
 ) -> dict[str, Searcher]:
     """Mint the configured leaf ``Searcher``s over the shared ES client (§4), keyed by service name.
 
@@ -496,31 +498,63 @@ def build_searchers(
     ``mapping.search_text_field``; a ``vector`` spec -> ``VectorSearch`` on that embedder's
     ``dense_vector`` field (``mapping.sem_field(embedder_id)``) with the referenced query embedder.
     Exhaustive on ``kind`` — an unknown kind raises (never a silent default).
+
+    When ``cache`` is set, each leaf is wrapped in a :class:`~benchmark.common.cache.CachingSearcher`
+    keyed by the index fingerprint (:func:`_index_version`, fetched ONCE — cheap, and the index is
+    already known to exist, §8.0) and a per-leaf ``identity`` (``match:field`` for lexical;
+    ``knn:field:num_candidates=N:emb=<embedder cache_identity>`` for vector — the embedder identity
+    makes a re-embed-into-the-same-index model swap a guaranteed miss, docs/caching_design.md §4/§5).
+    ``cache is None`` returns bare leaves (full bypass; no fingerprint fetch, no identity built).
     """
     client, msearch_chunk_size, num_candidates = _open(indexer_cfg)
     index = mapping.index_name
+    index_version = _index_version(client, index) if cache is not None else None  # fetched ONCE
     out: dict[str, Searcher] = {}
     for name, kind, embedder_id in specs:
         if kind == "lexical":
-            out[name] = LexicalSearcher(
+            leaf: Searcher = LexicalSearcher(
                 client, index, [mapping.search_text_field], msearch_chunk_size=msearch_chunk_size
             )
+            identity = f"match:{mapping.search_text_field}"
         elif kind == "vector":
             if embedder_id is None:
                 raise ValueError(f"vector searcher {name!r} has no embedder reference")
-            out[name] = VectorSearch(
-                client,
-                index,
-                mapping.sem_field(embedder_id),
-                embedders[embedder_id],
-                msearch_chunk_size=msearch_chunk_size,
-                num_candidates=num_candidates,
+            field = mapping.sem_field(embedder_id)
+            embedder = embedders[embedder_id]
+            leaf = VectorSearch(
+                client, index, field, embedder,
+                msearch_chunk_size=msearch_chunk_size, num_candidates=num_candidates,
+            )
+            # cache_identity only exists on the CachingEmbedder that make_embedders(...) mints under
+            # the SAME cache handle (§5); a bare embedder (cache is None) is never asked for it.
+            identity = (
+                ""
+                if cache is None
+                else f"knn:{field}:num_candidates={num_candidates}:"
+                f"emb={cast(CachingEmbedder, embedder).cache_identity}"
             )
         else:
             raise ValueError(
                 f"searcher {name!r}: unknown kind {kind!r}; expected 'lexical' or 'vector'"
             )
+        if cache is None:
+            out[name] = leaf
+        else:
+            assert index_version is not None  # always set when cache is active (fetched above)
+            out[name] = CachingSearcher(leaf, cache, index_version=index_version, identity=identity)
     return out
+
+
+def _index_version(client: Elasticsearch, index: str) -> str:
+    """The index fingerprint ``"uuid:doc_count"`` — what makes a cached result list valid (§6).
+
+    The UUID changes on any delete+recreate (a rebuilt index cannot serve stale lists); the doc
+    count catches incremental growth INTO the same index (same UUID, new docs, changed rankings).
+    Both are one cheap call each, fetched once per build.
+    """
+    uuid = client.indices.get(index=index)[index]["settings"]["index"]["uuid"]
+    count = client.count(index=index)["count"]
+    return f"{uuid}:{count}"
 
 
 def build_rerankers(

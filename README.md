@@ -254,6 +254,20 @@ hatch run eval:run -- --config myrun.yaml  # alternate config
 hatch run eval:run -- --dry-run            # print the pipeline list, run nothing
 ```
 
+### Caching (optional)
+
+The harness can persist provider inference (query/document embeddings, rerank scores) and searcher result lists to a local sqlite cache, so repeated work — within a run (variants share embedders/rerankers/searchers) and across runs (re-indexing an unchanged corpus, re-running evals) — is served from disk instead of re-paid. The cache is a **pure-function cache**: cache-on and cache-off produce byte-identical metrics (the key captures every value-determining input), so it changes speed, never numbers.
+
+```yaml
+cache:
+  enabled: true      # default when the block is ABSENT: false (opt-in cold run)
+  dir: .cache        # single sqlite file at .cache/inference.sqlite (gitignored)
+```
+
+- **Enable / disable:** set `cache.enabled` (or omit the block for a cold run — disabled).
+- **Clear:** `rm -rf .cache/` (or delete `.cache/inference.sqlite`). It is gitignored; there is no dedicated command.
+- **Note:** the key uses the model *name*, not its weights — if a provider silently retrains a model behind a stable alias, clear the cache. A corrupt cache never crashes a run: it is logged and the run proceeds without it.
+
 ---
 
 ## Outputs

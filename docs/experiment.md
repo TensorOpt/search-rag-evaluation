@@ -587,6 +587,14 @@ Embeddings and reranking are computed by direct **provider connectors** in `benc
 
 **Failure model (errors never swallowed).** `_post_json` retries on a retryable HTTP status (429 + transient 5xx) or a connection-level error, with exponential backoff honoring `Retry-After`, up to `max_retries`. A non-retryable status (401/403/400) raises `ProviderError` immediately with the raw response body; an exhausted retry budget raises with the last body. `ProviderError` carries the provider, HTTP status, URL, and raw body so the provider's own error payload is inspectable. `RateLimiter` enforces a minimum interval from `settings.rate_limit.requests_per_minute` (serial request spacing; a no-op when unset).
 
+### 5.5 Result & inference caching (optional cross-cutting layer)
+
+Caching is an **optional cross-cutting infra layer** (like logging, §11) that memoizes the three expensive/redundant computations of a run — query & document **embeddings**, **rerank** scores, and **searcher** result lists — to a local disk store (`.cache/`, a single stdlib `sqlite3` file; **no new dependency**). Because components are shared across variants (the runner builds them once, §8.0) and re-runs repeat identical work, this preserves computation **within a run and across runs**. It is **off unless enabled** in the config. `docs/caching_design.md` is the detailed companion spec.
+
+- **Reproducibility invariant (load-bearing).** The cache is a **pure-function** cache: running with it enabled or disabled yields **byte-identical** metrics — it changes *speed*, never *numbers* (§9.1). Every key captures **every** value-determining input, so a stale value can never be served: embeddings by provider / model_id / endpoint (`base_url`) / mode (query vs document) / dims / text; rerank by provider / model_id / endpoint / query / doc-text; searchers by **index fingerprint** (index UUID + doc-count) / leaf-identity / top_k / query. A corrupt or undecodable entry is treated as a miss and recomputed — never served, never crashing the run.
+- **Placement (no domain-engine change).** Three `Decorator`s over the seams (§3.3/§3.4) — `CachingEmbedder` (`Embedder`), `CachingRerankClient` (`RerankClient`), `CachingSearcher` (`Searcher`) — in `benchmark/common/cache.py`. The embed/rerank wrappers are applied in `config.make_embedders`/`make_rerankers`; the searcher wrapper in the backend's `build_searchers` (only the backend knows the index fingerprint + per-leaf identity). Nothing in `search`/`indexing`/`evaluation` or the concrete connectors/searchers changes: a new **provider** is wrapped automatically (zero cache code); a new **backend** reuses the generic `CachingSearcher` and adds only its own small fingerprint/identity glue in `build_searchers`. This upholds DRY/one-path (§1.4.4) and Generality (§1.4.3).
+- **Config surface.** One optional block, `cache: { enabled, dir }` (§10) — opt-in (absent → disabled), the shipped config enables it. Clear the cache by deleting the directory (`.cache/`, gitignored). The resolved `cache` config is captured in `run_config_*.json` for provenance and cannot change metrics.
+
 ---
 
 ## 6. End-to-End Data Flow (no gaps)
@@ -788,6 +796,7 @@ One file for all variants; the baseline is not compared to itself, so there is n
 - **Config capture:** the fully-resolved config (the resolved **services** registry — embedders/rerankers/searchers by name — and the resolved **pipelines**: the baseline plus every named variant with its retrievers/fuser/reranker/window; bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test + its zero/tie params, any degenerate-paired-set notes, dataset version, ES + endpoint versions, cutoff, seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits FDR-adjusted p-values (q-values) per test in the comparison CSV (§9), so — unlike Holm — the adjusted significance is fully materialized.
 - **Seeds:** one master seed feeds the bootstrap and any permutation test; recorded in config. Given the seed, stats are deterministic. There is no data-dependent pipeline selection, so the set of runs depends only on the config file.
 - **Determinism caveats:** ES scoring ties and approximate-kNN introduce nondeterminism. Mitigations: stable tie-break on `doc_id` in each `Searcher.search` (score desc, doc_id asc, §9.1); idempotent indexing (`_id = product_id`); recorded ES/endpoint versions.
+- **Caching does not affect numbers:** the optional disk cache (§5.5) memoizes embeddings / rerank scores / searcher results as a **pure-function** cache — a run with the cache enabled or disabled produces **byte-identical** metrics, so it never affects reproducibility. The resolved `cache` config (`enabled`, `dir`) is captured in `run_config_{timestamp}.json`. See `docs/caching_design.md`.
 
 ---
 
@@ -796,7 +805,8 @@ One file for all variants; the baseline is not compared to itself, so there is n
 A single YAML/JSON config declares everything as **explicit, named building blocks** — no axes, no
 expander, no sweep. The user reads the config top to bottom and sees exactly which pipelines run.
 The structure is: `dataset` / `services` (named embedders, rerankers, searchers) / `indexer` /
-`pipelines` (one `baseline` + a map of named `variants`) / `stats` / `cutoff` / `top_k`.
+`pipelines` (one `baseline` + a map of named `variants`) / `stats` / `cutoff` / `top_k` /
+`cache` (optional, §5.5).
 
 ```yaml
 dataset:
@@ -845,6 +855,9 @@ stats:
   seed: 1234
 cutoff: 10                       # metrics @10
 top_k: 100                       # results retrieved per query
+cache:                           # OPTIONAL (§5.5): memoize embeddings/rerank/searcher results to .cache/
+  enabled: true                  #   opt-in — absent means disabled; pure-function, never changes metrics
+  dir: .cache
 ```
 
 **Services (`${VAR}` env placeholders resolved at load, secrets never in the file):**
@@ -866,6 +879,12 @@ BM25 field **plus one `dense_vector` field per embedder that a `vector` searcher
 indexer builds a field for each `Embedder` the runner passes to the `indexing.Indexer` constructor (one per configured
 `embedder` service), and reaches ES from this block. It does **not** index one-per-embedder. (A pure
 vector store would need a per-store indexing model instead — deferred, §12/§13.)
+
+**`cache`** (optional, §5.5) — a two-key block, `cache: { enabled: <bool>, dir: <path> }`, enabling the
+disk cache that memoizes embeddings / rerank scores / searcher result lists. Absent → disabled (a cold
+run); `dir` defaults to `.cache` (gitignored). It is a **pure-function** cache — enabling it never
+changes metrics (§9.1) — so it is a speed knob, not part of the experiment definition. Clear it by
+deleting `dir`.
 
 **Pipeline field rules (validated at load; a violation raises a clear `ConfigError`, exhaustive — no silent default):**
 - Exactly **one of `retriever`** (a single searcher name) **XOR `retrievers`** (a list of 2+ searcher names).
@@ -896,6 +915,7 @@ benchmark/
     protocols.py       #   Searcher/Fuser/Reranker + Dataset ABCs; Embedder, RerankClient, IndexWriter Protocols
     ranking.py         #   fuse_rrf_local + rerank_local (pure windowed ranking primitives)
     logging_setup.py   #   console + file logging (logs/run_{timestamp}.log); use instead of print()
+    cache.py           #   OPTIONAL disk cache (§5.5): DiskCache + CachingEmbedder/RerankClient/Searcher
   providers/           # (f) concrete adapters, depend ONLY on common
     inference.py       #   OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib HTTP)
     elasticsearch.py   #   LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter, build_searchers/build_rerankers

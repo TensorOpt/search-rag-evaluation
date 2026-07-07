@@ -54,3 +54,6 @@ stats:
   seed: 1234
 cutoff: 10                      # metrics @10
 top_k: 50                       # results retrieved per query
+cache:                          # persistent inference/result cache (docs/caching_design.md)
+  enabled: true                 # block ABSENT -> disabled; embeddings/rerank/searcher lists memoized
+  dir: .cache                   # single sqlite file (.cache/inference.sqlite), gitignored; `rm -rf .cache` to clear

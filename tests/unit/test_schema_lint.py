@@ -46,6 +46,7 @@ _RUN_CONFIG_KEYS = {
     "baseline_id",
     "timestamp",
     "seed",
+    "cache",
 }
 
 

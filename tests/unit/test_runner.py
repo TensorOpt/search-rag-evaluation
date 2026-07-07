@@ -175,7 +175,7 @@ _VECTOR_DOCS = [ScoredDoc("d2", 0.9), ScoredDoc("d4", 0.8), ScoredDoc("d1", 0.7)
 
 
 def _fake_searchers(
-    indexer_cfg: Any, mapping: Any, services: Services, *, embedders: Mapping[str, Any]
+    indexer_cfg: Any, mapping: Any, services: Services, *, embedders: Mapping[str, Any], cache: Any = None
 ) -> dict[str, FakeSearcher]:
     """Stand-in for ``build_searchers``: one conftest ``FakeSearcher`` per configured searcher.
 
@@ -251,10 +251,14 @@ def patch_runner_factories(monkeypatch: pytest.MonkeyPatch) -> FakeIndexWriter:
     # Embedder/reranker connectors are FAKES (no network): the real Indexer embeds the corpus with
     # these at ingest; the fake vector leaf is canned, so it ignores the query embedder.
     monkeypatch.setattr(
-        config, "make_embedders", lambda services: {name: FakeEmbedder(name) for name in services.embedders}
+        config,
+        "make_embedders",
+        lambda services, *, cache=None: {name: FakeEmbedder(name) for name in services.embedders},
     )
     monkeypatch.setattr(
-        config, "make_rerankers", lambda services: {name: FakeRerankClient() for name in services.rerankers}
+        config,
+        "make_rerankers",
+        lambda services, *, cache=None: {name: FakeRerankClient() for name in services.rerankers},
     )
     monkeypatch.setattr(config, "make_searchers", _fake_searchers)
     monkeypatch.setattr(config, "make_rerankers_bound", _fake_rerankers_bound)
