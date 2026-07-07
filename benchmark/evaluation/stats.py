@@ -81,8 +81,11 @@ class StatsCfg:
 class ComparisonResult:
     """One ``(variant, metric)`` comparison result (§8.1 table, §9 comparison CSV).
 
-    ``delta``/``delta_ci_lo``/``delta_ci_high`` are ``None`` for an empty paired set (serialized as
-    empty cells, §9). ``p_value`` is the RAW, uncorrected test p-value (Wilcoxon or permutation) and
+    ``baseline_value``/``variant_value`` are the means of the baseline/variant metric over the SAME
+    paired (finite-in-both) query set as ``delta`` (so ``delta == variant_value - baseline_value``);
+    both are ``None`` for an empty paired set. ``delta``/``delta_ci_lo``/``delta_ci_high`` are ``None``
+    for an empty paired set (serialized as empty cells, §9). ``p_value`` is the RAW, uncorrected test
+    p-value (Wilcoxon or permutation) and
     ``significant_raw`` is the uncorrected per-test decision (``p_value <= alpha``), independent of the
     family. ``p_value_adjusted`` is the FDR (BH/BY) adjusted p-value (q-value) over the family — ``1.0``
     for degenerate rows — and ``significant`` is the FDR decision (``p_value_adjusted <= alpha``, §8.3).
@@ -92,6 +95,8 @@ class ComparisonResult:
 
     variant: str
     metric: str
+    baseline_value: float | None
+    variant_value: float | None
     delta: float | None
     delta_ci_lo: float | None
     delta_ci_high: float | None
@@ -140,7 +145,8 @@ class Comparator:
         for variant_id in sorted(variants):
             variant_metrics = variants[variant_id]
             for metric in CANONICAL_METRICS:
-                deltas = _paired_deltas(baseline, variant_metrics, metric)
+                base_arr, var_arr = _paired_values(baseline, variant_metrics, metric)
+                deltas = var_arr - base_arr
 
                 if deltas.size == 0:
                     # Empty paired set (§8.1 table): no scipy/bootstrap call.
@@ -148,6 +154,8 @@ class Comparator:
                         ComparisonResult(
                             variant=variant_id,
                             metric=metric,
+                            baseline_value=None,
+                            variant_value=None,
                             delta=None,
                             delta_ci_lo=None,
                             delta_ci_high=None,
@@ -163,10 +171,14 @@ class Comparator:
                 if bool(np.all(np.isclose(deltas, 0.0, rtol=0.0, atol=ZERO_ABS_TOL))):
                     # All-zero deltas (§8.1 table): no scipy/bootstrap call.
                     # np.isclose (not `== 0.0`) — never test float equality; tolerance ZERO_ABS_TOL.
+                    # Every δ==0 => baseline==variant per query, so the two means are equal.
+                    equal_value = float(np.mean(base_arr))
                     rows.append(
                         ComparisonResult(
                             variant=variant_id,
                             metric=metric,
+                            baseline_value=equal_value,
+                            variant_value=equal_value,
                             delta=0.0,
                             delta_ci_lo=0.0,
                             delta_ci_high=0.0,
@@ -180,6 +192,8 @@ class Comparator:
                     continue
 
                 # Real test: point estimate, bootstrap CI, raw p-value (§8.2).
+                baseline_value = float(np.mean(base_arr))
+                variant_value = float(np.mean(var_arr))
                 delta = float(np.mean(deltas))
                 ci_lo, ci_high = self._bootstrap_ci(deltas)
                 p_value = self._p_value(deltas)
@@ -189,6 +203,8 @@ class Comparator:
                     ComparisonResult(
                         variant=variant_id,
                         metric=metric,
+                        baseline_value=baseline_value,
+                        variant_value=variant_value,
                         delta=delta,
                         delta_ci_lo=ci_lo,
                         delta_ci_high=ci_high,
@@ -209,6 +225,8 @@ class Comparator:
             rows[idx] = ComparisonResult(
                 variant=row.variant,
                 metric=row.metric,
+                baseline_value=row.baseline_value,
+                variant_value=row.variant_value,
                 delta=row.delta,
                 delta_ci_lo=row.delta_ci_lo,
                 delta_ci_high=row.delta_ci_high,
@@ -281,18 +299,20 @@ class Comparator:
         return (1 + count) / (b + 1)
 
 
-def _paired_deltas(
+def _paired_values(
     baseline: Mapping[str, Mapping[str, float]],
     variant_metrics: Mapping[str, Mapping[str, float]],
     metric: str,
-) -> np.ndarray:
-    """Paired ``variant - baseline`` deltas for ``metric`` over the finite-both query set (§8.1).
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aligned baseline/variant ``metric`` arrays over the finite-both query set (§8.1).
 
     Pairs by ``query_id`` over queries present in BOTH runs whose metric value is finite (not NaN) in
-    BOTH runs — the generalized per-metric NaN exclusion. Query ids are iterated in sorted order so
-    the delta vector is deterministic (the bootstrap seeds off it).
+    BOTH runs — the generalized per-metric NaN exclusion, kept in ONE place so ``baseline_value``,
+    ``variant_value`` and ``delta = var - base`` all share the same mask. Query ids are iterated in
+    sorted order so the arrays are deterministic (the bootstrap seeds off the deltas).
     """
-    deltas: list[float] = []
+    base_vals: list[float] = []
+    var_vals: list[float] = []
     for qid in sorted(baseline):
         if qid not in variant_metrics:
             continue
@@ -300,8 +320,9 @@ def _paired_deltas(
         variant_value = variant_metrics[qid].get(metric, math.nan)
         if math.isnan(baseline_value) or math.isnan(variant_value):
             continue
-        deltas.append(variant_value - baseline_value)
-    return np.asarray(deltas, dtype=float)
+        base_vals.append(baseline_value)
+        var_vals.append(variant_value)
+    return np.asarray(base_vals, dtype=float), np.asarray(var_vals, dtype=float)
 
 
 def _sign_vectors(n: int) -> np.ndarray:

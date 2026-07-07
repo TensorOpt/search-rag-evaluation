@@ -131,6 +131,8 @@ def test_empty_paired_set_row_and_no_scipy(monkeypatch: pytest.MonkeyPatch) -> N
     rows = Comparator(StatsCfg()).compare(base, {"v": var})
     for m in CANONICAL_METRICS:
         r = _row(rows, "v", m)
+        assert r.baseline_value is None
+        assert r.variant_value is None
         assert r.delta is None
         assert r.delta_ci_lo is None
         assert r.delta_ci_high is None
@@ -146,8 +148,12 @@ def test_all_zero_delta_row_and_no_scipy(monkeypatch: pytest.MonkeyPatch) -> Non
     base = _baseline({f"q{i}": float(i % 2) for i in range(10)})
     var = _variant({f"q{i}": float(i % 2) for i in range(10)})  # identical -> all-zero deltas
     rows = Comparator(StatsCfg()).compare(base, {"v": var})
+    # Mean of {0,1,0,1,...} over 10 queries is 0.5; base==var per query so both means equal.
     for m in CANONICAL_METRICS:
         r = _row(rows, "v", m)
+        assert math.isclose(r.baseline_value, 0.5, abs_tol=1e-6)
+        assert math.isclose(r.variant_value, 0.5, abs_tol=1e-6)
+        assert r.baseline_value == r.variant_value
         assert r.delta == 0.0
         assert r.delta_ci_lo == 0.0
         assert r.delta_ci_high == 0.0
@@ -197,20 +203,21 @@ def test_per_metric_nan_exclusion_pairs_only_finite_both() -> None:
     var["q3"]["recall@10"] = math.nan  # excluded for recall only
 
     cfg = StatsCfg(bootstrap_B=200, seed=3)
-    # Capture the paired delta vector size per metric by spying on _paired_deltas.
+    # Capture the paired vector size per metric by spying on _paired_values (base/var are aligned).
     sizes: dict[str, int] = {}
-    orig = stats_mod._paired_deltas
+    orig = stats_mod._paired_values
 
-    def _spy(b: object, v: object, metric: str) -> np.ndarray:
-        arr = orig(b, v, metric)  # type: ignore[arg-type]
-        sizes[metric] = arr.size
-        return arr
+    def _spy(b: object, v: object, metric: str) -> tuple[np.ndarray, np.ndarray]:
+        base_arr, var_arr = orig(b, v, metric)  # type: ignore[arg-type]
+        assert base_arr.size == var_arr.size  # the two arrays share one NaN mask
+        sizes[metric] = var_arr.size
+        return base_arr, var_arr
 
-    stats_mod._paired_deltas = _spy  # type: ignore[assignment]
+    stats_mod._paired_values = _spy  # type: ignore[assignment]
     try:
         Comparator(cfg).compare(base, {"v": var})
     finally:
-        stats_mod._paired_deltas = orig  # type: ignore[assignment]
+        stats_mod._paired_values = orig  # type: ignore[assignment]
 
     assert sizes["avg_relevance"] == 6
     assert sizes["precision@10"] == 6
@@ -457,6 +464,29 @@ def test_delta_is_mean_of_paired_deltas() -> None:
     var = _variant({"q0": 0.1, "q1": 0.3, "q2": 0.5})  # deltas 0.1,0.3,0.5 -> mean 0.3
     rows = Comparator(StatsCfg(bootstrap_B=100, seed=1)).compare(base, {"v": var})
     assert _row(rows, "v", "avg_relevance").delta == pytest.approx(0.3)
+
+
+def test_baseline_and_variant_values_are_paired_means() -> None:
+    # base means 0.2 (0.1,0.2,0.3), var means 0.5 (0.4,0.5,0.6) -> delta == var - base == 0.3.
+    base = _baseline({"q0": 0.1, "q1": 0.2, "q2": 0.3})
+    var = _variant({"q0": 0.4, "q1": 0.5, "q2": 0.6})
+    r = _row(Comparator(StatsCfg(bootstrap_B=100, seed=1)).compare(base, {"v": var}), "v", "avg_relevance")
+    assert math.isclose(r.baseline_value, 0.2, abs_tol=1e-6)
+    assert math.isclose(r.variant_value, 0.5, abs_tol=1e-6)
+    # delta is exactly variant_value - baseline_value over the same paired set (never == on floats).
+    assert math.isclose(r.delta, r.variant_value - r.baseline_value, abs_tol=1e-6)
+
+
+def test_baseline_and_variant_values_use_the_same_nan_mask() -> None:
+    # q2 is NaN in the variant for avg_relevance -> excluded from BOTH means (shared mask), so
+    # baseline_value is the mean over {q0,q1} only, not all three baseline queries.
+    base = _baseline({"q0": 0.2, "q1": 0.4, "q2": 1.0})
+    var = _variant({"q0": 0.5, "q1": 0.7, "q2": 0.9})
+    var["q2"]["avg_relevance"] = math.nan
+    r = _row(Comparator(StatsCfg(bootstrap_B=100, seed=1)).compare(base, {"v": var}), "v", "avg_relevance")
+    assert math.isclose(r.baseline_value, 0.3, abs_tol=1e-6)  # mean(0.2, 0.4), q2 dropped
+    assert math.isclose(r.variant_value, 0.6, abs_tol=1e-6)  # mean(0.5, 0.7)
+    assert math.isclose(r.delta, r.variant_value - r.baseline_value, abs_tol=1e-6)
 
 
 def test_rows_are_ordered_by_variant_then_canonical_metric() -> None:

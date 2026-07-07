@@ -140,12 +140,23 @@ def test_run_end_to_end_produces_all_artifacts(es_index: str, tmp_path: Path) ->
 
     ts = cfg.timestamp
     base = cfg.baseline_id  # the baseline pipeline's artifact id ("baseline" by default, §9)
-    # All four pipelines produced result + metrics CSVs (single run_one path, baseline first).
-    for pipeline_id in (base, "semantic_co", "hybrid_co", "bm25_rerank"):
-        assert (tmp_path / f"result_{pipeline_id}_{ts}.csv").exists()
-        assert (tmp_path / f"metrics_{pipeline_id}_{ts}.csv").exists()
-    # One comparison per VARIANT — never baseline vs itself.
-    assert not (tmp_path / f"comparison_{base}_{base}_{ts}.csv").exists()
-    for variant in ("semantic_co", "hybrid_co", "bm25_rerank"):
-        assert (tmp_path / f"comparison_{base}_{variant}_{ts}.csv").exists()
-    assert (tmp_path / f"run_config_{ts}.json").exists()
+    # Exactly three single per-run CSVs (all pipelines / comparisons) + run_config (§9).
+    result_file = tmp_path / f"result_{ts}.csv"
+    metrics_file = tmp_path / f"metrics_{ts}.csv"
+    comparison_file = tmp_path / f"comparison_{ts}.csv"
+    for path in (result_file, metrics_file, comparison_file, tmp_path / f"run_config_{ts}.json"):
+        assert path.exists()
+
+    def _variant_column(path: Path) -> set[str]:
+        rows = path.read_text(encoding="utf-8").splitlines()[1:]
+        return {line.split(",")[0] for line in rows}
+
+    # All four pipelines (baseline included) appear in the result/metrics variant column.
+    all_pipelines = {base, "semantic_co", "hybrid_co", "bm25_rerank"}
+    assert _variant_column(result_file) == all_pipelines
+    assert _variant_column(metrics_file) == all_pipelines
+
+    # Comparison: baseline col constant; variant col is the variants only — never baseline vs itself.
+    comparison_rows = comparison_file.read_text(encoding="utf-8").splitlines()[1:]
+    assert {line.split(",")[0] for line in comparison_rows} == {base}
+    assert {line.split(",")[1] for line in comparison_rows} == {"semantic_co", "hybrid_co", "bm25_rerank"}

@@ -37,7 +37,7 @@ from benchmark.io_csv import (
     DEFAULT_OUTPUT_DIR,
     write_comparison_csv,
     write_metrics_csv,
-    write_result_csv,
+    write_results_csv,
     write_run_config,
 )
 
@@ -126,9 +126,11 @@ class ExperimentRunner:
         qrel_index = QrelIndex(dataset.qrels())
         evaluator = Evaluator(qrel_index, cutoff=cfg.cutoff)
 
-        # Per-pipeline per-query Metrics, keyed by pipeline id. The pipelines are exactly what the
-        # config declares — baseline first, then the named variants in config order (§10). No
-        # expansion, no sweep, no selection phase.
+        # Per-pipeline ranked results + per-query Metrics, keyed by pipeline id. The pipelines are
+        # exactly what the config declares — baseline first, then the named variants in config order
+        # (§10). No expansion, no sweep, no selection phase. Both dicts stay baseline-first (insertion
+        # order) so the single result/metrics files list the baseline before the variants (§9).
+        results_by_variant: dict[str, list[RankedResult]] = {}
         per_query: dict[str, dict[str, Metrics]] = {}
 
         def run_one(pcfg: PipelineCfg) -> None:
@@ -155,14 +157,17 @@ class ExperimentRunner:
             results = [
                 RankedResult(query.query_id, docs) for query, docs in zip(queries, ranked)
             ]
-            write_result_csv(pcfg, results, cfg.timestamp, output_dir=output_dir)
+            results_by_variant[pcfg.id] = results
             metrics = evaluator.score_run(results)  # per-query vectors
-            write_metrics_csv(pcfg, metrics, cfg.timestamp, output_dir=output_dir)
             per_query[pcfg.id] = metrics
             logger.info("pipeline %r: scored %d queries", pcfg.id, len(metrics))
 
         for pcfg in cfg.pipelines():  # baseline first, then variants
             run_one(pcfg)
+
+        # One result + one metrics file for the whole run (all pipelines, baseline-first, §9).
+        write_results_csv(results_by_variant, cfg.timestamp, output_dir=output_dir)
+        write_metrics_csv(per_query, cfg.timestamp, output_dir=output_dir)
 
         # Comparator pass — ONE family-wide call so the FDR correction (§8.3) is applied across the
         # whole (variant × metric) family. Adapt each Metrics -> {metric: value} via as_dict(): the
@@ -177,11 +182,7 @@ class ExperimentRunner:
             if vid != cfg.baseline_id
         }
         rows = Comparator(cfg.stats).compare(baseline_maps, variant_maps)  # family-wide FDR inside
-        for vid in variant_maps:
-            variant_rows = [row for row in rows if row.variant == vid]
-            write_comparison_csv(
-                cfg.baseline_id, vid, variant_rows, cfg.timestamp, output_dir=output_dir
-            )
+        write_comparison_csv(cfg.baseline_id, rows, cfg.timestamp, output_dir=output_dir)
         write_run_config(cfg, output_dir=output_dir)
         logger.info(
             "run complete: %d pipeline(s), %d variant comparison(s) written to %r",

@@ -52,10 +52,10 @@ def test_two_runs_same_seed_are_byte_identical(
     with monkeypatch.context() as mp:
         _run_into(mp, dir_b, ts)
 
-    metrics = sorted(p.name for p in dir_a.glob(f"metrics_*_{ts}.csv"))
-    comparisons = sorted(p.name for p in dir_a.glob(f"comparison_*_{ts}.csv"))
-    assert metrics, "expected metrics artifacts"
-    assert comparisons, "expected comparison artifacts (seeded bootstrap CI + p-values)"
+    metrics = sorted(p.name for p in dir_a.glob(f"metrics_{ts}.csv"))
+    comparisons = sorted(p.name for p in dir_a.glob(f"comparison_{ts}.csv"))
+    assert metrics, "expected metrics artifact"
+    assert comparisons, "expected comparison artifact (seeded bootstrap CI + p-values)"
 
     for name in metrics + comparisons:
         left = (dir_a / name).read_bytes()

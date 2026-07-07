@@ -1,26 +1,30 @@
 """CSV/JSON artifact writers with fixed schemas (docs/experiment.md §9). Phase 7.
 
 Four writers, each into an output dir (default ``results``), naming files with the run's single
-UTC timestamp ``YYYYMMDDTHHMMSSZ`` (§9):
+UTC timestamp ``YYYYMMDDTHHMMSSZ`` (§9). The three CSVs are ONE file per run (all pipelines /
+comparisons), each carrying a leading identity column:
 
-- :func:`write_result_csv`  -> ``result_{variant}_{ts}.csv``     : ``query_id,product_id,score,position``
-- :func:`write_metrics_csv` -> ``metrics_{variant}_{ts}.csv``    : ``query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing``
-- :func:`write_comparison_csv` -> ``comparison_{baseline}_{variant}_{ts}.csv`` : the 9-column §9 header
-- :func:`write_run_config`  -> ``run_config_{ts}.json``          : the fully-resolved config (§9.1)
+- :func:`write_results_csv`  -> ``result_{ts}.csv``   : ``variant,query_id,product_id,score,position``
+- :func:`write_metrics_csv`  -> ``metrics_{ts}.csv``  : ``variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing``
+- :func:`write_comparison_csv` -> ``comparison_{ts}.csv`` : the 12-column §9 header
+- :func:`write_run_config`   -> ``run_config_{ts}.json`` : the fully-resolved config (§9.1)
 
 Serialization rules (fixed so golden files are stable, §9/CLAUDE.md):
 
 - All CSVs UTF-8, comma-separated, header present, via the stdlib :mod:`csv` module.
 - Floats are formatted with ``repr`` (shortest round-trip) so a golden file is byte-stable.
-- ``result``: one row per ``ScoredDoc`` in ``RankedResult.docs``, in order; ``position`` is the
-  1-based index (derived here, §3.1, never stored on ``ScoredDoc``); at most ``top_k`` rows/query.
-- ``metrics``: one row per query. Each of the FOUR metric cells is written EMPTY (two adjacent
-  commas, no quoting) when its in-memory ``Metrics`` value is ``math.nan`` (§7): avg/ndcg/precision
-  empty when ``n_scored == 0``, recall empty when ``R == 0``. ``n_scored``/``n_missing`` are
-  non-negative ints, ALWAYS present.
-- ``comparison``: one row per canonical metric. ``significant_raw``/``significant`` are lowercase
-  ``true``/``false``; ``p_value``/``p_value_adjusted`` numeric. A ``None`` delta/CI cell (empty
-  paired set) is written EMPTY (§8.1).
+- ``result``: one row per ``ScoredDoc`` in ``RankedResult.docs``, in order, prefixed with the
+  pipeline id (``variant``); ``position`` is the 1-based index (derived here, §3.1, never stored on
+  ``ScoredDoc``); at most ``top_k`` rows/query. Variants are written in the mapping's order
+  (baseline first).
+- ``metrics``: one row per (variant, query), prefixed with the pipeline id. Each of the FOUR metric
+  cells is written EMPTY (two adjacent commas, no quoting) when its in-memory ``Metrics`` value is
+  ``math.nan`` (§7): avg/ndcg/precision empty when ``n_scored == 0``, recall empty when ``R == 0``.
+  ``n_scored``/``n_missing`` are non-negative ints, ALWAYS present.
+- ``comparison``: one row per (variant, canonical metric), prefixed with the shared ``baseline`` id.
+  ``baseline_value``/``variant_value``/``delta``/CI are numeric, or EMPTY for an empty paired set
+  (``None``, §8.1). ``significant_raw``/``significant`` are lowercase ``true``/``false``;
+  ``p_value``/``p_value_adjusted`` numeric.
 - :func:`write_run_config` serializes the fully-resolved config via ``dataclasses.asdict`` +
   ``json.dumps`` (deterministic, ``sort_keys=True``, with ``default=str`` catching any non-JSON
   straggler) so it round-trips (§9.1).
@@ -40,7 +44,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from benchmark.common.models import RankedResult
-from benchmark.config import PipelineCfg, ResolvedConfig
+from benchmark.config import ResolvedConfig
 from benchmark.evaluation.metrics import Metrics
 from benchmark.evaluation.stats import ComparisonResult
 
@@ -55,11 +59,20 @@ _METRIC_COLUMNS: tuple[str, ...] = (
     "precision@10",
 )
 
-_RESULT_HEADER: tuple[str, ...] = ("query_id", "product_id", "score", "position")
-_METRICS_HEADER: tuple[str, ...] = ("query_id", *_METRIC_COLUMNS, "n_scored", "n_missing")
+_RESULT_HEADER: tuple[str, ...] = ("variant", "query_id", "product_id", "score", "position")
+_METRICS_HEADER: tuple[str, ...] = (
+    "variant",
+    "query_id",
+    *_METRIC_COLUMNS,
+    "n_scored",
+    "n_missing",
+)
 _COMPARISON_HEADER: tuple[str, ...] = (
+    "baseline",
     "variant",
     "metric",
+    "baseline_value",
+    "variant_value",
     "delta",
     "delta_ci_lo",
     "delta_ci_high",
@@ -93,80 +106,86 @@ def _open_csv_writer(path: Path) -> Any:
     return handle, csv.writer(handle, lineterminator="\n")
 
 
-def write_result_csv(
-    pcfg: PipelineCfg,
-    results: Sequence[RankedResult],
+def write_results_csv(
+    results_by_variant: Mapping[str, Sequence[RankedResult]],
     timestamp: str,
     *,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> Path:
-    """Write ``result_{variant}_{ts}.csv`` — one row per ranked doc, ``position`` 1-based (§9).
+    """Write ``result_{ts}.csv`` — one row per ranked doc across ALL pipelines, ``position`` 1-based (§9).
 
-    ``position`` is derived here as the 1-based index into each ``RankedResult.docs`` (§3.1). The
-    number of rows per query is whatever the pipeline returned (already ``<= top_k``, §8.0).
+    ``results_by_variant`` maps pipeline id -> its ranked results (baseline first, then variants in
+    config order). Each row is prefixed with the variant id. ``position`` is derived here as the
+    1-based index into each ``RankedResult.docs`` (§3.1); the number of rows per query is whatever the
+    pipeline returned (already ``<= top_k``, §8.0).
     """
-    path = _artifact_path(output_dir, f"result_{pcfg.id}_{timestamp}.csv")
+    path = _artifact_path(output_dir, f"result_{timestamp}.csv")
     handle, writer = _open_csv_writer(path)
     with handle:
         writer.writerow(_RESULT_HEADER)
-        for result in results:
-            for position, doc in enumerate(result.docs, start=1):
-                writer.writerow(
-                    [result.query_id, doc.doc_id, repr(doc.score), position]
-                )
+        for variant_id, results in results_by_variant.items():
+            for result in results:
+                for position, doc in enumerate(result.docs, start=1):
+                    writer.writerow(
+                        [variant_id, result.query_id, doc.doc_id, repr(doc.score), position]
+                    )
     return path
 
 
 def write_metrics_csv(
-    pcfg: PipelineCfg,
-    metrics: Mapping[str, Metrics],
+    metrics_by_variant: Mapping[str, Mapping[str, Metrics]],
     timestamp: str,
     *,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> Path:
-    """Write ``metrics_{variant}_{ts}.csv`` — one row per query, NaN metric cells EMPTY (§7/§9).
+    """Write ``metrics_{ts}.csv`` — one row per (variant, query), NaN metric cells EMPTY (§7/§9).
 
-    Each of the four metric cells is empty when its ``Metrics`` value is ``math.nan``
-    (avg/ndcg/precision when ``n_scored == 0``; recall when ``R == 0``). ``n_scored``/``n_missing``
-    are always written as ints.
+    ``metrics_by_variant`` maps pipeline id -> {query_id: Metrics} (baseline first, then variants).
+    Each row is prefixed with the variant id. Each of the four metric cells is empty when its
+    ``Metrics`` value is ``math.nan`` (avg/ndcg/precision when ``n_scored == 0``; recall when
+    ``R == 0``). ``n_scored``/``n_missing`` are always written as ints.
     """
-    path = _artifact_path(output_dir, f"metrics_{pcfg.id}_{timestamp}.csv")
+    path = _artifact_path(output_dir, f"metrics_{timestamp}.csv")
     handle, writer = _open_csv_writer(path)
     with handle:
         writer.writerow(_METRICS_HEADER)
-        for query_id, m in metrics.items():
-            metric_values = m.as_dict()
-            row: list[Any] = [query_id]
-            row.extend(_float_cell(metric_values[name]) for name in _METRIC_COLUMNS)
-            row.extend([m.n_scored, m.n_missing])
-            writer.writerow(row)
+        for variant_id, metrics in metrics_by_variant.items():
+            for query_id, m in metrics.items():
+                metric_values = m.as_dict()
+                row: list[Any] = [variant_id, query_id]
+                row.extend(_float_cell(metric_values[name]) for name in _METRIC_COLUMNS)
+                row.extend([m.n_scored, m.n_missing])
+                writer.writerow(row)
     return path
 
 
 def write_comparison_csv(
     baseline_id: str,
-    variant_id: str,
     rows: Sequence[ComparisonResult],
     timestamp: str,
     *,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> Path:
-    """Write ``comparison_{baseline}_{variant}_{ts}.csv`` — one row per metric (§8.1/§9).
+    """Write ``comparison_{ts}.csv`` — one row per (variant, metric) across ALL variants (§8.1/§9).
 
-    ``delta``/CI cells are empty for an empty paired set (``None``) and numeric otherwise;
-    ``significant_raw``/``significant`` are lowercase ``true``/``false`` (§9).
+    ``baseline_id`` is the baseline pipeline id, emitted as the leading ``baseline`` column on every
+    row (the baseline is never compared to itself, so there is no baseline-vs-baseline row).
+    ``baseline_value``/``variant_value``/``delta``/CI cells are empty for an empty paired set
+    (``None``) and numeric otherwise; ``significant_raw``/``significant`` are lowercase
+    ``true``/``false`` (§9).
     """
-    path = _artifact_path(
-        output_dir, f"comparison_{baseline_id}_{variant_id}_{timestamp}.csv"
-    )
+    path = _artifact_path(output_dir, f"comparison_{timestamp}.csv")
     handle, writer = _open_csv_writer(path)
     with handle:
         writer.writerow(_COMPARISON_HEADER)
         for row in rows:
             writer.writerow(
                 [
+                    baseline_id,
                     row.variant,
                     row.metric,
+                    _float_cell(row.baseline_value),
+                    _float_cell(row.variant_value),
                     _float_cell(row.delta),
                     _float_cell(row.delta_ci_lo),
                     _float_cell(row.delta_ci_high),

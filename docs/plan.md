@@ -298,12 +298,12 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Objective.** Write the three CSV artifact types + run-config JSON with **exact, fixed** schemas (§9), verified by golden files.
 
 **Deliverables.**
-- `benchmark/io_csv.py` — `write_result_csv`, `write_metrics_csv`, `write_comparison_csv`, `write_run_config`.
+- `benchmark/io_csv.py` — `write_results_csv`, `write_metrics_csv`, `write_comparison_csv`, `write_run_config`.
 
 **Depends on.** Phases 1, 2, 3 (consumes `RankedResult`, `Metrics`, comparator rows).
 
 **Implementation notes (§9, CLAUDE.md invariants).**
-- Filenames: `result_{variant}_{timestamp}.csv`, `metrics_{variant}_{timestamp}.csv`, `comparison_{baseline}_{variant}_{timestamp}.csv`, `run_config_{timestamp}.json`; `{timestamp}` = single per-run UTC `YYYYMMDDTHHMMSSZ`.
+- Filenames (ONE file per run, all pipelines): `result_{timestamp}.csv`, `metrics_{timestamp}.csv`, `comparison_{timestamp}.csv`, `run_config_{timestamp}.json`; `{timestamp}` = single per-run UTC `YYYYMMDDTHHMMSSZ`. `result`/`metrics` carry a leading `variant` column (baseline included); `comparison` a leading `baseline` column.
 - **Exact headers / field order (do not rename/reorder):**
   - result → `query_id,product_id,score,position`
   - metrics → `query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing`
@@ -425,9 +425,9 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Implementation notes (§8.0, §6, §1.4(4)).**
 - **Setup prelude before any `run_one` (first lines of §8.0):** `runner.run()` must (a) call `ESIndexer.build(dataset, indexer, list(cfg.services.embedders.values()))` to obtain the `IndexMapping`, (b) build the `searcher_factory` (bound to the ES client + `IndexMapping`), (c) freeze `queries = list(dataset.queries())` as the single shared query set, and (d) build `QrelIndex(dataset.qrels())` once — all before the first `run_one`. Do not under-build this setup phase.
 - **`eval:index` entry point** invokes this same indexer path: `ESIndexer.build` in §3.5 strict order — **register embedder endpoints → `ensure_index` (semantic_text + `copy_to`) → `bulk_index`**. (`eval:index` builds/populates the index; `eval:run` consumes it.)
-- **One `run_one` path for every pipeline — baseline included** (DRY guarantee, §8.0): R0 register reranker if `pcfg.reranker` and `assert pcfg.rerank_window_size <= ep.task_settings["top_n"]`; `pipeline = build_pipeline(pcfg, cfg.services, mapping, factory)`; call `pipeline.bulk_search([q.text for q in queries], top_k=cfg.top_k)` **once** over the **frozen shared query set** (retrieval leaves batch via `_msearch`, §5.3 — far fewer round trips than per-query `search`), then zip the aligned `result[i]` into `RankedResult(queries[i].query_id, result[i])`; `write_result_csv`; `Evaluator.score_run`; `write_metrics_csv`; stash per-query vectors keyed by `pcfg.id`.
+- **One `run_one` path for every pipeline — baseline included** (DRY guarantee, §8.0): R0 register reranker if `pcfg.reranker` and `assert pcfg.rerank_window_size <= ep.task_settings["top_n"]`; `pipeline = build_pipeline(pcfg, cfg.services, mapping, factory)`; call `pipeline.bulk_search([q.text for q in queries], top_k=cfg.top_k)` **once** over the **frozen shared query set** (retrieval leaves batch via `_msearch`, §5.3 — far fewer round trips than per-query `search`), then zip the aligned `result[i]` into `RankedResult(queries[i].query_id, result[i])`; `Evaluator.score_run`; accumulate the `RankedResult`s + per-query `Metrics` keyed by `pcfg.id` (baseline first). After the loop, `write_results_csv`/`write_metrics_csv` each write ONE file for all pipelines (leading `variant` column, baseline included).
 - **Iterate `cfg.pipelines()`** — baseline first, then the named variants in config order. There is **no expansion, no sweep, and no §8.0a selection phase**: the runner is a flat loop over the explicit config pipelines.
-- **Comparator pass (family-wide, §8.0/§8.3):** collect the baseline's per-query metric maps and ALL variant pipelines' maps (adapt `Metrics` → plain `{metric: value}` via `Metrics.as_dict()`, since `stats` consumes maps, not `Metrics`), call `Comparator(cfg.stats).compare(baseline_maps, variant_maps)` **once** so the FDR correction (BH/BY) is applied across the whole `(variant × metric)` family, then group the returned rows by variant and `write_comparison_csv` one `comparison_bm25_{variant}_*` per variant; then `write_run_config`.
+- **Comparator pass (family-wide, §8.0/§8.3):** collect the baseline's per-query metric maps and ALL variant pipelines' maps (adapt `Metrics` → plain `{metric: value}` via `Metrics.as_dict()`, since `stats` consumes maps, not `Metrics`), call `Comparator(cfg.stats).compare(baseline_maps, variant_maps)` **once** so the FDR correction (BH/BY) is applied across the whole `(variant × metric)` family, then `write_comparison_csv(cfg.baseline_id, rows, ...)` writes ONE `comparison_{ts}.csv` (all rows, leading `baseline` column, no baseline-vs-baseline row); then `write_run_config`.
 - `--dry-run` prints the pipeline list (baseline first) and runs nothing (README).
 
 **Test / acceptance criteria.** *(requires dockerized ES ≥ 8.15; small subset)*

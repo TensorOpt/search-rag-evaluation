@@ -8,10 +8,10 @@ in-memory :class:`Dataset`, a fake :class:`IndexWriter`, fake embedder/rerank co
 :class:`FakeReranker`). The real domain ``indexing.Indexer(writer, embedders).build`` runs against the
 fake writer (so the §3.5 ensure→embed→bulk sequence is exercised, not stubbed).
 
-Asserts: every pipeline traverses the single ``run_one`` path (all produce artifacts); all three CSV
-types + run_config land in the tmp output dir; the baseline is written first and is NOT in the
-comparison outputs; the R0 assert raises when a reranker top_n < rerank_window_size; ``--dry-run``
-writes nothing.
+Asserts: every pipeline traverses the single ``run_one`` path (all rows land in the single result +
+metrics files); all three CSV types + run_config land in the tmp output dir; the baseline appears
+first in the ``variant`` column and is NOT compared to itself in the comparison file; the R0 assert
+raises when a reranker top_n < rerank_window_size; ``--dry-run`` writes nothing.
 """
 
 from __future__ import annotations
@@ -267,8 +267,10 @@ def patched_factories(monkeypatch: pytest.MonkeyPatch) -> FakeIndexWriter:
     return patch_runner_factories(monkeypatch)
 
 
-def _artifacts(output_dir: Path, prefix: str, timestamp: str) -> list[str]:
-    return sorted(p.name for p in output_dir.glob(f"{prefix}_*_{timestamp}.csv"))
+def _column(path: Path, index: int) -> list[str]:
+    """The values of column ``index`` for every data row (header skipped)."""
+    lines = path.read_text(encoding="utf-8").splitlines()[1:]
+    return [line.split(",")[index] for line in lines]
 
 
 # --- tests ------------------------------------------------------------------------------------
@@ -295,35 +297,41 @@ def test_run_produces_all_artifacts_baseline_first(
 
     ExperimentRunner().run(cfg, output_dir=str(tmp_path))
 
-    # Every pipeline (baseline + 3 variants) produced a result + metrics CSV -> single run_one path.
-    assert _artifacts(tmp_path, "result", ts) == [
-        f"result_bm25_{ts}.csv",
-        f"result_bm25_rerank_{ts}.csv",
-        f"result_hybrid_e5_{ts}.csv",
-        f"result_semantic_e5_{ts}.csv",
+    # Exactly three per-run CSVs (single files) + run_config — no per-variant files.
+    result_file = tmp_path / f"result_{ts}.csv"
+    metrics_file = tmp_path / f"metrics_{ts}.csv"
+    comparison_file = tmp_path / f"comparison_{ts}.csv"
+    assert sorted(p.name for p in tmp_path.glob("*.csv")) == [
+        f"comparison_{ts}.csv",
+        f"metrics_{ts}.csv",
+        f"result_{ts}.csv",
     ]
-    assert _artifacts(tmp_path, "metrics", ts) == [
-        f"metrics_bm25_{ts}.csv",
-        f"metrics_bm25_rerank_{ts}.csv",
-        f"metrics_hybrid_e5_{ts}.csv",
-        f"metrics_semantic_e5_{ts}.csv",
-    ]
-    # One comparison per VARIANT — the baseline is NEVER compared to itself.
-    comparisons = sorted(p.name for p in tmp_path.glob(f"comparison_*_{ts}.csv"))
-    assert comparisons == [
-        f"comparison_bm25_bm25_rerank_{ts}.csv",
-        f"comparison_bm25_hybrid_e5_{ts}.csv",
-        f"comparison_bm25_semantic_e5_{ts}.csv",
-    ]
-    assert not (tmp_path / f"comparison_bm25_bm25_{ts}.csv").exists()  # baseline not vs itself
     assert (tmp_path / f"run_config_{ts}.json").exists()
+
+    # Every pipeline (baseline first, then variants in config order) appears in the variant column.
+    def _variant_order(path: Path) -> list[str]:
+        seen: list[str] = []
+        for v in _column(path, 0):
+            if v not in seen:
+                seen.append(v)
+        return seen
+
+    assert _variant_order(result_file) == ["bm25", "semantic_e5", "hybrid_e5", "bm25_rerank"]
+    assert _variant_order(metrics_file) == ["bm25", "semantic_e5", "hybrid_e5", "bm25_rerank"]
+
+    # Comparison: baseline col constant == bm25; one row per (variant, metric); NO baseline-vs-itself.
+    baseline_col = _column(comparison_file, 0)
+    variant_col = _column(comparison_file, 1)
+    assert set(baseline_col) == {"bm25"}
+    assert "bm25" not in variant_col  # baseline never compared to itself
+    assert len(variant_col) == 3 * 4  # 3 variants x 4 canonical metrics
 
     # eval:run does NOT index — the ingest seam is never exercised here (that's eval:index's job).
     assert patched_factories.ensured is False
     assert patched_factories.indexed == []
 
 
-def test_run_result_csv_is_first_written_for_baseline(
+def test_run_result_file_lists_baseline_first(
     patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
     from benchmark.runner import ExperimentRunner
@@ -333,14 +341,12 @@ def test_run_result_csv_is_first_written_for_baseline(
 
     ExperimentRunner().run(cfg, output_dir=str(tmp_path))
 
-    # Baseline result file is written before the variant's (mtime ordering, single path, baseline-first).
-    baseline_result = tmp_path / f"result_bm25_{ts}.csv"
-    variant_result = tmp_path / f"result_semantic_e5_{ts}.csv"
-    assert baseline_result.stat().st_mtime_ns <= variant_result.stat().st_mtime_ns
-    # Baseline result content reflects the lexical leaf (d1 first, 4 rows/query).
-    header, *rows = baseline_result.read_text().splitlines()
-    assert header == "query_id,product_id,score,position"
-    assert rows[0].startswith("q1,d1,")
+    result_file = tmp_path / f"result_{ts}.csv"
+    header, *rows = result_file.read_text().splitlines()
+    assert header == "variant,query_id,product_id,score,position"
+    # Baseline rows come first (single path, baseline-first) and reflect the lexical leaf (d1 first).
+    assert rows[0] == "bm25,q1,d1,5.0,1"
+    assert _column(result_file, 0)[0] == "bm25"
 
 
 def test_r0_asserts_when_rerank_window_exceeds_top_n(

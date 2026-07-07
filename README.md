@@ -37,7 +37,7 @@ hatch run eval:index
 hatch run eval:run
 
 # 7. Inspect results
-ls results/                     # result_* / metrics_* / comparison_bm25_* / run_config_*
+ls results/                     # result_* / metrics_* / comparison_* / run_config_*
 
 # 8. Tear down
 docker compose down -v
@@ -60,7 +60,7 @@ The harness supports **six conceptual retrieval shapes** — the BM25 baseline p
 | 4 | `semantic_rerank` | Semantic candidates → reranker. |
 | 5 | `hybrid_rerank` | RRF(BM25, semantic) → reranker. |
 
-Every pipeline is an explicit named entry in the config — there is no per-variant code and **no matrix expansion or sweep**. Each named variant produces one `result_*` + `metrics_*` + `comparison_bm25_*` triple. The baseline is not compared to itself, so only the named variants yield `comparison_bm25_*` CSVs.
+Every pipeline is an explicit named entry in the config — there is no per-variant code and **no matrix expansion or sweep**. A run produces one `result_*` + `metrics_*` + `comparison_*` file, each holding all pipelines (the `result`/`metrics` files include the baseline via a leading `variant` column). The baseline is not compared to itself, so it has no row in `comparison_*`.
 
 ---
 
@@ -99,7 +99,7 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 │   │   └── wands.py           # WandsDataset (label→gain, search_text concat)
 │   ├── config.py              # config value types (PipelineCfg/Services/ResolvedConfig, NO expansion) + build_pipeline; YAML/JSON load + resolve; lazy dotted adapter factories
 │   ├── runner.py              # ExperimentRunner — the single execution path
-│   └── io_csv.py              # write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
+│   └── io_csv.py              # write_results_csv / write_metrics_csv / write_comparison_csv / write_run_config
 ├── dataset/
 │   └── wands/                 # query.csv, product.csv, label.csv  (NOT in the repo; see below)
 ├── results/                   # run artifacts land here (gitignored)
@@ -258,33 +258,34 @@ hatch run eval:run -- --dry-run            # print the pipeline list, run nothin
 
 ## Outputs
 
-Artifacts are written to `results/` with a single per-run UTC timestamp `{timestamp} = YYYYMMDDTHHMMSSZ`. `{variant}` is the pipeline's name from config (e.g. `hybrid_e5_k60`); `{baseline}` is the baseline pipeline's id (`bm25`). All CSVs are UTF-8, comma-separated, with a header. **Field names and order are fixed.**
+Artifacts are written to `results/` with a single per-run UTC timestamp `{timestamp} = YYYYMMDDTHHMMSSZ`. Each run produces exactly three CSVs (plus `run_config`), each holding **all** pipelines in one file: the `variant` column is the pipeline's name from config (e.g. `hybrid_e5_k60`), and `baseline` is the baseline pipeline's id (`bm25`). All CSVs are UTF-8, comma-separated, with a header. **Field names and order are fixed.**
 
-### `result_{variant}_{timestamp}.csv`
-
-```
-query_id,product_id,score,position
-```
-
-One row per returned doc; `position` is the 1-based rank; at most `top_k` rows per query.
-
-### `metrics_{variant}_{timestamp}.csv`
+### `result_{timestamp}.csv`
 
 ```
-query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
+variant,query_id,product_id,score,position
 ```
 
-One row per query. Metrics use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. `n_scored` = judged docs the metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; both are non-negative integers, always present. Any of the four metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, `recall@10` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
+One file for all pipelines (baseline included). One row per returned doc; `variant` is the pipeline id; `position` is the 1-based rank; at most `top_k` rows per (variant, query). Rows are grouped by variant, baseline first.
 
-### `comparison_{baseline}_{variant}_{timestamp}.csv`
+### `metrics_{timestamp}.csv`
 
 ```
-variant,metric,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
+variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
 ```
 
-One row per metric ∈ {`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`}.
+One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. Metrics use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. `n_scored` = judged docs the metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; both are non-negative integers, always present. Any of the four metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, `recall@10` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
 
-- `delta` — mean paired difference (variant − baseline) over the shared query set.
+### `comparison_{timestamp}.csv`
+
+```
+baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
+```
+
+One file for all variants (the baseline is not compared to itself, so there is no baseline-vs-baseline row). One row per (variant, metric ∈ {`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`}); `baseline` is the baseline pipeline's id (same on every row) and `variant` is the compared pipeline's id.
+
+- `baseline_value` / `variant_value` — the per-metric means of the baseline and the variant over the shared paired (non-NaN) query set.
+- `delta` — mean paired difference (`variant_value − baseline_value`) over that set.
 - `delta_ci_lo` / `delta_ci_high` — the **per-comparison, unadjusted 2.5/97.5 percentile bootstrap interval**. This is effect-size context only; it is **not** a significance gate.
 - `p_value` — the **raw** (uncorrected) Wilcoxon signed-rank (or permutation) p-value.
 - `significant_raw` ∈ {`true`,`false`} — the **uncorrected** per-test decision (`p_value <= α`), independent of the family.
@@ -299,10 +300,9 @@ The fully-resolved config + seed: the resolved services registry and named pipel
 
 ```bash
 ls -1 results/
-# result_bm25_20260630T120000Z.csv
-# metrics_bm25_20260630T120000Z.csv
-# comparison_bm25_semantic_e5_20260630T120000Z.csv
-# ...
+# result_20260630T120000Z.csv
+# metrics_20260630T120000Z.csv
+# comparison_20260630T120000Z.csv
 # run_config_20260630T120000Z.json
 ```
 

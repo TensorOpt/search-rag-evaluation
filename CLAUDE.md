@@ -38,10 +38,10 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   threshold for precision/recall is `gain >= 0.5` (Partial or Exact). A **MISSING** judgement (no
   qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (§7) — **NOT** treated
   as irrelevant; only a **judged** `0.0` is irrelevant. Per-query `n_scored`/`n_missing` are recorded.
-- **Exact CSV artifact schemas (do not rename/reorder fields):**
-  - `result_{variant}_{timestamp}.csv` — `query_id, product_id, score, position`
-  - `metrics_{variant}_{timestamp}.csv` — `query_id, avg_relevance, ndcg@10, recall@10, precision@10, n_scored, n_missing`
-  - `comparison_{baseline}_{variant}_{timestamp}.csv` — `variant, metric, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, p_value_adjusted, significant`
+- **Exact CSV artifact schemas (do not rename/reorder fields) — one file per run, all pipelines:**
+  - `result_{timestamp}.csv` — `variant, query_id, product_id, score, position`
+  - `metrics_{timestamp}.csv` — `variant, query_id, avg_relevance, ndcg@10, recall@10, precision@10, n_scored, n_missing`
+  - `comparison_{timestamp}.csv` — `baseline, variant, metric, baseline_value, variant_value, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, p_value_adjusted, significant`
 - **RRF k-sweep** is over `rank_constant` ∈ {10,20,…,100}.
 
 ## Conventions

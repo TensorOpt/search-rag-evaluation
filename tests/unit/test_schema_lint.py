@@ -3,9 +3,9 @@
 Runs :class:`benchmark.runner.ExperimentRunner` with the in-memory fakes from ``test_runner`` into a
 tmp dir, then byte-exactly asserts every produced artifact's header/field order against §9:
 
-- ``result_*.csv``     : ``query_id,product_id,score,position``
-- ``metrics_*.csv``    : ``query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing``
-- ``comparison_*.csv`` : the 9-column §9 comparison header
+- ``result_{ts}.csv``     : ``variant,query_id,product_id,score,position``
+- ``metrics_{ts}.csv``    : ``variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing``
+- ``comparison_{ts}.csv`` : the 12-column §9 comparison header
 - ``run_config_*.json``: parses + carries the §9.1 keys (services/pipelines/stats/cutoff/top_k/seed…)
 
 The linter reads the FIRST line of each CSV as the header (byte-exact) so a rename/reorder in any
@@ -27,10 +27,10 @@ from tests.unit.test_runner import (
 )
 
 # The §9 headers, spelled out here (NOT imported from io_csv) so a drift in io_csv is caught.
-_RESULT_HEADER = "query_id,product_id,score,position"
-_METRICS_HEADER = "query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing"
+_RESULT_HEADER = "variant,query_id,product_id,score,position"
+_METRICS_HEADER = "variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing"
 _COMPARISON_HEADER = (
-    "variant,metric,delta,delta_ci_lo,delta_ci_high,"
+    "baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,"
     "p_value,significant_raw,p_value_adjusted,significant"
 )
 #: §9.1 run_config keys (fully-resolved config; asdict of ResolvedConfig).
@@ -76,19 +76,15 @@ def test_artifact_schemas_match_section_9(
 
     ExperimentRunner().run(cfg, output_dir=str(tmp_path))
 
-    result_files = sorted(tmp_path.glob(f"result_*_{ts}.csv"))
-    metrics_files = sorted(tmp_path.glob(f"metrics_*_{ts}.csv"))
-    comparison_files = sorted(tmp_path.glob(f"comparison_*_{ts}.csv"))
-    # Sanity: every named pipeline produced result+metrics; every variant a comparison.
-    assert len(result_files) == len(metrics_files) == 4  # baseline + 3 variants
-    assert len(comparison_files) == 3  # one per variant (baseline never vs itself)
+    # Exactly ONE file per artifact type (all pipelines / comparisons in a single file, §9).
+    result_files = sorted(tmp_path.glob(f"result_{ts}.csv"))
+    metrics_files = sorted(tmp_path.glob(f"metrics_{ts}.csv"))
+    comparison_files = sorted(tmp_path.glob(f"comparison_{ts}.csv"))
+    assert len(result_files) == len(metrics_files) == len(comparison_files) == 1
 
-    for path in result_files:
-        assert _header(path) == _RESULT_HEADER, path.name
-    for path in metrics_files:
-        assert _header(path) == _METRICS_HEADER, path.name
-    for path in comparison_files:
-        assert _header(path) == _COMPARISON_HEADER, path.name
+    assert _header(result_files[0]) == _RESULT_HEADER
+    assert _header(metrics_files[0]) == _METRICS_HEADER
+    assert _header(comparison_files[0]) == _COMPARISON_HEADER
 
     run_config = tmp_path / f"run_config_{ts}.json"
     payload = json.loads(run_config.read_text(encoding="utf-8"))

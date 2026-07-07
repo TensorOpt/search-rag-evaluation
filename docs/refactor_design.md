@@ -403,7 +403,7 @@ edit (new `ESIndexWriter`-equivalent + `build_searchers`/`build_rerankers` + tar
 >   datasets/wands.py    #   WandsDataset (implements Dataset; label->gain; search_text concat)
 >   config.py            #   config value types + YAML load/resolve + build_pipeline + lazy dotted adapter factories
 >   runner.py            #   ExperimentRunner (the single execution path, §8.0)
->   io_csv.py            #   write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
+>   io_csv.py            #   write_results_csv / write_metrics_csv / write_comparison_csv / write_run_config
 > ```
 >
 > **Layers.** `a–g` form a strict acyclic engine: `common` (g) ← `providers` (f) ← `embedding`(c)/

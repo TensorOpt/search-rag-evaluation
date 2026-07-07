@@ -598,18 +598,19 @@ flowchart TD
   C --> D{for each named pipeline}
   D --> E[3a. R0 if reranker: assert rerank_window_size <= reranker settings.top_n]
   E --> F[3b. build_pipeline -> SearchPipeline graph; pipeline.search per query over ALL queries]
-  F --> G[4. write result_variant_ts.csv: query_id,product_id,score,position]
-  G --> H[5. Evaluator.score per query -> write metrics_variant_ts.csv]
+  F --> G[4. accumulate results per variant: variant,query_id,product_id,score,position]
+  G --> H[5. Evaluator.score per query -> accumulate metrics per variant]
   H --> I[(per-query metric vectors held in memory keyed by query_id)]
   I --> J[after all pipelines done]
-  J --> K[6. Comparator: ONE family-wide compare of ALL variant pipelines vs baseline over SAME query set, FDR/BH across the family -> split rows per variant -> comparison_bm25_variant_ts.csv each]
+  J --> W[write ONE result_ts.csv and ONE metrics_ts.csv, all pipelines incl. baseline, one row per (variant,query)]
+  W --> K[6. Comparator: ONE family-wide compare of ALL variant pipelines vs baseline over SAME query set, FDR/BH across the family -> ONE comparison_ts.csv, all variants]
   K --> L[7. write run_config_ts.json]
 ```
 
-Concrete materialization rules:
-- **Result CSV** (step 4): for each `RankedResult`, write one row per `ScoredDoc`, `position = 1-based index`, `score = ScoredDoc.score`. At most `top_k` rows per query.
-- **Per-query metrics** (step 5): the Evaluator joins each `RankedResult` to qrels by `query_id` (qrels indexed once into `dict[query_id, dict[doc_id, gain]]`), computes the four metrics (§7), writes one row per query, **and** returns the per-query vectors in memory keyed by `query_id` for the Comparator (so metrics are computed once, not re-derived from CSV).
-- **Comparison** (step 6): runs only after all runs' metric vectors exist; a **single** `Comparator.compare(baseline_maps, variant_maps)` call pairs each variant against the baseline on the **identical query set** (§8.1) and applies the **FDR (BH/BY) correction family-wide** across all `(variant, metric)` tests (§8.3), then the returned rows (each carrying both raw and FDR-adjusted significance) are grouped by variant and written one `comparison_bm25_{variant}_{ts}.csv` each.
+Concrete materialization rules (three single files per run):
+- **Result CSV** (`result_{ts}.csv`): ONE file for all pipelines (baseline included). For each variant (baseline first, then variants in config order) and each `RankedResult`, write one row per `ScoredDoc` prefixed with the `variant` id: `variant = PipelineCfg.id`, `position = 1-based index`, `score = ScoredDoc.score`. At most `top_k` rows per (variant, query).
+- **Per-query metrics** (`metrics_{ts}.csv`): ONE file for all pipelines (baseline included). The Evaluator joins each `RankedResult` to qrels by `query_id` (qrels indexed once into `dict[query_id, dict[doc_id, gain]]`), computes the four metrics (§7), and returns the per-query vectors in memory keyed by `query_id` for the Comparator (so metrics are computed once, not re-derived from CSV). The runner accumulates these per variant and writes one row per (variant, query), each prefixed with the `variant` id (baseline first, then variants in config order).
+- **Comparison** (`comparison_{ts}.csv`): ONE file. Runs only after all runs' metric vectors exist; a **single** `Comparator.compare(baseline_maps, variant_maps)` call pairs each variant against the baseline on the **identical query set** (§8.1) and applies the **FDR (BH/BY) correction family-wide** across all `(variant, metric)` tests (§8.3), then all returned rows (each carrying both raw and FDR-adjusted significance, and its `baseline_value`/`variant_value`) are written to the single file, each row prefixed with the `baseline` id. The baseline is not compared to itself, so there is no baseline-vs-baseline row.
 
 The baseline (`bm25`) is always materialized first so every later comparison has its paired reference in memory.
 
@@ -674,7 +675,8 @@ class ExperimentRunner:
 
         # The pipelines are exactly what the config declares — baseline first, then the named
         # variants in config order (§10). No expansion, no sweep, no selection phase.
-        per_query: dict[str, dict[str, Metrics]] = {}
+        per_query: dict[str, dict[str, Metrics]] = {}       # keyed by variant id, baseline first
+        results_by_variant: dict[str, list[RankedResult]] = {}
 
         def run_one(pcfg: PipelineCfg) -> None:
             if pcfg.reranker:                        # R0: the W <= top_n cap only — no endpoint registration
@@ -688,20 +690,23 @@ class ExperimentRunner:
             results = [
                 RankedResult(q.query_id, docs) for q, docs in zip(queries, ranked)
             ]
-            write_result_csv(pcfg, results, cfg.timestamp)
+            results_by_variant[pcfg.id] = results           # accumulated, not written yet
             metrics = Evaluator(qrels).score_run(results)   # per-query vectors
-            write_metrics_csv(pcfg, metrics, cfg.timestamp)
             per_query[pcfg.id] = metrics
 
         for pcfg in cfg.pipelines():                 # baseline first, then variants
             run_one(pcfg)
 
+        # ONE result file and ONE metrics file for the whole run (all pipelines incl. baseline).
+        write_results_csv(results_by_variant, cfg.timestamp)   # result_{ts}.csv, variant col first
+        write_metrics_csv(per_query, cfg.timestamp)            # metrics_{ts}.csv, variant col first
+
         # Comparator pass — ONE family-wide call so the FDR correction (§8.3) is applied across the run.
         # Collect the baseline's per-query metric maps and ALL variant pipelines' maps, call compare()
         # ONCE (it pairs each variant vs the baseline, per metric, computes the RAW per-test
         # significance, and FDR-corrects the whole family of (variant, metric) tests together — each
-        # returned ComparisonResult carries both the raw and the FDR-adjusted significance), then split
-        # the returned rows by variant and write one comparison_bm25_{variant}_{ts}.csv each.
+        # returned ComparisonResult carries both the raw and the FDR-adjusted significance, plus its
+        # baseline_value/variant_value), then write ALL rows to one comparison_{ts}.csv.
         # Metrics.as_dict() supplies the plain {metric: value} maps the comparator consumes
         # (§11 import rule: stats sees maps, not Metrics).
         baseline_maps = {q: m.as_dict() for q, m in per_query[cfg.baseline_id].items()}
@@ -710,9 +715,7 @@ class ExperimentRunner:
             for vid, metrics in per_query.items() if vid != cfg.baseline_id
         }
         rows = Comparator(cfg.stats).compare(baseline_maps, variant_maps)   # family-wide FDR inside
-        for vid in variant_maps:
-            vrows = [r for r in rows if r.variant == vid]
-            write_comparison_csv(cfg.baseline_id, vid, vrows, cfg.timestamp)
+        write_comparison_csv(cfg.baseline_id, rows, cfg.timestamp)   # comparison_{ts}.csv, all variants
         write_run_config(cfg)
 ```
 Every pipeline — baseline included — traverses the **identical** `run_one` code path; only the `PipelineCfg` differs. This is the DRY guarantee, verifiable by inspection: the runner is a flat loop over the explicit config pipelines with no expansion or selection phase.
@@ -761,25 +764,25 @@ The CI and the significance decision are deliberately kept in **distinct, clearl
 
 ## 9. Output Artifacts, Naming, Reproducibility
 
-`{timestamp}` = UTC `YYYYMMDDTHHMMSSZ` of run start (single value for the whole run). `{variant}` = the pipeline's name from config (its `pipelines.variants` map key, e.g. `hybrid_e5_k60`). `{baseline}` = the baseline pipeline's id (`bm25`/`baseline`). All CSVs UTF-8, comma-separated, header present. **Field names and order are fixed:**
+`{timestamp}` = UTC `YYYYMMDDTHHMMSSZ` of run start (single value for the whole run). Each run writes exactly three CSVs (plus `run_config`), each holding **all** pipelines: the leading `variant` column is the pipeline's name from config (its `pipelines.variants` map key, e.g. `hybrid_e5_k60`), and `baseline` is the baseline pipeline's id (`bm25`/`baseline`). All CSVs UTF-8, comma-separated, header present. **Field names and order are fixed:**
 
-**`result_{variant}_{timestamp}.csv`**
+**`result_{timestamp}.csv`**
 ```
-query_id,product_id,score,position
+variant,query_id,product_id,score,position
 ```
-One row per returned doc; `position` 1-based ascending; ≤ top_k rows per query.
+One file for all pipelines (baseline included). One row per returned doc; `variant` = pipeline id; `position` 1-based ascending; ≤ top_k rows per (variant, query). Rows are grouped by variant, baseline first, then variants in config order.
 
-**`metrics_{variant}_{timestamp}.csv`**
+**`metrics_{timestamp}.csv`**
 ```
-query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
+variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
 ```
-One row per query. `n_scored` and `n_missing` are **non-negative integers, ALWAYS present** (never empty): the condensed-list counts of §7 (`n_scored` = judged docs scored, `n_missing` = missing docs skipped). Any of the **four metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when its in-memory `Metrics` value is `NaN` (§7): `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored == 0`, `recall@10` empty when `R == 0`. This empty↔`NaN` mapping is fixed so a reader never guesses; consumers must treat an empty metric cell as "excluded", and the comparator does this from the in-memory `NaN`, not by re-parsing this file (§8.1).
+One file for all pipelines (baseline included). One row per (variant, query); `variant` = pipeline id; baseline first, then variants in config order. `n_scored` and `n_missing` are **non-negative integers, ALWAYS present** (never empty): the condensed-list counts of §7 (`n_scored` = judged docs scored, `n_missing` = missing docs skipped). Any of the **four metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when its in-memory `Metrics` value is `NaN` (§7): `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored == 0`, `recall@10` empty when `R == 0`. This empty↔`NaN` mapping is fixed so a reader never guesses; consumers must treat an empty metric cell as "excluded", and the comparator does this from the in-memory `NaN`, not by re-parsing this file (§8.1).
 
-**`comparison_{baseline}_{variant}_{timestamp}.csv`**
+**`comparison_{timestamp}.csv`**
 ```
-variant,metric,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
+baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
 ```
-One row per metric ∈ {`avg_relevance`,`ndcg@10`,`recall@10`,`precision@10`}; `significant` ∈ {`true`,`false`} and `significant_raw` ∈ {`true`,`false`}. `delta_ci_lo/high` are the **per-comparison unadjusted 2.5/97.5 bootstrap interval (effect-size context only, §8.2)**; `p_value` is the **raw** (uncorrected) Wilcoxon (or permutation) p; `significant_raw` is the **uncorrected per-test decision** (`p_value <= α`); `p_value_adjusted` is the **BH (or BY) FDR-adjusted p-value (q-value)** over the family; `significant` is the **FDR decision** (`p_value_adjusted <= α`, §8.3). The CI is in a different role from the significance flags and **may disagree** with them (§8.3). For a degenerate paired set, `delta` and the CI cells are written **empty** (empty paired set) or `0.0` (all-zero deltas) per the §8.1 table, with `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`.
+One file for all variants; the baseline is not compared to itself, so there is no baseline-vs-baseline row. One row per (variant, metric ∈ {`avg_relevance`,`ndcg@10`,`recall@10`,`precision@10`}); `baseline` = the baseline pipeline's id (same on every row); `variant` = the compared pipeline's id; `significant` ∈ {`true`,`false`} and `significant_raw` ∈ {`true`,`false`}. `baseline_value` / `variant_value` are the per-metric **means over the paired (non-NaN) query set** (§8.1) of the baseline and the variant respectively, and `delta = variant_value − baseline_value` (identical to the mean paired difference). `delta_ci_lo/high` are the **per-comparison unadjusted 2.5/97.5 bootstrap interval (effect-size context only, §8.2)**; `p_value` is the **raw** (uncorrected) Wilcoxon (or permutation) p; `significant_raw` is the **uncorrected per-test decision** (`p_value <= α`); `p_value_adjusted` is the **BH (or BY) FDR-adjusted p-value (q-value)** over the family; `significant` is the **FDR decision** (`p_value_adjusted <= α`, §8.3). The CI is in a different role from the significance flags and **may disagree** with them (§8.3). For a degenerate paired set, `baseline_value`, `variant_value`, `delta` and the CI cells are written **empty** (empty paired set) or `0.0` (all-zero deltas — `baseline_value`/`variant_value` equal, `delta = 0.0`) per the §8.1 table, with `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`.
 
 ### 9.1 Reproducibility
 - **Config capture:** the fully-resolved config (the resolved **services** registry — embedders/rerankers/searchers by name — and the resolved **pipelines**: the baseline plus every named variant with its retrievers/fuser/reranker/window; bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test + its zero/tie params, any degenerate-paired-set notes, dataset version, ES + endpoint versions, cutoff, seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits FDR-adjusted p-values (q-values) per test in the comparison CSV (§9), so — unlike Holm — the adjusted significance is fully materialized.
@@ -876,8 +879,8 @@ vector store would need a per-store indexing model instead — deferred, §12/§
   run ids are the map keys (baseline id = `baseline`, configurable via `baseline_id`). A variant id
   that duplicates the baseline id is an error.
 
-Each named pipeline → a `SearchPipeline` object graph (§4, `build_pipeline`) → one `result_*` +
-`metrics_*` + `comparison_bm25_*` triple. Each reranker's `top_n` must be `>= rerank_window_size`
+Each named pipeline → a `SearchPipeline` object graph (§4, `build_pipeline`) → its rows in the run's
+single `result_*` / `metrics_*` files (and, for variants, `comparison_*`). Each reranker's `top_n` must be `>= rerank_window_size`
 (asserted at R0, §8.0 / §5.3). **There is no matrix expansion and no k-sweep** — the pipelines run
 are exactly those listed. An optional sweep/expansion helper that would *generate* many pipelines
 from axes is a possible future convenience, deliberately omitted here for config legibility (§13).
@@ -906,7 +909,7 @@ benchmark/
   datasets/wands.py    #   WandsDataset (implements Dataset; label->gain; search_text concat)
   config.py            #   config value types + YAML load/resolve + build_pipeline + lazy dotted adapter factories
   runner.py            #   ExperimentRunner (the single execution path, §8.0)
-  io_csv.py            #   write_result_csv / write_metrics_csv / write_comparison_csv / write_run_config
+  io_csv.py            #   write_results_csv / write_metrics_csv / write_comparison_csv / write_run_config
 docs/experiment.md
 dataset/wands/         # query.csv, product.csv, label.csv (gitignored)
 ```
