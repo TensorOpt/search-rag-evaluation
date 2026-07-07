@@ -25,7 +25,7 @@ services:                       # named, typed, reusable building blocks
 indexer:
   provider: elasticsearch
   index: wands_bench
-  settings: { url: "${ES_URL}", bulk_chunk_size: 96, request_timeout: 600 }
+  settings: { url: "${ES_URL}", bulk_chunk_size: 96, request_timeout: 30 }
 pipelines:
   baseline_id: bm25             # baseline pipeline's artifact id (§9): result_bm25_*, comparison_bm25_*
   baseline:                     # the reference every variant is compared against

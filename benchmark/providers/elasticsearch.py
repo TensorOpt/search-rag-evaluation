@@ -70,7 +70,13 @@ _BULK_PROGRESS_EVERY = 10_000
 
 
 def _make_client(indexer_cfg: Mapping[str, Any]) -> Elasticsearch:
-    """Build an :class:`Elasticsearch` client from ``indexer.settings.url`` (§10)."""
+    """Build an :class:`Elasticsearch` client from ``indexer.settings.url`` (§10).
+
+    ``request_timeout`` (``indexer.settings.request_timeout``) bounds each request so an
+    unresponsive ES fails fast with a ``ConnectionTimeout`` rather than hanging silently — keep it
+    modest (a healthy localhost bulk is sub-second); a very large value just turns a real problem
+    (e.g. a broken index) into a long silent stall.
+    """
     settings = indexer_cfg["settings"]
     url = settings["url"]
     request_timeout = int(settings.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT))

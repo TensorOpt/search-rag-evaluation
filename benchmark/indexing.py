@@ -112,6 +112,10 @@ def _embed_batch(
                 f"document {doc.doc_id!r} has no {search_text_field!r} field to embed"
             )
         texts.append(doc.fields[search_text_field])
+    logger.info(
+        "embedding a batch of %d documents with %s",
+        len(batch), [e.id for e in embedders]
+    )
     vectors_by_embedder = {embedder.id: embedder.embed_documents(texts) for embedder in embedders}
     for offset, doc in enumerate(batch):
         fields = dict(doc.fields)

@@ -111,7 +111,7 @@ def _retry_delay(exc: urllib.error.HTTPError, attempt: int) -> float:
             return min(float(retry_after), _BACKOFF_CAP)
         except ValueError:
             # A non-numeric Retry-After (HTTP-date form) — fall back to backoff rather than parse it.
-            logger.debug("non-numeric Retry-After %r; using backoff", retry_after)
+            logger.warning("non-numeric Retry-After %r; using backoff", retry_after)
     return min(_BACKOFF_BASE * (2**attempt), _BACKOFF_CAP)
 
 
