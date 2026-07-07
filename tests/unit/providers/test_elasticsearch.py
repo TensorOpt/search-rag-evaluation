@@ -129,6 +129,25 @@ def test_ensure_index_idempotent_when_index_exists() -> None:
     client.indices.create.assert_not_called()  # existing index -> skip, no raise
 
 
+def test_doc_count_returns_count_when_index_exists() -> None:
+    client = _fake_client()
+    client.indices.exists.return_value = True
+    client.count.return_value = {"count": 42994}
+    writer = _writer_with(client)
+
+    assert writer.doc_count() == 42994
+    client.count.assert_called_once_with(index="wands_bench")
+
+
+def test_doc_count_none_when_index_absent() -> None:
+    client = _fake_client()
+    client.indices.exists.return_value = False
+    writer = _writer_with(client)
+
+    assert writer.doc_count() is None  # absent -> None (the runner treats this as "run eval:index")
+    client.count.assert_not_called()
+
+
 # --- bulk_index -------------------------------------------------------------------------------
 
 

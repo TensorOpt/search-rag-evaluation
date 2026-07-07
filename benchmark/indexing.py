@@ -39,13 +39,29 @@ class Indexer:
         self.writer = writer
         self.embedders = list(embedders)
 
+    def _sem_fields(self) -> dict[str, str]:
+        """Each embedder id -> its backend-safe ``dense_vector`` field name (no dim probe)."""
+        return {embedder.id: self.writer.sem_field_name(embedder.id) for embedder in self.embedders}
+
+    def mapping(self, dataset: Dataset) -> IndexMapping:
+        """The ``IndexMapping`` for QUERYING an already-built index (§8.0) — field names only.
+
+        No dim probe, no (re)indexing. ``eval:run`` uses this to name the leaf searchers' fields
+        against an index a prior ``eval:index`` populated; ``backend_mapping`` (used only to CREATE
+        the index) is left empty since nothing is created or written here.
+        """
+        return IndexMapping(
+            index_name=self.writer.index,
+            search_text_field=dataset.field_schema().search_text_field,
+            sem_fields=self._sem_fields(),
+            backend_mapping={},
+        )
+
     def build(self, dataset: Dataset) -> IndexMapping:
         # 1. sem_fields: embedder id -> dense_vector field name (backend-safe, from the writer).
         #    Discover each dim (probes the provider or reads settings.dims) — needed to map the
         #    dense_vector field before ingest.
-        sem_fields: dict[str, str] = {
-            embedder.id: self.writer.sem_field_name(embedder.id) for embedder in self.embedders
-        }
+        sem_fields = self._sem_fields()
         vector_dims: dict[str, int] = {
             sem_fields[embedder.id]: embedder.dim for embedder in self.embedders
         }

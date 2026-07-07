@@ -114,6 +114,12 @@ class FakeIndexWriter(IndexWriter):
         self.index = "fake_index"
         self.ensured = False
         self.indexed: list[Document] = []
+        # doc_count() default == the FakeDataset corpus size, so run()'s "fully indexed" check
+        # (index count == dataset count, §8.0) passes; the failure tests set it to None/other.
+        self.doc_count_value: int | None = len(_DOCS)
+
+    def doc_count(self) -> int | None:
+        return self.doc_count_value
 
     def sem_field_name(self, embedder_id: str) -> str:
         return "sem__" + embedder_id
@@ -312,12 +318,9 @@ def test_run_produces_all_artifacts_baseline_first(
     assert not (tmp_path / f"comparison_bm25_bm25_{ts}.csv").exists()  # baseline not vs itself
     assert (tmp_path / f"run_config_{ts}.json").exists()
 
-    # The ingest seam ran (ensure_index + streamed bulk_index) and the corpus was embedded at
-    # ingest: every indexed doc carries the embedder's dense_vector field (§3.5). No inference
-    # registration happens (ES is a plain index); the reranker 'rr' is a connector, not registered.
-    assert patched_factories.ensured is True
-    assert len(patched_factories.indexed) == len(_DOCS)
-    assert all("sem__e5" in doc.fields for doc in patched_factories.indexed)
+    # eval:run does NOT index — the ingest seam is never exercised here (that's eval:index's job).
+    assert patched_factories.ensured is False
+    assert patched_factories.indexed == []
 
 
 def test_run_result_csv_is_first_written_for_baseline(
@@ -355,9 +358,10 @@ def test_r0_asserts_when_rerank_window_exceeds_top_n(
         ExperimentRunner().run(cfg, output_dir=str(tmp_path))
 
 
-def test_build_index_reuses_single_ingest_path(
+def test_build_index_builds_and_populates(
     patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
+    # eval:index path: build_index() ensures the index + embeds + streams the corpus in (§3.5).
     from benchmark.runner import ExperimentRunner
 
     cfg = _config(variants=[], timestamp="20260702T030000Z")
@@ -365,10 +369,32 @@ def test_build_index_reuses_single_ingest_path(
 
     assert isinstance(dataset, FakeDataset)
     assert writer is patched_factories
-    # One dense_vector field per embedder (§5.2); doc _id-keyed ingest happened.
+    # One dense_vector field per embedder (§5.2); the corpus was embedded + streamed in.
     assert mapping.sem_fields == {"e5": "sem__e5"}
-    assert set(embedders) == {"e5"}  # the embedder connector registry the runner reuses (§8.0)
+    assert set(embedders) == {"e5"}  # the embedder connector registry (§8.0)
     assert writer.ensured is True
+    assert len(writer.indexed) == len(_DOCS)
+    assert all("sem__e5" in doc.fields for doc in writer.indexed)
+
+
+def test_run_fails_if_index_missing(patched_factories: FakeIndexWriter, tmp_path: Path) -> None:
+    from benchmark.runner import ExperimentRunner, IndexNotReadyError
+
+    patched_factories.doc_count_value = None  # index does not exist
+    cfg = _config(variants=[], timestamp="20260702T040000Z")
+    with pytest.raises(IndexNotReadyError, match="does not exist"):
+        ExperimentRunner().run(cfg, output_dir=str(tmp_path))
+    assert list(tmp_path.glob("*.csv")) == []  # nothing written on a failed precondition
+
+
+def test_run_fails_if_index_incomplete(patched_factories: FakeIndexWriter, tmp_path: Path) -> None:
+    from benchmark.runner import ExperimentRunner, IndexNotReadyError
+
+    patched_factories.doc_count_value = len(_DOCS) - 1  # partially indexed (count mismatch)
+    cfg = _config(variants=[], timestamp="20260702T050000Z")
+    with pytest.raises(IndexNotReadyError, match="not fully indexed"):
+        ExperimentRunner().run(cfg, output_dir=str(tmp_path))
+    assert list(tmp_path.glob("*.csv")) == []
 
 
 def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

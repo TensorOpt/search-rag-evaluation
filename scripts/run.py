@@ -1,8 +1,10 @@
 """eval:run — run the whole benchmark end to end (docs/experiment.md §8.0). Phase 11.
 
 Loads the explicit §10 config, then drives :class:`benchmark.runner.ExperimentRunner` over it:
-index build → one ``run_one`` per pipeline (baseline first) → the family-wide comparator pass →
-run-config JSON (§8.0). ``--dry-run`` prints the pipeline list (baseline first) and writes NOTHING.
+verify the index (built by ``eval:index``) is fully populated → one ``run_one`` per pipeline
+(baseline first) → the family-wide comparator pass → run-config JSON (§8.0). ``eval:run`` does NOT
+index; if the index is missing or partial it exits non-zero with a clear message (build it with
+``eval:index`` first). ``--dry-run`` prints the pipeline list (baseline first) and writes NOTHING.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ import argparse
 
 from benchmark.config import load_config
 from benchmark.common.logging_setup import get_logger, setup_logging
-from benchmark.runner import ExperimentRunner
+from benchmark.runner import ExperimentRunner, IndexNotReadyError
 
 log = get_logger(__name__)
 
@@ -43,7 +45,12 @@ def main(argv: list[str] | None = None) -> int:
         log.info("--dry-run: %d pipeline(s) listed; nothing was run or written", len(cfg.pipelines()))
         return 0
 
-    ExperimentRunner().run(cfg, output_dir=args.output_dir)
+    try:
+        ExperimentRunner().run(cfg, output_dir=args.output_dir)
+    except IndexNotReadyError as exc:
+        # The index isn't built/complete — a config/workflow error, not a crash. Clear message, exit 1.
+        log.error("%s", exc)
+        return 1
     return 0
 
 

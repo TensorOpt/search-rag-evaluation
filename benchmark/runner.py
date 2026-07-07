@@ -5,13 +5,14 @@ IDENTICAL ``run_one`` code path; only the :class:`~benchmark.config.PipelineCfg`
 guarantee, §8.0). The runner is a flat loop over the explicit config pipelines (baseline first) —
 there is NO matrix expansion, NO sweep, and NO selection phase.
 
-Setup prelude (§8.0), before any per-pipeline work: load the dataset, build the index (instantiate
-the embedder connectors → the domain ``indexing.Indexer`` discovers dims → ensure_index → embed the
-corpus → bulk_index, delegating backend bits to the injected ``IndexWriter``), build the full leaf
-``Searcher`` / ``Reranker`` maps (wired to the embedder/reranker connectors), freeze the shared query
-set, and build the :class:`QrelIndex` + :class:`Evaluator` once. The index-build sequence lives in
-ONE place — :meth:`ExperimentRunner.build_index` — reused by both :meth:`ExperimentRunner.run`'s setup
-and the ``eval:index`` entry point (``scripts/index.py``), so there is a single ensure/embed/bulk path (DRY).
+Two entry points, two paths. ``eval:index`` (``scripts/index.py``) BUILDS the index via
+:meth:`ExperimentRunner.build_index` (instantiate the embedder connectors → the domain
+``indexing.Indexer`` discovers dims → ensure_index → embed the corpus → bulk_index, delegating
+backend bits to the injected ``IndexWriter``). ``eval:run`` (:meth:`ExperimentRunner.run`) does NOT
+index — its setup prelude VERIFIES a pre-built index (doc count == the dataset's, else
+:class:`IndexNotReadyError`, §8.0), builds the full leaf ``Searcher`` / ``Reranker`` maps (wired to
+the embedder/reranker connectors) over that index's field names, freezes the shared query set, and
+builds the :class:`QrelIndex` + :class:`Evaluator` once.
 
 Imports the pure consumers (``config``/``evaluation``/``io_csv``/``common``) + the domain
 ``indexing.Indexer`` — NEVER an adapter at import time (§11). The concrete ``IndexWriter`` + leaf
@@ -43,14 +44,24 @@ from benchmark.io_csv import (
 logger = get_logger(__name__)
 
 
+class IndexNotReadyError(RuntimeError):
+    """``eval:run`` was invoked but the index is missing or not fully built (§8.0).
+
+    ``eval:run`` does NOT (re)index — it requires an index already populated by ``eval:index``. This
+    is raised when the target index does not exist, or when its doc count does not equal the
+    dataset's (a partial/stale index), so a run never silently scores against incomplete data.
+    """
+
+
 class ExperimentRunner:
     """Runs the whole benchmark for a resolved config, the single execution path (§8.0)."""
 
     def build_index(self, cfg: ResolvedConfig) -> tuple[Any, Any, Any, dict[str, Any]]:
         """Build the index (§3.5 ensure_index→embed→bulk_index); return (dataset, writer, mapping, embedders).
 
-        The ONE index-build path (DRY): reused by :meth:`run`'s setup prelude AND the ``eval:index``
-        entry point. Loads the dataset, builds the ``IndexWriter`` (``config.make_index_writer``),
+        The index-build path driven by the ``eval:index`` entry point (``scripts/index.py``).
+        ``eval:run`` does NOT call this — it verifies a pre-built index instead (see :meth:`run`).
+        Loads the dataset, builds the ``IndexWriter`` (``config.make_index_writer``),
         instantiates every configured embedder connector (``config.make_embedders`` — §3.4), and
         drives the domain :class:`~benchmark.indexing.Indexer` over them (each embedder gets a
         ``dense_vector`` field; the harness embeds the corpus at ingest, §3.5). Returns the dataset
@@ -71,8 +82,37 @@ class ExperimentRunner:
         return dataset, writer, mapping, embedders
 
     def run(self, cfg: ResolvedConfig, *, output_dir: str = DEFAULT_OUTPUT_DIR) -> None:
-        """Run every pipeline baseline-first, then the family-wide comparator pass (§8.0)."""
-        dataset, writer, mapping, embedders = self.build_index(cfg)
+        """Run every pipeline baseline-first, then the family-wide comparator pass (§8.0).
+
+        ``eval:run`` does NOT (re)index — it REQUIRES an index already built by ``eval:index``. Before
+        any pipeline runs, it verifies the index exists and holds the whole corpus (its doc count
+        equals the dataset's document count), raising :class:`IndexNotReadyError` otherwise so a
+        missing/partial/stale index never silently skews the metrics.
+        """
+        dataset = config.load_dataset(cfg.dataset)
+        writer = config.make_index_writer(cfg.indexer)
+        embedders = config.make_embedders(cfg.services)  # name -> Embedder connector (§3.4)
+        # Query-only mapping: field names for the leaf searchers; NO dim probe, NO (re)indexing.
+        mapping = Indexer(writer, list(embedders.values())).mapping(dataset)
+
+        # Require a fully-built index (built by eval:index). Compare the index doc count to the
+        # dataset's (§8.0) — fail fast on a missing or partial index rather than re-indexing here.
+        indexed = writer.doc_count()
+        expected = sum(1 for _ in dataset.documents())
+        if indexed is None:
+            raise IndexNotReadyError(
+                f"index {mapping.index_name!r} does not exist — build it first with `eval:index`"
+            )
+        if indexed != expected:
+            raise IndexNotReadyError(
+                f"index {mapping.index_name!r} has {indexed} docs but the dataset has {expected}; "
+                "it is not fully indexed — (re)build it with `eval:index` before `eval:run`"
+            )
+        logger.info(
+            "index %r ready: %d docs match the dataset; running eval (no re-indexing)",
+            mapping.index_name, indexed,
+        )
+
         rerank_clients = config.make_rerankers(cfg.services)  # name -> RerankClient connector (§3.4/§5.4)
         # Build the FULL configured leaf-searcher + reranker sets ONCE, shared across all pipelines
         # (each pipeline selects its leaves/reranker by name in build_pipeline). ES: Lexical/Vector/

@@ -198,11 +198,15 @@ class IndexWriter(Protocol):
     (§3.3/§3.6), realized as concrete provider classes (ES ``LexicalSearcher`` / ``VectorSearch`` /
     ``ESReranker``).
 
-    ``embed_batch_size`` is the ingest buffering granularity the ``Indexer`` streams the corpus at;
-    ``sem_field_name`` maps an embedder id to its backend-safe field name; ``create_mapping``
-    translates the dataset ``FieldSchema`` (+ the per-field vector dims) into the ``IndexMapping``.
+    ``index`` is the target index name; ``embed_batch_size`` is the ingest buffering granularity the
+    ``Indexer`` streams the corpus at; ``sem_field_name`` maps an embedder id to its backend-safe
+    field name; ``create_mapping`` translates the dataset ``FieldSchema`` (+ the per-field vector
+    dims) into the ``IndexMapping``; ``doc_count`` returns the number of docs currently in the index
+    (``None`` if the index does not exist) — the runner uses it to verify a fully-built index before
+    an eval (§8.0), since ``eval:run`` does NOT (re)index.
     """
 
+    index: str
     embed_batch_size: int
 
     def sem_field_name(self, embedder_id: str) -> str: ...
@@ -214,3 +218,4 @@ class IndexWriter(Protocol):
     ) -> IndexMapping: ...
     def ensure_index(self, mapping: IndexMapping) -> None: ...
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None: ...
+    def doc_count(self) -> int | None: ...

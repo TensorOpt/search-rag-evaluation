@@ -80,6 +80,9 @@ class _RecordingWriter(IndexWriter):
         self.ensured_mapping: Any = None
         self.indexed_docs: list[Document] = []
 
+    def doc_count(self) -> int | None:
+        return len(self.indexed_docs)
+
     def sem_field_name(self, embedder_id: str) -> str:
         return "sem__" + re.sub(r"[^0-9a-zA-Z]+", "_", embedder_id)
 
@@ -158,3 +161,15 @@ def test_indexer_multiple_embedders_one_dense_vector_each() -> None:
     doc_fields = writer.indexed_docs[0].fields
     assert len(doc_fields["sem__e5_small"]) == 3
     assert len(doc_fields["sem__elser"]) == 5
+
+
+def test_indexer_mapping_names_fields_without_indexing() -> None:
+    # mapping() is the query-side path (eval:run): field names only — no ensure/embed/bulk, no probe.
+    writer = _RecordingWriter()
+    mapping = Indexer(writer, [_FakeEmbedder("e5.small.v1", dim=4)]).mapping(_FakeDataset())
+
+    assert mapping.index_name == "wands_bench"
+    assert mapping.search_text_field == "search_text"
+    assert mapping.sem_field("e5.small.v1") == "sem__e5_small_v1"
+    assert mapping.backend_mapping == {}  # query-only: no create-mapping body
+    assert writer.calls == []  # nothing ensured/indexed

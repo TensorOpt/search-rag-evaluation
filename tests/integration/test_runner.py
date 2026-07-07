@@ -131,8 +131,10 @@ def test_eval_index_builds_populated_index(es_index: str) -> None:
 
 def test_run_end_to_end_produces_all_artifacts(es_index: str, tmp_path: Path) -> None:
     cfg = resolve_config(_trimmed_config(es_index, _require_cohere()))
+    runner = ExperimentRunner()
     try:
-        ExperimentRunner().run(cfg, output_dir=str(tmp_path))
+        runner.build_index(cfg)  # eval:index first — eval:run REQUIRES a pre-built index (§8.0)
+        runner.run(cfg, output_dir=str(tmp_path))
     except ProviderError as exc:
         pytest.skip(f"cohere embedding/rerank unavailable (env constraint): {exc}")
 

@@ -186,6 +186,17 @@ class ESIndexWriter(IndexWriter):
         logger.info("creating index %r", mapping.index_name)
         self.client.indices.create(index=mapping.index_name, mappings=mapping.backend_mapping)
 
+    def doc_count(self) -> int | None:
+        """Number of docs currently in the index, or ``None`` if the index does not exist (§8.0).
+
+        The runner calls this to verify a fully-built index before an eval (``eval:run`` does not
+        index). Uses the searchable count (post-refresh) — ``bulk_index`` refreshes at the end, so a
+        completed ``eval:index`` reports the full corpus; an interrupted one reports fewer.
+        """
+        if not self.client.indices.exists(index=self.index):
+            return None
+        return int(self.client.count(index=self.index)["count"])
+
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None:
         """Stream ``docs`` into ``mapping.index_name`` (``_id = doc.doc_id``) in chunks, then refresh (§3.5).
 

@@ -81,9 +81,13 @@ class _RerankClient:
 
 
 class _Writer:
-    """A trivial ``IndexWriter`` seam: field-naming + mapping + ensure_index/bulk_index (no register)."""
+    """A trivial ``IndexWriter`` seam: field-naming + mapping + ensure_index/bulk_index + doc_count."""
 
+    index = "i"
     embed_batch_size = 96
+
+    def doc_count(self) -> int | None:
+        return 0
 
     def sem_field_name(self, embedder_id: str) -> str:
         return "sem__" + embedder_id

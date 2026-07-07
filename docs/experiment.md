@@ -658,7 +658,14 @@ class ExperimentRunner:
         dataset = load_dataset(cfg.dataset)
         writer = make_index_writer(cfg.indexer)      # IndexWriter ingest seam (§3.3), lazily built
         embedders = make_embedders(cfg.services)     # {name: Embedder connector} (§3.4), lazily built
-        mapping = Indexer(writer, list(embedders.values())).build(dataset)  # embeds corpus -> dense_vector (§3.5)
+        # eval:run does NOT (re)index — it REQUIRES an index already built by eval:index. Verify it
+        # exists and holds the WHOLE corpus (doc count == dataset), else raise IndexNotReadyError so a
+        # missing/partial/stale index never silently skews the metrics. mapping() is query-only:
+        # the leaf searchers' field names, with NO dim probe and NO (re)indexing.
+        mapping = Indexer(writer, list(embedders.values())).mapping(dataset)
+        indexed, expected = writer.doc_count(), sum(1 for _ in dataset.documents())
+        if indexed is None or indexed != expected:   # index absent, or partially built
+            raise IndexNotReadyError(...)             # -> (re)build it with eval:index first
         rerankers = make_rerankers(cfg.services)     # {name: RerankClient connector} (§3.4/§5.4)
         searchers = make_searchers(cfg.indexer, cfg.services, mapping, embedders=embedders)   # ES build_searchers -> {name: Searcher}
         reranker_objs = make_rerankers_bound(cfg.indexer, cfg.services, mapping, rerank_clients=rerankers)  # ES build_rerankers -> {name: Reranker}
@@ -709,6 +716,8 @@ class ExperimentRunner:
         write_run_config(cfg)
 ```
 Every pipeline — baseline included — traverses the **identical** `run_one` code path; only the `PipelineCfg` differs. This is the DRY guarantee, verifiable by inspection: the runner is a flat loop over the explicit config pipelines with no expansion or selection phase.
+
+**Build vs. run are separate steps.** `eval:index` (`scripts/index.py`) builds/populates the index via `Indexer.build` (embed the corpus → `dense_vector`). `eval:run` **does not index** — its prelude only *verifies* a pre-built index (the doc-count check above) and then queries it. So building is done once; re-running the eval reuses the index and makes no document-embedding calls (only per-query embeddings for vector retrieval). Changing the dataset or an embedder means rebuilding with `eval:index` before the next `eval:run` — otherwise the count check passes on a stale index (a known limitation: counts match but content changed). `IndexNotReadyError` (missing or partial index) exits `eval:run` non-zero with a message pointing at `eval:index`.
 
 ### 8.1 Pairing, point estimate, and empty/degenerate paired sets
 Comparisons are **paired by `query_id`** between a variant and the baseline (`bm25`). For metric `m` and query `q`: `δ_q = m_variant(q) − m_baseline(q)`.

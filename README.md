@@ -236,9 +236,9 @@ Indexing is idempotent (`_id = product_id`), so re-running is safe. Adding a new
 hatch run eval:run
 ```
 
-This drives the entire `ExperimentRunner` path from `config.yaml`:
+`eval:run` does **not** index — build the index first with `eval:index`. It drives the entire `ExperimentRunner` path from `config.yaml`:
 
-1. Loads the dataset, builds (or reuses) the index, freezes the shared query set.
+1. Loads the dataset and **verifies the index is fully built**: it must exist and its doc count must equal the dataset's document count, otherwise `eval:run` exits non-zero with a clear message (build it with `eval:index`). This never re-embeds — re-running the eval reuses the index and makes no document-embedding calls. (Changed the dataset or an embedder? Re-run `eval:index` first — the count check can't detect same-count-but-different content.)
 2. Reads the explicit pipelines from config, **baseline first**.
 3. For each pipeline: (for a rerank pipeline) asserts `rerank_window_size <= settings.top_n`, builds the `SearchPipeline` graph (`build_pipeline`), runs it over all queries, writes the result CSV, scores it, writes the metrics CSV.
 4. Compares every named variant against the baseline on the identical query set and writes the comparison CSV.
