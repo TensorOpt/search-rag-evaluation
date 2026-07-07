@@ -92,12 +92,12 @@ def _metrics_by_variant() -> dict[str, dict[str, Metrics]]:
     """
     return {
         "bm25": {
-            "q_full": Metrics(0.75, 0.9, 0.5, 1.0, n_scored=4, n_missing=2),
-            "q_noscore": Metrics(math.nan, math.nan, 0.0, math.nan, n_scored=0, n_missing=3),
-            "q_norel": Metrics(0.0, 0.0, math.nan, 0.0, n_scored=2, n_missing=0),
+            "q_full": Metrics(0.75, 0.9, 0.5, 1.0, n_results=6, n_scored=4, n_missing=2),
+            "q_noscore": Metrics(math.nan, math.nan, 0.0, math.nan, n_results=3, n_scored=0, n_missing=3),
+            "q_norel": Metrics(0.0, 0.0, math.nan, 0.0, n_results=2, n_scored=2, n_missing=0),
         },
         "semantic_e5": {
-            "q_full": Metrics(0.8, 0.95, 1.0, 0.5, n_scored=3, n_missing=1),
+            "q_full": Metrics(0.8, 0.95, 1.0, 0.5, n_results=4, n_scored=3, n_missing=1),
         },
     }
 
@@ -113,24 +113,24 @@ def test_metrics_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
 def test_metrics_header_ends_with_counts(tmp_path: Path) -> None:
     """The metrics header leads with variant and ends with the two int count columns (§9)."""
     path = write_metrics_csv(
-        {"bm25": {"q1": Metrics(1.0, 1.0, 1.0, 1.0, n_scored=1, n_missing=0)}},
+        {"bm25": {"q1": Metrics(1.0, 1.0, 1.0, 1.0, n_results=2, n_scored=1, n_missing=0)}},
         TIMESTAMP,
         output_dir=tmp_path,
     )
     header = path.read_text(encoding="utf-8").splitlines()[0]
-    assert header == "variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing"
+    assert header == "variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing"
 
 
 def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None:
     """A NaN metric cell is two adjacent commas (empty field), while counts stay integers."""
     path = write_metrics_csv(
-        {"bm25": {"q0": Metrics(math.nan, math.nan, math.nan, math.nan, n_scored=0, n_missing=0)}},
+        {"bm25": {"q0": Metrics(math.nan, math.nan, math.nan, math.nan, n_results=0, n_scored=0, n_missing=0)}},
         TIMESTAMP,
         output_dir=tmp_path,
     )
     row = path.read_text(encoding="utf-8").splitlines()[1]
     # variant + query_id + four empty metric cells + two int counts.
-    assert row == "bm25,q0,,,,,0,0"
+    assert row == "bm25,q0,,,,,0,0,0"
 
 
 # --- comparison CSV ---------------------------------------------------------------------------

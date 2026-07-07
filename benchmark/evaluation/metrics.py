@@ -100,14 +100,16 @@ class Metrics:
 
     The four metric fields are floats and may each independently be ``math.nan`` (see the module
     docstring for the per-metric NaN conditions). ``as_dict()`` exposes only the four metrics under
-    the canonical §9 metric-name keys that the comparator and CSV writers key on; the two counts
-    (``n_scored``, ``n_missing``) are non-negative ints exposed as fields, not in ``as_dict()``.
+    the canonical §9 metric-name keys that the comparator and CSV writers key on; the three counts
+    (``n_results``, ``n_scored``, ``n_missing``) are non-negative ints exposed as fields, not in
+    ``as_dict()``.
     """
 
     avg_relevance: float
     ndcg_at_10: float
     recall_at_10: float
     precision_at_10: float
+    n_results: int
     n_scored: int
     n_missing: int
 
@@ -135,6 +137,7 @@ class Evaluator:
     def _score_one(self, result: RankedResult) -> Metrics:
         k = self._cutoff
         qid = result.query_id
+        n_results = len(result.docs)
 
         # Scan the ranked list, collecting the condensed top-k: keep JUDGED docs (finite gain) in
         # rank order, SKIP MISSING docs (NaN gain, no qrel entry). Stop once k judged docs are
@@ -143,22 +146,22 @@ class Evaluator:
         condensed: list[float] = []
         n_missing = 0
         for d in result.docs:
-            g = self._qrels.gain(qid, d.doc_id)
-            if math.isnan(g):
+            gain = self._qrels.gain(qid, d.doc_id)
+            if math.isnan(gain):
                 n_missing += 1
             else:
-                condensed.append(g)
+                condensed.append(gain)
                 if len(condensed) >= k:
                     break
 
-        m = len(condensed)  # n_scored
+        n_scored = len(condensed)
 
-        if m == 0:
+        if n_scored == 0:
             avg_relevance = math.nan
             ndcg = math.nan
             precision = math.nan
         else:
-            avg_relevance = sum(condensed) / m
+            avg_relevance = sum(condensed) / n_scored
             # DCG over the condensed positions 1..m; judged-irrelevant (0.0) contributes 0.
             dcg = _dcg(condensed)
             # IDCG: DCG of the top-k ideal ordering (ALL judged gains desc, truncated to k, §7);
@@ -166,8 +169,8 @@ class Evaluator:
             idcg = _dcg(self._qrels.sorted_judged_gains(qid)[:k])
             # isclose (not `!= 0.0`) — never test float equality; IDCG==0 means no positive gains.
             ndcg = 0.0 if math.isclose(idcg, 0.0, abs_tol=ZERO_ABS_TOL) else dcg / idcg
-            hits = sum(1 for g in condensed if g >= RELEVANCE_THRESHOLD)
-            precision = hits / m  # denominator = n_scored (§7).
+            hits = sum(1 for gain in condensed if gain >= RELEVANCE_THRESHOLD)
+            precision = hits / n_scored  # denominator = n_scored (§7).
 
         # recall@10 uses R (relevant judged docs over ALL qrels) and the condensed-top-k hits.
         r = self._qrels.relevant_count(qid)
@@ -179,6 +182,7 @@ class Evaluator:
             ndcg_at_10=ndcg,
             recall_at_10=recall,
             precision_at_10=precision,
-            n_scored=m,
+            n_results=n_results,
+            n_scored=n_scored,
             n_missing=n_missing,
         )

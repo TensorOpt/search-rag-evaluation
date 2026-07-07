@@ -57,7 +57,7 @@ def test_qrelindex_sorted_judged_gains_descending():
 def test_metrics_as_dict_exact_canonical_keys():
     m = Metrics(
         avg_relevance=0.1, ndcg_at_10=0.2, recall_at_10=0.3, precision_at_10=0.4,
-        n_scored=5, n_missing=2,
+        n_results=7, n_scored=5, n_missing=2,
     )
     d = m.as_dict()
     assert set(d.keys()) == {"avg_relevance", "ndcg@10", "recall@10", "precision@10"}

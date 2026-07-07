@@ -271,10 +271,10 @@ One file for all pipelines (baseline included). One row per returned doc; `varia
 ### `metrics_{timestamp}.csv`
 
 ```
-variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
+variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing
 ```
 
-One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. Metrics use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. `n_scored` = judged docs the metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; both are non-negative integers, always present. Any of the four metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, `recall@10` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
+One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. Metrics use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. `n_results` = docs the pipeline returned for the query (`<= top_k`); `n_scored` = judged docs the metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; all three are non-negative integers, always present. Any of the four metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, `recall@10` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
 
 ### `comparison_{timestamp}.csv`
 

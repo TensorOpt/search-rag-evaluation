@@ -774,9 +774,9 @@ One file for all pipelines (baseline included). One row per returned doc; `varia
 
 **`metrics_{timestamp}.csv`**
 ```
-variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
+variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing
 ```
-One file for all pipelines (baseline included). One row per (variant, query); `variant` = pipeline id; baseline first, then variants in config order. `n_scored` and `n_missing` are **non-negative integers, ALWAYS present** (never empty): the condensed-list counts of §7 (`n_scored` = judged docs scored, `n_missing` = missing docs skipped). Any of the **four metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when its in-memory `Metrics` value is `NaN` (§7): `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored == 0`, `recall@10` empty when `R == 0`. This empty↔`NaN` mapping is fixed so a reader never guesses; consumers must treat an empty metric cell as "excluded", and the comparator does this from the in-memory `NaN`, not by re-parsing this file (§8.1).
+One file for all pipelines (baseline included). One row per (variant, query); `variant` = pipeline id; baseline first, then variants in config order. `n_results`, `n_scored` and `n_missing` are **non-negative integers, ALWAYS present** (never empty): `n_results` = docs the pipeline returned for the query (`<= top_k`); the condensed-list counts of §7 (`n_scored` = judged docs scored, `n_missing` = missing docs skipped). Any of the **four metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when its in-memory `Metrics` value is `NaN` (§7): `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored == 0`, `recall@10` empty when `R == 0`. This empty↔`NaN` mapping is fixed so a reader never guesses; consumers must treat an empty metric cell as "excluded", and the comparator does this from the in-memory `NaN`, not by re-parsing this file (§8.1).
 
 **`comparison_{timestamp}.csv`**
 ```

@@ -4,7 +4,7 @@ Runs :class:`benchmark.runner.ExperimentRunner` with the in-memory fakes from ``
 tmp dir, then byte-exactly asserts every produced artifact's header/field order against §9:
 
 - ``result_{ts}.csv``     : ``variant,query_id,product_id,score,position``
-- ``metrics_{ts}.csv``    : ``variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing``
+- ``metrics_{ts}.csv``    : ``variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing``
 - ``comparison_{ts}.csv`` : the 12-column §9 comparison header
 - ``run_config_*.json``: parses + carries the §9.1 keys (services/pipelines/stats/cutoff/top_k/seed…)
 
@@ -28,7 +28,7 @@ from tests.unit.test_runner import (
 
 # The §9 headers, spelled out here (NOT imported from io_csv) so a drift in io_csv is caught.
 _RESULT_HEADER = "variant,query_id,product_id,score,position"
-_METRICS_HEADER = "variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing"
+_METRICS_HEADER = "variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing"
 _COMPARISON_HEADER = (
     "baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,"
     "p_value,significant_raw,p_value_adjusted,significant"

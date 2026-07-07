@@ -5,7 +5,7 @@ UTC timestamp ``YYYYMMDDTHHMMSSZ`` (§9). The three CSVs are ONE file per run (a
 comparisons), each carrying a leading identity column:
 
 - :func:`write_results_csv`  -> ``result_{ts}.csv``   : ``variant,query_id,product_id,score,position``
-- :func:`write_metrics_csv`  -> ``metrics_{ts}.csv``  : ``variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing``
+- :func:`write_metrics_csv`  -> ``metrics_{ts}.csv``  : ``variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing``
 - :func:`write_comparison_csv` -> ``comparison_{ts}.csv`` : the 12-column §9 header
 - :func:`write_run_config`   -> ``run_config_{ts}.json`` : the fully-resolved config (§9.1)
 
@@ -64,6 +64,7 @@ _METRICS_HEADER: tuple[str, ...] = (
     "variant",
     "query_id",
     *_METRIC_COLUMNS,
+    "n_results",
     "n_scored",
     "n_missing",
 )
@@ -143,7 +144,7 @@ def write_metrics_csv(
     ``metrics_by_variant`` maps pipeline id -> {query_id: Metrics} (baseline first, then variants).
     Each row is prefixed with the variant id. Each of the four metric cells is empty when its
     ``Metrics`` value is ``math.nan`` (avg/ndcg/precision when ``n_scored == 0``; recall when
-    ``R == 0``). ``n_scored``/``n_missing`` are always written as ints.
+    ``R == 0``). ``n_results``/``n_scored``/``n_missing`` are always written as ints.
     """
     path = _artifact_path(output_dir, f"metrics_{timestamp}.csv")
     handle, writer = _open_csv_writer(path)
@@ -154,7 +155,7 @@ def write_metrics_csv(
                 metric_values = m.as_dict()
                 row: list[Any] = [variant_id, query_id]
                 row.extend(_float_cell(metric_values[name]) for name in _METRIC_COLUMNS)
-                row.extend([m.n_scored, m.n_missing])
+                row.extend([m.n_results, m.n_scored, m.n_missing])
                 writer.writerow(row)
     return path
 

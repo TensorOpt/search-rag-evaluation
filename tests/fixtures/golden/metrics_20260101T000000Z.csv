@@ -1,5 +1,5 @@
-variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_scored,n_missing
-bm25,q_full,0.75,0.9,0.5,1.0,4,2
-bm25,q_noscore,,,0.0,,0,3
-bm25,q_norel,0.0,0.0,,0.0,2,0
-semantic_e5,q_full,0.8,0.95,1.0,0.5,3,1
+variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing
+bm25,q_full,0.75,0.9,0.5,1.0,6,4,2
+bm25,q_noscore,,,0.0,,3,0,3
+bm25,q_norel,0.0,0.0,,0.0,2,2,0
+semantic_e5,q_full,0.8,0.95,1.0,0.5,4,3,1
