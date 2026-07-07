@@ -18,6 +18,7 @@ import json
 from typing import Sequence
 
 import numpy as np
+import pytest
 
 from benchmark.common.cache import (
     CachingEmbedder,
@@ -268,21 +269,19 @@ def test_persistence_across_instances(tmp_path) -> None:
     cache2.close()
 
 
-# --- #7 corrupt entry -> recompute ------------------------------------------------------------
+# --- #7 corrupt entry -> FAIL FAST (raises, never a silent miss) ------------------------------
 
 
-def test_corrupt_entry_recompute(tmp_path) -> None:
+def test_corrupt_entry_raises(tmp_path) -> None:
     cache = DiskCache(str(tmp_path))
-    wrapped, inner = _make_embedder(cache)
-    text = "corrupt-me"
-    key = embedding_key("cohere", "m", None, "query", None, text)
+    key = embedding_key("cohere", "m", None, "query", None, "corrupt-me")
     cache._conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (key, "not json{{"))
     cache._conn.commit()
 
-    value = wrapped.embed_queries([text])[0]
-    assert inner.calls == 1  # corrupt value is a MISS -> recomputed
-    stored = cache.get_many([key])[key]  # INSERT OR REPLACE corrected the row
-    assert np.allclose(stored, value, rtol=0.0, atol=ZERO_ABS_TOL)
+    # The store only ever writes valid JSON, so a corrupt value is an integrity failure -> fail fast
+    # (§2/§7), never a silent miss + recompute that would hide a compromised cache behind a slowdown.
+    with pytest.raises(RuntimeError, match="corrupt value"):
+        cache.get_many([key])
     cache.close()
 
 
@@ -480,12 +479,13 @@ def test_open_cache_enabled_opens(tmp_path) -> None:
     cache.close()
 
 
-def test_open_cache_corrupt_db_returns_none(tmp_path) -> None:
+def test_open_cache_corrupt_db_raises(tmp_path) -> None:
     from benchmark.config import CacheCfg, open_cache
 
     cache_dir = tmp_path / ".cache"
     cache_dir.mkdir()
-    # A non-sqlite file where inference.sqlite is expected -> sqlite3.DatabaseError on open -> the
-    # run proceeds WITHOUT the cache (§7), never crashing.
+    # A non-sqlite file where inference.sqlite is expected -> sqlite3.DatabaseError on open. An
+    # ENABLED cache that cannot open FAILS FAST (§7) — never a silent cacheless degrade.
     (cache_dir / "inference.sqlite").write_bytes(b"this is not a sqlite database file at all")
-    assert open_cache(CacheCfg(enabled=True, dir=str(cache_dir))) is None
+    with pytest.raises(RuntimeError, match="unusable"):
+        open_cache(CacheCfg(enabled=True, dir=str(cache_dir)))

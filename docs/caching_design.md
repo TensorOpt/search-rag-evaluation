@@ -37,8 +37,11 @@ wrong vector/score and corrupts the metrics — strictly worse than no cache. Tw
 1. **Airtight keys (§6).** The key hashes *every* value-determining input. Over-keying (an extra
    field that does not change the value) only causes a spurious miss → recompute → same value; that
    is safe. Under-keying serves garbage; that is forbidden.
-2. **Fail-safe reads (§7).** A corrupt/undecodable entry is treated as a **miss** and recomputed —
-   never served, never crashes the run, never silently swallowed (logged).
+2. **Fail-fast reads (§7).** The store only ever writes valid JSON, so a corrupt/undecodable entry —
+   or an enabled-but-unopenable DB — is an **unexpected integrity failure** that **raises with
+   context** (never served, never silently recomputed or degraded to a slower cacheless run). An
+   enabled cache that cannot be trusted is a hard error the user must see, not a symptom to diagnose
+   (CLAUDE.md exception convention).
 
 Batching does not affect a value: these providers embed/score each text independently, so a text's
 vector and a `(query, doc)` score are invariant to how inputs are grouped into requests. Caching
@@ -203,9 +206,11 @@ finally:
         cache.close()
 ```
 
-`config.open_cache` returns `None` when disabled (factories skip wrapping — a true bypass) **and** when
-the DB is unopenable — the single place §7's whole-DB degradation lives, so a corrupt
-`inference.sqlite` never crashes the run:
+`config.open_cache` returns `None` ONLY when caching is disabled (factories skip wrapping — a true
+bypass). When caching is **enabled**, an unopenable/corrupt `inference.sqlite`
+(`sqlite3.DatabaseError`) **fails fast** with a clear, actionable error — an enabled cache that cannot
+open is a hard error, never a silent degrade to a slower cacheless run the user would only notice as
+a slowdown (§7, CLAUDE.md exception convention):
 
 ```python
 def open_cache(cache_cfg: CacheCfg) -> DiskCache | None:
@@ -213,10 +218,11 @@ def open_cache(cache_cfg: CacheCfg) -> DiskCache | None:
         return None
     try:
         return DiskCache(cache_cfg.dir)
-    except sqlite3.DatabaseError as exc:          # corrupt / unopenable DB (§7)
-        logger.warning("cache at %s unusable (%s); running without it — `rm -rf %s` to reset",
-                       cache_cfg.dir, exc, cache_cfg.dir)
-        return None                               # run WITHOUT the cache: correct, just no speedup
+    except sqlite3.DatabaseError as exc:          # corrupt / unopenable DB — surface it, never hide it
+        raise RuntimeError(
+            f"cache at {cache_cfg.dir!r} is enabled but unusable ({exc}); it is likely corrupt — "
+            f"delete it (`rm -rf {cache_cfg.dir}`) and re-run, or set cache.enabled: false"
+        ) from exc
 ```
 
 ### Injection point (searcher) — the backend's `build_searchers`, NOT config
@@ -446,9 +452,17 @@ def _chunks(seq, n):                     # range-based: _chunks([], n) yields no
 class DiskCache:                         # NOT a Protocol — exactly one implementation (YAGNI)
     def __init__(self, directory: str) -> None:
         path = Path(directory); path.mkdir(parents=True, exist_ok=True)   # missing dir -> create it
-        self._conn = sqlite3.connect(path / "inference.sqlite")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID")
-        self._conn.execute("PRAGMA journal_mode=WAL"); self._conn.execute("PRAGMA synchronous=NORMAL")
+        db_path = path / "inference.sqlite"
+        # sqlite3.connect succeeds even on a non-DB file; the DatabaseError surfaces on the FIRST
+        # statement below. Set up a LOCAL handle and adopt it only on success, so a corrupt DB closes
+        # the fd here (no leak) and the error propagates to open_cache, which fails fast (§5).
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID")
+            conn.execute("PRAGMA journal_mode=WAL"); conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            conn.close(); raise
+        self._conn = conn; self._path = db_path    # _path kept for a precise corrupt-value error
 
     def get_many(self, keys: Sequence[str]) -> dict[str, Any]:
         out: dict[str, Any] = {}                   # get_many([]) -> {} (no chunks, no query)
@@ -457,8 +471,9 @@ class DiskCache:                         # NOT a Protocol — exactly one implem
             for k, v in self._conn.execute(f"SELECT k, v FROM kv WHERE k IN ({placeholders})", chunk):
                 try:
                     out[k] = json.loads(v)
-                except json.JSONDecodeError:
-                    logger.debug("cache: corrupt value for key %s; treating as miss", k)   # fail-safe
+                except json.JSONDecodeError as exc:   # FAIL FAST — the store only writes valid JSON
+                    raise RuntimeError(f"cache at {self._path} has a corrupt value for key {k} — "
+                                       "delete the cache dir and re-run") from exc
             # a key absent from `out` is simply a miss -> recomputed by the caller
         return out
 
@@ -473,17 +488,18 @@ class DiskCache:                         # NOT a Protocol — exactly one implem
         self._conn.close()
 ```
 
-**Corruption / missing-file handling (fail-safe, never silent):**
+**Corruption / missing-file handling (fail-fast, never silent):**
 
-- **Missing dir/file** → create it; log `info` ("cache: created …"). Not an error.
-- **Undecodable single entry** (`json.JSONDecodeError`) → treat as a **miss**, log `debug`, recompute;
-  the recompute's `set_many` overwrites the bad row (`INSERT OR REPLACE`). Narrow catch — nothing else
-  is swallowed.
+- **Missing dir/file** → create it; log `info` ("cache: created …"). Not an error (a fresh cache).
+- **Undecodable single entry** (`json.JSONDecodeError`) → **RAISES** with the key + path. The store
+  only ever writes valid JSON via `set_many`, so a corrupt value is an unexpected integrity failure —
+  surfaced, not silently treated as a miss and recomputed (which would hide a compromised cache behind
+  a spurious slowdown). Narrow catch — nothing else is swallowed.
 - **Whole-DB corruption** (`sqlite3.DatabaseError` on open) → **unexpected**, caught in **one place**:
-  `config.open_cache` (§5) logs a `warning` with the path and returns `None`, so the run proceeds
-  **without the cache** (correctness preserved, only the speedup lost) and the user is told to
-  `rm -rf .cache/`. Never crash the benchmark; never serve garbage; never a silent `except: pass`
-  (CLAUDE.md exception convention).
+  `config.open_cache` (§5) re-raises a `RuntimeError` with the path and the `rm -rf` reset hint, so an
+  **enabled** cache that cannot open **fails the run fast** rather than silently degrading to a slower
+  cacheless run. `DiskCache.__init__` closes its local connection before the error propagates (no fd
+  leak). Never serve garbage; never a silent `except: pass` (CLAUDE.md exception convention).
 
 **Concurrency/atomicity.** Single-threaded serial harness → no lock contention. Each miss-batch's
 `set_many` is one transaction; WAL makes each commit atomic and durable, so an interrupted run leaves a
@@ -541,7 +557,7 @@ cache = CacheCfg(enabled=bool(raw_cache.get("enabled", False)),
 ## 10. How each invariant is upheld
 
 - **Reproducibility (§1.4.2):** pure-function keys capture every value-determining input (§6);
-  fail-safe reads never serve garbage (§7). Cache on vs off must yield **byte-identical** metrics —
+  fail-fast reads never serve garbage — a corrupt/unopenable cache raises (§7). Cache on vs off must yield **byte-identical** metrics —
   this is a test (§11). The cache changes *speed*, never *numbers*.
 - **DRY / one-path (§1.4.4):** exactly one generic decorator per seam
   (`CachingEmbedder`/`CachingRerankClient`/`CachingSearcher`) + one key builder each, all in `common`.
@@ -597,8 +613,9 @@ the cache relies on.
    open a **new** `DiskCache(tmp)` on the same dir, assert a hit (no inner call).
 6. **Disable bypasses entirely.** `make_embedders(services, cache=None)` returns objects that are
    **not** `CachingEmbedder`; no sqlite file is created.
-7. **Corrupt entry → recompute.** Insert a non-JSON `v` for a known key; `get_many` omits it (debug
-   log), the wrapper recomputes and `INSERT OR REPLACE` corrects the row; assert final value correct.
+7. **Corrupt entry → raises (fail fast).** Insert a non-JSON `v` for a known key; assert `get_many`
+   RAISES `RuntimeError` (the store only writes valid JSON, so a corrupt value is surfaced, not
+   silently recomputed). Companion: `open_cache` on a non-sqlite file raises (enabled-but-unusable).
 8. **RateLimiter untouched on hit.** The counting fake proves zero inner calls on a hit → zero
    `acquire()` → zero budget consumed (covered by tests 1–2).
 9. **Runner plumbing / no-crash (NOT a key-correctness guard).** Run the runner over the WANDS sample
@@ -635,7 +652,7 @@ Float comparisons in all tests use `math.isclose`/`np.isclose(rtol=0.0, atol=1e-
 
 1. **Phase A — store.** `benchmark/common/cache.py`: `DiskCache` (open/get_many/set_many/close,
    WAL, chunked `get_many`, corruption handling) + `embedding_key`/`rerank_key`. Tests: round-trip,
-   persistence across instances, corrupt-entry miss, chunking > 999 keys.
+   persistence across instances, corrupt-entry raises, chunking > 999 keys.
 2. **Phase B — wrappers.** `CachingEmbedder(Embedder)` + `CachingRerankClient(RerankClient)` +
    `CachingSearcher(Searcher)` in the same module (declare the subclassing) + `search_key`; add the
    public `cache_identity` on `CachingEmbedder`. Tests: no-recompute, partial-hit rerank, key

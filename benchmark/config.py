@@ -654,23 +654,24 @@ def make_index_writer(indexer_cfg: Mapping[str, Any]) -> Any:
 
 
 def open_cache(cache_cfg: CacheCfg) -> DiskCache | None:
-    """Open the live persistent cache from ``cache_cfg``, or ``None`` (docs/caching_design.md §5/§7).
+    """Open the live persistent cache from ``cache_cfg`` (docs/caching_design.md §5/§7).
 
-    Returns ``None`` when disabled (the factories then skip wrapping entirely — a true bypass) AND
-    the single place §7's whole-DB degradation lives: a corrupt/unopenable ``inference.sqlite``
-    (:class:`sqlite3.DatabaseError`) is logged as a ``warning`` and the run proceeds WITHOUT the
-    cache (correctness preserved, only the speedup lost) rather than crashing the benchmark.
+    Returns ``None`` ONLY when caching is disabled (the factories then skip wrapping entirely — a
+    true bypass). When caching is ENABLED, an unopenable/corrupt ``inference.sqlite``
+    (:class:`sqlite3.DatabaseError`) **fails fast** with a clear, actionable error: a cache the user
+    turned on that cannot open is a hard error — never a silent degrade to a slower cacheless run
+    that the user would only diagnose through the symptom (CLAUDE.md exception convention: an
+    unexpected condition is raised with context, not suppressed).
     """
     if not cache_cfg.enabled:
         return None
     try:
         return DiskCache(cache_cfg.dir)
-    except sqlite3.DatabaseError as exc:  # corrupt / unopenable DB (§7) — unexpected, caught here only
-        logger.warning(
-            "cache at %s unusable (%s); running without it — `rm -rf %s` to reset",
-            cache_cfg.dir, exc, cache_cfg.dir,
-        )
-        return None  # run WITHOUT the cache: correct, just no speedup
+    except sqlite3.DatabaseError as exc:  # corrupt / unopenable DB — unexpected; surface it, never hide it
+        raise RuntimeError(
+            f"cache at {cache_cfg.dir!r} is enabled but unusable ({exc}); it is likely corrupt — "
+            f"delete it (`rm -rf {cache_cfg.dir}`) and re-run, or set cache.enabled: false"
+        ) from exc
 
 
 def make_searchers(

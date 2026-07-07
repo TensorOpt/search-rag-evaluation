@@ -11,8 +11,10 @@ value-determining input, §2/§6) shared by three Decorators, each explicitly su
   ``(index_version, identity, top_k, query)``; backend-agnostic (the two strings are opaque, §4).
 
 All three share one :class:`DiskCache` (a single sqlite file, JSON values). A miss recomputes; a hit
-never calls the inner connector (so the connector's ``RateLimiter`` budget is untouched, §8). A
-corrupt/undecodable entry is a fail-safe MISS (recomputed, never served, never crashes, §2/§7).
+never calls the inner connector (so the connector's ``RateLimiter`` budget is untouched, §8). The
+store only ever writes valid JSON, so a corrupt/undecodable stored value is an unexpected integrity
+failure that **fails fast** (raises with context, §2/§7) — never silently recomputed or served, and
+an enabled-but-unopenable cache raises rather than degrading to a slower cacheless run.
 
 Cross-cutting infra like :mod:`benchmark.common.logging_setup`: imports only **stdlib**
 (:mod:`sqlite3`/:mod:`json`/:mod:`hashlib`/:mod:`pathlib`) + the ``common`` seams/models — never a
@@ -116,15 +118,18 @@ class DiskCache:  # NOT a Protocol — exactly one implementation (YAGNI, §7)
             conn.execute("PRAGMA journal_mode=WAL")  # atomic commit, crash-safe across a long run
             conn.execute("PRAGMA synchronous=NORMAL")  # fast + safe under WAL
         except sqlite3.DatabaseError:
-            conn.close()  # no fd leak on the corrupt-DB path (config.open_cache re-catches + returns None)
+            conn.close()  # no fd leak on the corrupt-DB path (config.open_cache re-raises with context)
             raise
         self._conn = conn
+        self._path = db_path  # kept for a precise error message on a corrupt stored value
 
     def get_many(self, keys: Sequence[str]) -> dict[str, Any]:
-        """Return ``{key: value}`` for the keys present + decodable; absent/corrupt keys are misses.
+        """Return ``{key: value}`` for the keys present in the store; absent keys are misses.
 
-        ``get_many([])`` -> ``{}`` (no chunks, no query — never a ``WHERE k IN ()``). A single
-        undecodable value is a fail-safe miss (debug-logged, recomputed by the caller), §2/§7.
+        ``get_many([])`` -> ``{}`` (no chunks, no query — never a ``WHERE k IN ()``). The store only
+        ever writes valid JSON (:meth:`set_many`), so an undecodable stored value is an unexpected
+        integrity failure that **raises** (fail fast, §2/§7) — it is never silently treated as a miss
+        and recomputed, which would hide a compromised cache behind a spurious slowdown.
         """
         out: dict[str, Any] = {}
         for chunk in _chunks(keys, _CHUNK_SIZE):
@@ -134,13 +139,16 @@ class DiskCache:  # NOT a Protocol — exactly one implementation (YAGNI, §7)
             ):
                 try:
                     out[k] = json.loads(v)
-                except json.JSONDecodeError:
-                    logger.debug("cache: corrupt value for key %s; treating as miss", k)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"cache at {self._path} has a corrupt value for key {k} — the store is "
+                        "compromised; delete the cache dir (`rm -rf`) and re-run"
+                    ) from exc
         return out
 
     def set_many(self, items: Mapping[str, Any]) -> None:
-        """Store ``items`` (json-encoded) in ONE transaction; ``INSERT OR REPLACE`` overwrites a
-        prior (incl. a corrupt) row for the same key (§7)."""
+        """Store ``items`` (json-encoded) in ONE transaction; ``INSERT OR REPLACE`` is idempotent for
+        a re-stored key (§7)."""
         with self._conn:  # atomic under WAL
             self._conn.executemany(
                 "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
