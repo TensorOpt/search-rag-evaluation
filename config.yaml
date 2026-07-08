@@ -1,4 +1,4 @@
-# Explicit experiment config (docs/experiment.md §10).
+# Explicit experiment config (docs/architecture.md §10).
 # FULLY EXPLICIT: named services + named pipelines. There is NO matrix expansion and NO sweep — you
 # write each pipeline you want to run by hand, so the config is readable at a glance. config.py
 # (benchmark/config.py) parses + validates this into a ResolvedConfig; the runner iterates the
@@ -8,7 +8,7 @@ dataset:
   name: wands
   path: ./dataset/wands
 services:                       # named, typed, reusable building blocks
-  # Embedders/rerankers are PROVIDER CONNECTORS (benchmark/providers.py): the harness calls Cohere /
+  # Embedders/rerankers are PROVIDER CONNECTORS (benchmark/providers/inference.py): the harness calls Cohere /
   # Voyage / OpenAI directly — ES runs no inference (§1.1/§3.4). `provider` selects the connector;
   # `model_id`/`api_key`/`rate_limit`/`dims`(optional) live in `settings`. OpenAI has NO reranker.
   - embedder: { name: cohere, provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0, rate_limit: { requests_per_minute: 90 } } }

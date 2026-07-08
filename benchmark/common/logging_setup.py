@@ -7,7 +7,7 @@ loggers with :func:`get_logger`.
 
 This is a cross-cutting leaf utility: it imports only the standard library and
 may be imported by any module (it is not a dataset/backend adapter, so it does
-not affect the generality invariant in docs/experiment.md §11).
+not affect the generality invariant in docs/architecture.md §11).
 """
 
 from __future__ import annotations

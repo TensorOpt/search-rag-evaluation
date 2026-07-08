@@ -1,4 +1,4 @@
-"""Phase 2 unit tests for benchmark.metrics (docs/experiment.md §7).
+"""Phase 2 unit tests for benchmark.metrics (docs/methodology.md §7).
 
 Condensed-list evaluation: a MISSING judgement (no qrel entry) is SKIPPED, NOT scored as 0.0; a
 JUDGED-irrelevant doc (gain 0.0, present in qrels) is KEPT and contributes 0 to DCG. Every expected

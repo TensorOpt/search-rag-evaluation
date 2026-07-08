@@ -1,1 +1,1 @@
-"""Dataset adapters (docs/experiment.md §11)."""
+"""Dataset adapters (docs/architecture.md §11)."""

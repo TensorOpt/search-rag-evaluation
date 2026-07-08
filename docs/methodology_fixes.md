@@ -1,5 +1,7 @@
 # Methodology Fixes — Design (review + sign-off before implementation)
 
+> **Historical design record; implemented.** Authoritative docs: docs/methodology.md + docs/architecture.md.
+
 > Status: DESIGN ONLY. Nothing in `experiment.md` / `CLAUDE.md` / `config.yaml` / code is edited yet.
 > This doc spells out the exact edits so implementation is mechanical. `experiment.md` remains the
 > source of truth; the "Proposed edits" section lists every section to rewrite so code and doc stay

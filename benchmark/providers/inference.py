@@ -1,4 +1,4 @@
-"""Direct inference-provider connectors — embeddings + rerank (docs/experiment.md §3.4, §5.4).
+"""Direct inference-provider connectors — embeddings + rerank (docs/architecture.md §3.4, §5.4).
 
 The harness calls Cohere / Voyage / OpenAI **directly** (ES is no longer an inference gateway,
 §1.1) so we have fine-grained control over batching, rate limiting, retries, and — crucially —

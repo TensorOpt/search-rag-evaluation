@@ -24,7 +24,7 @@ packages = ["benchmark"]
 #   wait-for-es / fetch-data : real, pure-infra helper scripts (scripts/).
 #   index / run              : non-destructive placeholders, wired in Phase 11.
 # Helper scripts live under the top-level scripts/ package so that benchmark/
-# stays exactly the docs/experiment.md §11 module set.
+# stays exactly the docs/architecture.md §11 module set.
 # ---------------------------------------------------------------------------
 [tool.hatch.envs.eval]
 dependencies = []

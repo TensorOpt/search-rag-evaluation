@@ -1,6 +1,6 @@
 """ES adapter: LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter + build_searchers/build_rerankers.
 
-docs/experiment.md §3.3, §3.4, §3.5, §5. ES is a **plain vector/BM25 index** (§1.1) — it is NOT an
+docs/architecture.md §3.3, §3.4, §3.5, §5. ES is a **plain vector/BM25 index** (§1.1) — it is NOT an
 inference gateway. The harness computes embeddings via the provider connectors
 (``benchmark.providers.inference``, §3.4) and stores them in ``dense_vector`` fields; there is no
 ``_inference`` endpoint, no ``semantic_text`` field, and no ``register_inference``.
@@ -188,7 +188,7 @@ class ESIndexWriter(IndexWriter):
         self.client.indices.create(index=mapping.index_name, mappings=mapping.backend_mapping)
 
     def doc_count(self) -> int | None:
-        """Number of docs currently in the index, or ``None`` if the index does not exist (§8.0).
+        """Number of docs currently in the index, or ``None`` if the index does not exist (§6).
 
         The runner calls this to verify a fully-built index before an eval (``eval:run`` does not
         index). Uses the searchable count (post-refresh) — ``bulk_index`` refreshes at the end, so a
@@ -501,7 +501,7 @@ def build_searchers(
 
     When ``cache`` is set, each leaf is wrapped in a :class:`~benchmark.common.cache.CachingSearcher`
     keyed by the index fingerprint (:func:`_index_version`, fetched ONCE — cheap, and the index is
-    already known to exist, §8.0) and a per-leaf ``identity`` (``match:field`` for lexical;
+    already known to exist, §6) and a per-leaf ``identity`` (``match:field`` for lexical;
     ``knn:field:num_candidates=N:emb=<embedder cache_identity>`` for vector — the embedder identity
     makes a re-embed-into-the-same-index model swap a guaranteed miss, docs/caching_design.md §4/§5).
     ``cache is None`` returns bare leaves (full bypass; no fingerprint fetch, no identity built).

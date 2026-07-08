@@ -1,4 +1,4 @@
-"""Pure windowed ranking primitives — ``fuse_rrf_local`` + ``rerank_local`` (docs/experiment.md §3.7).
+"""Pure windowed ranking primitives — ``fuse_rrf_local`` + ``rerank_local`` (docs/architecture.md §3.7).
 
 Pure Python; imports only ``benchmark.common.models`` + stdlib. The shared bottom-layer home for the
 two windowed ranking helpers (merged from the former ``fusion.py`` + ``rerank.py``):

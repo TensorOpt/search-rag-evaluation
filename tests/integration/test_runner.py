@@ -1,4 +1,4 @@
-"""Live end-to-end runner + eval:index tests (docs/experiment.md §8.0, plan Phase 11).
+"""Live end-to-end runner + eval:index tests (docs/architecture.md §6, plan Phase 11).
 
 Marked ``integration``; SKIPS (never fails) when ES is unreachable, when ``COHERE_KEY`` is absent, or
 on a provider ``ProviderError`` (an env constraint — auth/rate limit). ES is a plain vector/BM25 index
@@ -133,7 +133,7 @@ def test_run_end_to_end_produces_all_artifacts(es_index: str, tmp_path: Path) ->
     cfg = resolve_config(_trimmed_config(es_index, _require_cohere()))
     runner = ExperimentRunner()
     try:
-        runner.build_index(cfg)  # eval:index first — eval:run REQUIRES a pre-built index (§8.0)
+        runner.build_index(cfg)  # eval:index first — eval:run REQUIRES a pre-built index (§6)
         runner.run(cfg, output_dir=str(tmp_path))
     except ProviderError as exc:
         pytest.skip(f"cohere embedding/rerank unavailable (env constraint): {exc}")

@@ -8,7 +8,7 @@ both over the shared ``_search``/``_msearch`` helpers' client-side score-desc/do
 ``build_searchers``/``build_rerankers`` leaf builders (replacing the deleted ``_ESSearcherFactory``); and
 a client-side ``HybridSearch`` == ``fuse_rrf_local`` cross-check. The domain ``Indexer`` orchestration
 (embed-at-ingest, ensure→index call order) is covered in ``tests/unit/test_indexing.py``. See
-docs/experiment.md §3.3-§3.7, §5.
+docs/architecture.md §3.3-§3.7, §5.
 """
 
 from __future__ import annotations

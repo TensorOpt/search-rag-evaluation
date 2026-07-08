@@ -7,7 +7,7 @@ cluster is unreachable, when a required provider API key is absent, or on a prov
 (``LexicalSearcher`` + ``bulk_index`` chunking), the semantic path (client-side embed → ES ``knn``
 over a live ``dense_vector`` field, via a real embedding connector), and ``ESReranker`` over a real
 provider ``RerankClient``. The semantic + rerank tests need a Cohere API key
-(``COHERE_KEY``). Does NOT depend on ``WandsDataset``. See docs/experiment.md §5.2, §5.3, §5.4.
+(``COHERE_KEY``). Does NOT depend on ``WandsDataset``. See docs/architecture.md §5.2, §5.3, §5.4.
 """
 
 from __future__ import annotations

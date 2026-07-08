@@ -1,4 +1,4 @@
-"""Core abstraction seams (docs/experiment.md §3.2-§3.5).
+"""Core abstraction seams (docs/architecture.md §3.2-§3.5).
 
 Two kinds of seam live here:
 
@@ -203,7 +203,7 @@ class IndexWriter(Protocol):
     field name; ``create_mapping`` translates the dataset ``FieldSchema`` (+ the per-field vector
     dims) into the ``IndexMapping``; ``doc_count`` returns the number of docs currently in the index
     (``None`` if the index does not exist) — the runner uses it to verify a fully-built index before
-    an eval (§8.0), since ``eval:run`` does NOT (re)index.
+    an eval (§6), since ``eval:run`` does NOT (re)index.
     """
 
     index: str

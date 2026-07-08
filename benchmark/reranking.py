@@ -1,4 +1,4 @@
-"""Rerank-client factory (d): ``make_reranker`` + the provider->connector dispatch table (docs/experiment.md §5.4).
+"""Rerank-client factory (d): ``make_reranker`` + the provider->connector dispatch table (docs/architecture.md §5.4).
 
 Layer (d): depends on ``providers`` (the concrete connectors in ``benchmark.providers.inference``) +
 ``common``. The dispatch table lived in the former ``providers.py``; it moves here so the

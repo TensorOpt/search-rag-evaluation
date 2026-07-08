@@ -1,4 +1,4 @@
-"""Evaluator, Metrics, and QrelIndex over graded relevance (docs/experiment.md §7). Phase 2.
+"""Evaluator, Metrics, and QrelIndex over graded relevance (docs/methodology.md §7). Phase 2.
 
 Per-query metrics computed once and returned in memory keyed by ``query_id`` so §8 statistics
 reuse them without re-parsing CSV. The point/quality metrics (``avg_relevance``/``ndcg@10``/

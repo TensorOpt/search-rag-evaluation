@@ -1,1 +1,1 @@
-"""Search-relevance benchmark harness package (see docs/experiment.md §11)."""
+"""Search-relevance benchmark harness package (see docs/architecture.md §11)."""

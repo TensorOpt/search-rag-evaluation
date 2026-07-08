@@ -1,4 +1,4 @@
-"""Offline unit tests for the provider connectors (docs/experiment.md §3.4, §5.4).
+"""Offline unit tests for the provider connectors (docs/architecture.md §3.4, §5.4).
 
 ``urllib.request.urlopen`` is MOCKED — NO network. Covers, per provider: request URL + method +
 bearer auth + JSON body shape; response parsing/index-alignment; document-vs-query input mode;

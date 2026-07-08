@@ -1,4 +1,4 @@
-"""Resolved-config value types + config load/resolve + pipeline assembly + adapter factories (docs/experiment.md §4, §10, §11). Phase 6.
+"""Resolved-config value types + config load/resolve + pipeline assembly + adapter factories (docs/architecture.md §4, §10, §11). Phase 6.
 
 This module is the whole configuration layer. It holds:
 
@@ -236,7 +236,7 @@ class ResolvedConfig:
     cache: CacheCfg = CacheCfg()
 
     def pipelines(self) -> list[PipelineCfg]:
-        """The run's pipelines, baseline first (§8.0)."""
+        """The run's pipelines, baseline first (§6)."""
         return [self.baseline, *self.variants]
 
 

@@ -1,4 +1,4 @@
-"""CSV/JSON artifact writers with fixed schemas (docs/experiment.md §9). Phase 7.
+"""CSV/JSON artifact writers with fixed schemas (docs/architecture.md §9). Phase 7.
 
 Four writers, each into an output dir (default ``results``), naming files with the run's single
 UTC timestamp ``YYYYMMDDTHHMMSSZ`` (§9). The three CSVs are ONE file per run (all pipelines /
@@ -130,7 +130,7 @@ def write_results_csv(
     ``results_by_variant`` maps pipeline id -> its ranked results (baseline first, then variants in
     config order). Each row is prefixed with the variant id. ``position`` is derived here as the
     1-based index into each ``RankedResult.docs`` (§3.1); the number of rows per query is whatever the
-    pipeline returned (already ``<= top_k``, §8.0).
+    pipeline returned (already ``<= top_k``, §6).
     """
     path = _artifact_path(output_dir, f"result_{timestamp}.csv")
     handle, writer = _open_csv_writer(path)

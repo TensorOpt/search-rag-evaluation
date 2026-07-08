@@ -1,4 +1,4 @@
-"""Offline ExperimentRunner tests (docs/experiment.md §8.0, plan Phase 11).
+"""Offline ExperimentRunner tests (docs/architecture.md §6, plan Phase 11).
 
 Drives :class:`benchmark.runner.ExperimentRunner` with FAKES — NO ES, NO network. The lazy config
 factories (``load_dataset`` / ``make_index_writer`` / ``make_embedders`` / ``make_rerankers`` /
@@ -115,7 +115,7 @@ class FakeIndexWriter(IndexWriter):
         self.ensured = False
         self.indexed: list[Document] = []
         # doc_count() default == the FakeDataset corpus size, so run()'s "fully indexed" check
-        # (index count == dataset count, §8.0) passes; the failure tests set it to None/other.
+        # (index count == dataset count, §6) passes; the failure tests set it to None/other.
         self.doc_count_value: int | None = len(_DOCS)
 
     def doc_count(self) -> int | None:
@@ -385,7 +385,7 @@ def test_build_index_builds_and_populates(
     assert writer is patched_factories
     # One dense_vector field per embedder (§5.2); the corpus was embedded + streamed in.
     assert mapping.sem_fields == {"e5": "sem__e5"}
-    assert set(embedders) == {"e5"}  # the embedder connector registry (§8.0)
+    assert set(embedders) == {"e5"}  # the embedder connector registry (§6)
     assert writer.ensured is True
     assert len(writer.indexed) == len(_DOCS)
     assert all("sem__e5" in doc.fields for doc in writer.indexed)

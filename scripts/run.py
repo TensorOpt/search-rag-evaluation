@@ -1,8 +1,8 @@
-"""eval:run — run the whole benchmark end to end (docs/experiment.md §8.0). Phase 11.
+"""eval:run — run the whole benchmark end to end (docs/architecture.md §6). Phase 11.
 
 Loads the explicit §10 config, then drives :class:`benchmark.runner.ExperimentRunner` over it:
 verify the index (built by ``eval:index``) is fully populated → one ``run_one`` per pipeline
-(baseline first) → the family-wide comparator pass → run-config JSON (§8.0). ``eval:run`` does NOT
+(baseline first) → the family-wide comparator pass → run-config JSON (§6). ``eval:run`` does NOT
 index; if the index is missing or partial it exits non-zero with a clear message (build it with
 ``eval:index`` first). ``--dry-run`` prints the pipeline list (baseline first) and writes NOTHING.
 """
@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(timestamp=cfg.timestamp)
 
     if args.dry_run:
-        # Baseline first, then the named variants in config order (§8.0/§10). Write nothing.
+        # Baseline first, then the named variants in config order (§6/§10). Write nothing.
         for position, pcfg in enumerate(cfg.pipelines()):
             marker = "baseline" if pcfg.id == cfg.baseline_id else f"variant {position}"
             log.info("pipeline %d: %s (%s)", position, pcfg.id, marker)

@@ -10,13 +10,15 @@ strategy improves over a **BM25 baseline** on a fixed dataset + qrel set. First 
 inference: it computes embeddings and rerank scores via **provider connectors** (Cohere, Voyage,
 OpenAI) in `benchmark/providers/inference.py` — ES runs no `_inference`.
 
-- **`docs/experiment.md`** — authoritative experimental design (abstractions, metrics, statistics).
-  **This is the source of truth.** When code and this doc disagree on a name or schema, the doc wins.
+- **`docs/methodology.md`** — authoritative for the evaluation **science**: objective, variants-as-
+  hypotheses, the IR model/glossary, metrics, statistics (the WHAT/WHY).
+- **`docs/architecture.md`** — authoritative for the **blueprint**: abstractions/class hierarchy, ES
+  mapping, caching, data flow + single execution path, artifact schemas, config, module layout,
+  extension guide (the HOW).
+- **These two are the source of truth.** When code and a doc disagree on a name or schema, the doc
+  wins. (`docs/{experiment,plan,caching_design,refactor_design,methodology_fixes}.md` are retired,
+  frozen historical records — not authoritative.)
 - **`README.md`** — operational guide: how to run the evals end to end.
-
-Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-compose.yml`,
-`benchmark/` package skeleton, `config.yaml`). Build proceeds phase-by-phase per
-[`docs/plan.md`](docs/plan.md); each phase ends in a user sign-off + commit.
 
 ## Stack
 
@@ -38,7 +40,7 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   `Indexer`/factory (the domain `Indexer` is backend-agnostic and shared).
 - **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. Binary-relevance
   threshold for precision/recall is `gain >= 0.5` (Partial or Exact). A **MISSING** judgement (no
-  qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (§7) for the CONDENSED
+  qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (methodology.md §7) for the CONDENSED
   metrics (`avg_relevance`/`ndcg@10`/`precision@10`) — **NOT** treated as irrelevant; only a
   **judged** `0.0` is irrelevant. **Recall is STANDARD** (`|judged-relevant ∩ result.docs[:k]| / R`,
   `R` from qrels) at cutoffs `{10, 50, 100}` — invariant-safe: it never scores a MISSING doc as
@@ -47,15 +49,14 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   top-10) are recorded.
 - **Uniform retrieval depth (kill the confound).** Every system retrieves/returns to ONE depth:
   `fuser.window == rerank_window_size == top_k` (WANDS: 100), reranker `top_n >= W`. No knob may make
-  depth co-vary with the rerank/fusion treatment (§5.3).
-- **Default significance test = mean-δ sign-flip permutation** (§8.2): the p-value, point estimate,
+  depth co-vary with the rerank/fusion treatment (architecture.md §5.3).
+- **Default significance test = mean-δ sign-flip permutation** (methodology.md §8.2): the p-value, point estimate,
   and CI share one estimand (the mean paired difference). `wilcoxon` stays selectable.
 - **Exact CSV artifact schemas (do not rename/reorder fields) — one file per run, all pipelines:**
   - `result_{timestamp}.csv` — `variant, query_id, product_id, score, position`
   - `metrics_{timestamp}.csv` — `variant, query_id, avg_relevance, ndcg@10, recall@10, recall@50, recall@100, precision@10, n_results, n_scored, n_missing`
   - `comparison_{timestamp}.csv` — `system_a, system_b, metric, value_a, value_b, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, in_family, p_value_adjusted, significant, n_common`
-    (FDR family = `contrast.family × fdr_metrics`; **`in_family=false ⟺ p_value_adjusted and significant BOTH empty`**, §8.3.)
-- **RRF k-sweep** is over `rank_constant` ∈ {10,20,…,100}.
+    (FDR family = `contrast.family × fdr_metrics`; **`in_family=false ⟺ p_value_adjusted and significant BOTH empty`**, methodology.md §8.3.)
 
 ## Conventions
 
@@ -66,7 +67,7 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   `_BaseReranker(_Connector, RerankClient)`, `LexicalSearcher(Searcher)`), **even for structural
   `Protocol`s** where Python does not require it. This makes the interface→implementations mapping
   greppable/navigable (find an interface's implementors by its subclasses) and lets mypy verify
-  conformance at the class definition — the lazy dotted-target factories (§11) return `Any`, so an
+  conformance at the class definition — the lazy dotted-target factories (architecture.md §11) return `Any`, so an
   undeclared structural implementation's drift would otherwise go statically unchecked.
 - **Move with certainty.** Prefer resolving unknowns at build time over runtime. If a dependency's
   capability/version/behavior is uncertain, pin the version that guarantees it and call it directly —
@@ -92,5 +93,6 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 - **Use logging, not `print()`.** Get a logger via `benchmark.common.logging_setup.get_logger(__name__)`
   and call `setup_logging()` once at each entry point — it logs to the console and to
   `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.
-- Before changing a name/schema, check it against `docs/experiment.md` and keep both files consistent.
+- Before changing a name/schema, check it against `docs/methodology.md` (metrics/stats) or
+  `docs/architecture.md` (abstractions/schemas/config/layout) and keep code and docs consistent.
 - Don't commit `dataset/`, `results/`, or `logs/` artifacts.

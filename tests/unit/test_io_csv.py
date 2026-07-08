@@ -1,4 +1,4 @@
-"""Phase 7 — golden-file + behavioral tests for benchmark.io_csv (docs/experiment.md §9, §9.1).
+"""Phase 7 — golden-file + behavioral tests for benchmark.io_csv (docs/architecture.md §9, §9.1).
 
 The three CSV writers are asserted BYTE-FOR-BYTE against committed golden files (exact headers +
 field order + the NaN->empty and degenerate serializations). ``write_run_config`` is asserted by
@@ -73,7 +73,7 @@ def test_result_csv_header_and_position(tmp_path: Path) -> None:
 
 
 def test_result_csv_respects_returned_length(tmp_path: Path) -> None:
-    """Rows per query equal the returned doc count (pipeline already truncates to top_k, §8.0)."""
+    """Rows per query equal the returned doc count (pipeline already truncates to top_k, §6)."""
     docs = [ScoredDoc(f"d{i}", float(i)) for i in range(5)]
     path = write_results_csv({"bm25": [RankedResult("q1", docs)]}, TIMESTAMP, output_dir=tmp_path)
     data_rows = path.read_text(encoding="utf-8").splitlines()[1:]

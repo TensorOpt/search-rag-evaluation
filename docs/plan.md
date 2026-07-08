@@ -1,5 +1,7 @@
 # Search-Relevance Benchmark — Phased Development Plan
 
+> **Historical design record; implemented.** Authoritative docs: docs/methodology.md + docs/architecture.md.
+
 > Status: build plan v1 · Owner: TensorOpt · License: MIT
 > Authoritative design: [`docs/experiment.md`](experiment.md). Operational guide: [`README.md`](../README.md). Repo invariants: [`CLAUDE.md`](../CLAUDE.md).
 > Where this plan and `docs/experiment.md` disagree on a name, schema, or sequencing, **the design doc wins** — this plan only schedules the build; it does not redefine it.

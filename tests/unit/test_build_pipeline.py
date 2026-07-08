@@ -1,4 +1,4 @@
-"""build_pipeline object-graph tests (docs/experiment.md §4, §10, plan Phase 6).
+"""build_pipeline object-graph tests (docs/architecture.md §4, §10, plan Phase 6).
 
 Builds each explicit pipeline shape (single lexical/vector leaf; HybridSearch+RRFFuser; +reranker
 with rerank_window_size) from pre-built fake ``{name: Searcher}`` / ``{name: Reranker}`` maps passed

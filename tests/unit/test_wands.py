@@ -1,4 +1,4 @@
-"""Phase 8 unit tests for benchmark.datasets.wands (docs/experiment.md §3.2, §5.1, §7)."""
+"""Phase 8 unit tests for benchmark.datasets.wands (docs/architecture.md §3.2, §5.1 + docs/methodology.md §7)."""
 
 from __future__ import annotations
 

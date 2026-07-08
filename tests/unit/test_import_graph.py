@@ -1,6 +1,6 @@
 """Import-graph test — automates the §11 module-layout invariant (§1.4(3) Generality).
 
-docs/experiment.md §11: "search, indexing, evaluation.metrics, evaluation.stats, runner, io_csv
+docs/architecture.md §11: "search, indexing, evaluation.metrics, evaluation.stats, runner, io_csv
 import only common (models/protocols/ranking + the cross-cutting leaf logging_setup) — never
 datasets/*, providers/*, embedding, or reranking." and config.py "imports search (the composers) +
 evaluation.stats + common only, and still imports no adapter at import time (the factories resolve

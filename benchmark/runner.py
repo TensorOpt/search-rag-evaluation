@@ -1,8 +1,8 @@
-"""The single execution path — ``ExperimentRunner`` (docs/experiment.md §8.0). Phase 11.
+"""The single execution path — ``ExperimentRunner`` (docs/architecture.md §6). Phase 11.
 
 One runner, config-only differences: every pipeline — the baseline included — traverses the
 IDENTICAL ``run_one`` code path; only the :class:`~benchmark.config.PipelineCfg` differs (the DRY
-guarantee, §8.0). The runner is a flat loop over the explicit config pipelines (baseline first) —
+guarantee, §6). The runner is a flat loop over the explicit config pipelines (baseline first) —
 there is NO matrix expansion, NO sweep, and NO selection phase.
 
 Two entry points, two paths. ``eval:index`` (``scripts/index.py``) BUILDS the index via
@@ -10,7 +10,7 @@ Two entry points, two paths. ``eval:index`` (``scripts/index.py``) BUILDS the in
 ``indexing.Indexer`` discovers dims → ensure_index → embed the corpus → bulk_index, delegating
 backend bits to the injected ``IndexWriter``). ``eval:run`` (:meth:`ExperimentRunner.run`) does NOT
 index — its setup prelude VERIFIES a pre-built index (doc count == the dataset's, else
-:class:`IndexNotReadyError`, §8.0), builds the full leaf ``Searcher`` / ``Reranker`` maps (wired to
+:class:`IndexNotReadyError`, §6), builds the full leaf ``Searcher`` / ``Reranker`` maps (wired to
 the embedder/reranker connectors) over that index's field names, freezes the shared query set, and
 builds the :class:`QrelIndex` + :class:`Evaluator` once.
 
@@ -45,7 +45,7 @@ logger = get_logger(__name__)
 
 
 class IndexNotReadyError(RuntimeError):
-    """``eval:run`` was invoked but the index is missing or not fully built (§8.0).
+    """``eval:run`` was invoked but the index is missing or not fully built (§6).
 
     ``eval:run`` does NOT (re)index — it requires an index already populated by ``eval:index``. This
     is raised when the target index does not exist, or when its doc count does not equal the
@@ -54,7 +54,7 @@ class IndexNotReadyError(RuntimeError):
 
 
 class ExperimentRunner:
-    """Runs the whole benchmark for a resolved config, the single execution path (§8.0)."""
+    """Runs the whole benchmark for a resolved config, the single execution path (§6)."""
 
     def build_index(self, cfg: ResolvedConfig) -> tuple[Any, Any, Any, dict[str, Any]]:
         """Build the index (§3.5 ensure_index→embed→bulk_index); return (dataset, writer, mapping, embedders).
@@ -90,7 +90,7 @@ class ExperimentRunner:
                 cache.close()
 
     def run(self, cfg: ResolvedConfig, *, output_dir: str = DEFAULT_OUTPUT_DIR) -> None:
-        """Run every pipeline baseline-first, then the family-wide comparator pass (§8.0).
+        """Run every pipeline baseline-first, then the family-wide comparator pass (§6).
 
         ``eval:run`` does NOT (re)index — it REQUIRES an index already built by ``eval:index``. Before
         any pipeline runs, it verifies the index exists and holds the whole corpus (its doc count
@@ -109,7 +109,7 @@ class ExperimentRunner:
             mapping = Indexer(writer, list(embedders.values())).mapping(dataset)
 
             # Require a fully-built index (built by eval:index). Compare the index doc count to the
-            # dataset's (§8.0) — fail fast on a missing or partial index rather than re-indexing here.
+            # dataset's (§6) — fail fast on a missing or partial index rather than re-indexing here.
             indexed = writer.doc_count()
             expected = sum(1 for _ in dataset.documents())
             if indexed is None:
@@ -149,7 +149,7 @@ class ExperimentRunner:
             per_query: dict[str, dict[str, Metrics]] = {}
 
             def run_one(pcfg: PipelineCfg) -> None:
-                # R0 — the W <= top_n cap (§5.4/§8.0). No endpoint registration: the reranker is a
+                # R0 — the W <= top_n cap (§5.4/§6). No endpoint registration: the reranker is a
                 # provider connector (already built in `rerankers`); `top_n` is a plain settings key
                 # capping how many candidates the provider scores per request.
                 if pcfg.reranker is not None:

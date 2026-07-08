@@ -1,4 +1,4 @@
-"""Embedder factory (c): ``make_embedder`` + the provider->connector dispatch table (docs/experiment.md §3.4).
+"""Embedder factory (c): ``make_embedder`` + the provider->connector dispatch table (docs/architecture.md §3.4).
 
 Layer (c): depends on ``providers`` (the concrete connectors in ``benchmark.providers.inference``) +
 ``common``. The dispatch table lived in the former ``providers.py``; it moves here so the

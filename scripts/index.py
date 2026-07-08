@@ -1,4 +1,4 @@
-"""eval:index — build + populate the ES index (docs/experiment.md §3.5). Phase 11.
+"""eval:index — build + populate the ES index (docs/architecture.md §3.5). Phase 11.
 
 Drives the ONE shared index-build path (:meth:`benchmark.runner.ExperimentRunner.build_index`):
 instantiate each embedder connector → ``ensure_index`` (one ``dense_vector`` field per embedder) →

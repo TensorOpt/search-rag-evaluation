@@ -1,4 +1,4 @@
-"""Comparator: bootstrap CI, permutation/Wilcoxon p-value, FDR decision (docs/experiment.md §8). Phase 3.
+"""Comparator: bootstrap CI, permutation/Wilcoxon p-value, FDR decision (docs/methodology.md §8). Phase 3.
 
 The :class:`Comparator` scores an explicit list of :class:`Contrast` (each a pair of system ids
 ``a``/``b`` with ``delta = value(a) − value(b)``), per metric, and produces one

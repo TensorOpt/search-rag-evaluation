@@ -1,4 +1,4 @@
-"""Backend-agnostic composers of the composite retrieval model (docs/experiment.md §3.6/§3.7).
+"""Backend-agnostic composers of the composite retrieval model (docs/architecture.md §3.6/§3.7).
 
 Everything that produces a ranked list is a ``Searcher`` (§3.3). The three concrete composers
 here wire leaf ``Searcher``s (the ES-specific ``LexicalSearcher``/``VectorSearch``, Phase 9/10)
@@ -116,7 +116,7 @@ class SearchPipeline(Searcher):
         return self.reranker.rerank(query, candidates)[:top_k]
 
     def bulk_search(self, queries: Sequence[str], *, top_k: int) -> list[list[ScoredDoc]]:
-        """Batch retrieval over the whole query set; rerank per query (aligned, §3.6/§8.0).
+        """Batch retrieval over the whole query set; rerank per query (aligned, §3.6/§6).
 
         Retrieval is batched via ``retriever.bulk_search`` (so ES leaves batch via ``_msearch``).
         Reranking stays PER QUERY: the provider rerank call is per-query, so batching it is a future

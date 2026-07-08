@@ -1,5 +1,7 @@
 # Persistent Inference Cache — Design
 
+> **Historical design record; implemented.** Authoritative docs: docs/methodology.md + docs/architecture.md.
+
 > Status: finalized spec (approved for implementation). Companion to `docs/experiment.md`
 > (authoritative). Where this doc and the experiment design disagree on a name/schema, **the
 > experiment doc wins**. Scope: DESIGN ONLY. No implementation code ships with this doc;

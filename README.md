@@ -2,7 +2,7 @@
 
 A reproducible harness for measuring how much different retrieval strategies improve search relevance over a **BM25 baseline**, on a fixed dataset and qrel set. It indexes documents into ElasticSearch, runs each variant (semantic, hybrid + RRF, and reranked combinations) through **one shared pipeline**, scores them with graded relevance metrics (`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`, `recall@100`, `precision@10`), and emits per-run CSV artifacts plus a paired statistical comparison against the baseline. The first concrete instantiation uses **WANDS** (Wayfair ANnotation Dataset for Search) on ElasticSearch **>= 8.15**, used as a **plain vector + BM25 index**: the harness embeds the corpus and queries via provider connectors (Cohere / Voyage / OpenAI) and retrieves with BM25 `match` + `knn` over `dense_vector` fields.
 
-This README is the operational guide for **running the evals**. For the full experimental design — abstractions, metric definitions, statistics, and the DRY single-execution-path argument — read [`docs/experiment.md`](docs/experiment.md). Where this guide and the design doc differ on a name, the design doc wins.
+This README is the operational guide for **running the evals**. The design lives in two authoritative docs: the **science** (metric definitions, statistics, variants-as-hypotheses) → [`docs/methodology.md`](docs/methodology.md); the **internals** (abstractions, ES mapping, caching, the DRY single-execution-path, artifact schemas, config, module layout) → [`docs/architecture.md`](docs/architecture.md). Where this guide and a design doc differ on a name, the design doc wins.
 
 ---
 
@@ -43,7 +43,7 @@ ls results/                     # result_* / metrics_* / comparison_* / run_conf
 docker compose down -v
 ```
 
-`hatch run eval:run` reads `config.yaml` — a set of **explicit, named pipelines** (a `baseline` plus named `variants`; no matrix expansion, no sweep) — executes every pipeline through the single `ExperimentRunner` path (baseline first), and writes the three CSV artifact types described below. Commands shown above are the intended CLI surface that the implementation satisfies; they mirror the design in [`docs/experiment.md`](docs/experiment.md).
+`hatch run eval:run` reads `config.yaml` — a set of **explicit, named pipelines** (a `baseline` plus named `variants`; no matrix expansion, no sweep) — executes every pipeline through the single `ExperimentRunner` path (baseline first), and writes the three CSV artifact types described below. Commands shown above are the intended CLI surface that the implementation satisfies; they mirror the design in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -107,11 +107,12 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 ├── docker-compose.yml         # single-node ElasticSearch
 ├── pyproject.toml             # hatch envs + scripts
 ├── docs/
-│   └── experiment.md          # authoritative design doc
+│   ├── methodology.md         # authoritative: evaluation science (metrics, statistics)
+│   └── architecture.md        # authoritative: blueprint (abstractions, ES, caching, schemas, layout)
 └── LICENSE                    # MIT
 ```
 
-Module names and responsibilities follow §11 of the design doc. The `a–g` layers form a strict acyclic engine (`common` ← `providers` ← `embedding`/`reranking` ← `indexing`/`search`/`evaluation`); the domain layers import only `common` abstractions at import time and consume concrete `providers` pieces injected at runtime. `config.py`, `runner.py`, `io_csv.py` are the composition layer above the engine: `config.py` (config value types + `build_pipeline` + loader) imports `search` for the composers, a one-way wiring edge, and selects adapters via its lazy dotted-target factories, so no engine module names an adapter.
+Module names and responsibilities follow architecture.md §11. The `a–g` layers form a strict acyclic engine (`common` ← `providers` ← `embedding`/`reranking` ← `indexing`/`search`/`evaluation`); the domain layers import only `common` abstractions at import time and consume concrete `providers` pieces injected at runtime. `config.py`, `runner.py`, `io_csv.py` are the composition layer above the engine: `config.py` (config value types + `build_pipeline` + loader) imports `search` for the composers, a one-way wiring edge, and selects adapters via its lazy dotted-target factories, so no engine module names an adapter.
 ---
 
 ## Install
@@ -187,7 +188,7 @@ services:
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
 ```
 
-The harness embeds the whole corpus with each configured embedder **before** searching — one `dense_vector` field per embedder (see §5.2 of the design doc). Rerankers need no setup: `ESReranker` calls the provider connector per query, and the harness asserts `rerank_window_size <= settings.top_n` before running each rerank pipeline.
+The harness embeds the whole corpus with each configured embedder **before** searching — one `dense_vector` field per embedder (see architecture.md §5.2). Rerankers need no setup: `ESReranker` calls the provider connector per query, and the harness asserts `rerank_window_size <= settings.top_n` before running each rerank pipeline.
 
 ---
 
@@ -214,7 +215,7 @@ mkdir -p dataset/wands
 cp /tmp/WANDS/dataset/query.csv /tmp/WANDS/dataset/product.csv /tmp/WANDS/dataset/label.csv dataset/wands/
 ```
 
-Note that the raw `label.csv` stores the **string** label (`Exact` / `Partial` / `Irrelevant`) and carries a leading `id` column; the numeric gains are **not** in the file. The `WandsDataset` adapter applies the `Exact/Partial/Irrelevant → 1.0/0.5/0.0` label-to-gain mapping at qrel emission (design §7) and concatenates name + description (+ features) into the canonical `search_text` field, so every variant ranks the same input text.
+Note that the raw `label.csv` stores the **string** label (`Exact` / `Partial` / `Irrelevant`) and carries a leading `id` column; the numeric gains are **not** in the file. The `WandsDataset` adapter applies the `Exact/Partial/Irrelevant → 1.0/0.5/0.0` label-to-gain mapping at qrel emission (methodology.md §7) and concatenates name + description (+ features) into the canonical `search_text` field, so every variant ranks the same input text.
 
 ---
 
@@ -309,7 +310,7 @@ One file for all contrasts. Each row is a contrast between two systems (the base
 - `significant` ∈ {`true`,`false`} — the **FDR decision** (`p_value_adjusted <= α`) at level `q = α = 0.05`. **Empty when `in_family=false`** (rule: `in_family=false ⟺ both `p_value_adjusted` and `significant` empty`).
 - `n_common` — the common-subset size for that metric (always present).
 
-> The CI lives in a different role from the significance flags and **may disagree** with them — this is expected under a step-up FDR procedure (see §8.3 of the design doc). The CI is descriptive; `significant` is the FDR gate, `significant_raw` is the uncorrected view. The FDR family is deliberately small — only the headline metrics (`ndcg@10` = ranking quality, `recall@100` = coverage) enter it, so near-collinear metrics do not inflate it; the rest are descriptive. The design uses FDR (not FWER/Holm) because this is an **exploratory** search for the best pipeline among many **correlated** configurations, where the cost of a false positive is low and asymmetric and BH keeps far more power than Bonferroni-style FWER.
+> The CI is descriptive effect-size context in a different role from the significance flags, and **may disagree** with them — expected under a step-up FDR procedure. `significant` is the FDR gate; `significant_raw` is the uncorrected view. The FDR family is deliberately small — only the headline metrics (`ndcg@10` = ranking quality, `recall@100` = coverage) enter it. Why FDR (not FWER/Holm), why a small family, the CI/flag disagreement, and the exact mean-δ estimand → methodology.md §8.
 
 ### `run_config_{timestamp}.json`
 
@@ -325,21 +326,23 @@ ls -1 results/
 
 ---
 
-## Configuration reference
+## Crafting `config.yaml`
 
-The config lives in `config.yaml` (YAML or JSON). It declares **explicit, named building blocks** — `services` (embedders, rerankers, searchers) and `pipelines` (a `baseline` plus a map of named `variants`). No axes, no expander, no sweep: the pipelines run are exactly the ones written.
+The config lives in `config.yaml` (YAML or JSON) and declares **explicit, named building blocks**.
+No axes, no expander, no sweep: the pipelines run are exactly the ones written, so you read the file
+top to bottom and see the whole experiment. `benchmark/config.py` parses + validates it into a
+`ResolvedConfig`; the runner iterates the baseline + explicit variants (baseline first). Full schema
++ validation rules → architecture.md §10.
 
 ```yaml
 dataset:
   name: wands
   path: ./dataset/wands
-services:                       # named, typed, reusable building blocks (embedders/rerankers are provider connectors)
+services:                       # named, typed, reusable building blocks
   - embedder: { name: cohere, provider: cohere, settings: { api_key: ${COHERE_KEY}, model_id: embed-english-v3.0 } }
-  - embedder: { name: voyage, provider: voyage, settings: { api_key: ${VOYAGE_KEY}, model_id: voyage-3.5 } }
   - reranker: { name: co-rr,  provider: cohere, settings: { api_key: ${COHERE_KEY}, model_id: rerank-v3.5, top_n: 100 } }
   - searcher: { name: bm25,        provider: elasticsearch, kind: lexical }
   - searcher: { name: semantic_co, provider: elasticsearch, kind: vector, embedder: cohere }
-  - searcher: { name: semantic_vo, provider: elasticsearch, kind: vector, embedder: voyage }
 indexer:
   provider: elasticsearch
   index: wands_bench
@@ -349,29 +352,78 @@ pipelines:
     retriever: bm25
   variants:                      # each is one explicit run; the map key is its id
     semantic_co:   { retriever: semantic_co }
-    semantic_vo:   { retriever: semantic_vo }
     hybrid_co_k60:
       retrievers: [bm25, semantic_co]
       fuser: { type: rrf, rank_constant: 60, window: 100 }
-    bm25_rerank:
-      retriever: bm25
-      reranker: co-rr
-      rerank_window_size: 100
+    bm25_rerank:        { retriever: bm25,        reranker: co-rr, rerank_window_size: 100 }
+    semantic_co_rerank: { retriever: semantic_co, reranker: co-rr, rerank_window_size: 100 }
     hybrid_co_rerank:
       retrievers: [bm25, semantic_co]
       fuser: { type: rrf, rank_constant: 60, window: 100 }
       reranker: co-rr
       rerank_window_size: 100
 stats:
-  test: wilcoxon
+  test: permutation              # mean-δ sign-flip permutation (default); wilcoxon selectable
   correction: bh                 # Benjamini-Hochberg FDR (default); by = Benjamini-Yekutieli
   alpha: 0.05                    # BOTH the raw per-test threshold AND the FDR target level q
-  bootstrap_B: 10000
+  bootstrap_B: 10000             # CI resamples AND permutation count; p-resolution floor 1/(B+1)
   ci_level: 0.95                 # UNADJUSTED per-comparison effect-size CI; NOT a gate
   seed: 1234
-cutoff: 10                       # metrics @10
-top_k: 100                       # results retrieved per query
+  contrasts:                     # explicit system_a vs system_b; absent => every variant vs baseline
+    - { a: semantic_co,        b: bm25,          family: true }
+    - { a: hybrid_co_k60,      b: semantic_co,   family: true }
+    - { a: hybrid_co_rerank,   b: semantic_co,   family: true }
+    - { a: bm25_rerank,        b: bm25,          family: true }
+    - { a: semantic_co_rerank, b: semantic_co,   family: true }
+    - { a: hybrid_co_rerank,   b: hybrid_co_k60, family: true }
+  fdr_metrics: [ndcg@10, recall@100]  # the ONLY metrics that enter the BH family
+cutoff: 10                       # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
+top_k: 100                       # uniform retrieval depth: fuser.window == rerank_window_size == top_k
+cache:                           # OPTIONAL: memoize embeddings/rerank/searcher results to .cache/
+  enabled: true
+  dir: .cache
 ```
+
+**`services` — the reusable building blocks.** Three kinds, each `name`d and referenced by name
+elsewhere:
+- **`embedder`** / **`reranker`** are **provider connectors** — the harness calls Cohere / Voyage /
+  OpenAI directly (ES runs no inference). `provider` picks the connector; `settings` carries
+  `model_id`, `api_key`, and optional `rate_limit.requests_per_minute` / `batch_size` / `dims`. A
+  reranker's **`top_n`** (the rank-window cap = candidates scored per request) is a plain `settings`
+  key; the harness asserts `rerank_window_size <= top_n` before each rerank pipeline. **OpenAI has no
+  reranker** (rejected at load).
+- **`searcher`** is a leaf retriever: `kind: lexical` (BM25) or `kind: vector` (references an
+  `embedder` by name). Add an embedding model by adding an `embedder` + a `vector` searcher, then
+  reindex (architecture.md §5.2/§12).
+- Secrets are `${VAR}` placeholders resolved from the environment at load — they never live in the
+  file.
+
+**`pipelines` — the baseline + named variants.** `baseline` is the reference every default comparison
+subtracts from; `variants` is a map of `id → pipeline spec` (the map key is the pipeline's artifact
+id). The six entries above are the full **{bm25, semantic, hybrid} × {rerank off, rerank on}**
+factorial — all six cells present, including the dense-only `semantic_co_rerank`. Each spec is one of:
+a single `retriever`; or `retrievers: [...]` (2+) with a `fuser` (RRF); optionally a `reranker` +
+`rerank_window_size`. There is no per-variant code — every spec is composed by the same
+`build_pipeline` (architecture.md §4). Want two RRF `k`s or two embedders? Write two named variants.
+
+**`stats` — the comparison regime.** `contrasts` turns the factorial into explicit hypotheses
+(each `a` vs `b`; `family: true` puts the row in the FDR family); absent, it defaults to
+every-variant-vs-baseline. `fdr_metrics` is the small set of headline metrics that enter the
+Benjamini-Hochberg family (default `ndcg@10` = ranking quality, `recall@100` = coverage) — everything
+else is reported as descriptive context. `test` is the default mean-δ sign-flip `permutation`
+(`wilcoxon` selectable), `correction` is `bh` (or `by`), `alpha` is both the raw and FDR threshold,
+`bootstrap_B` drives both the CI resamples and the permutation count, and `seed` makes it all
+reproducible. The science behind these choices → methodology.md §8.
+
+**`cutoff` / `top_k` — uniform depth (a load-bearing invariant).** `cutoff` is the point/quality
+cutoff (10). `top_k` is the **single retrieval depth every system shares**: the config keeps
+`fuser.window == rerank_window_size == top_k` so depth never co-varies with the rerank/fusion
+treatment (and enables `recall@100`). See architecture.md §5.3.
+
+**`cache` — an optional speed knob.** `cache: { enabled, dir }` memoizes embeddings / rerank scores /
+searcher result lists to a local sqlite file. It is a **pure-function** cache — enabling it never
+changes the numbers, only the speed — so it is not part of the experiment definition. Absent → a cold
+(disabled) run. See architecture.md §5.5 (and the [Caching](#caching-optional) section above).
 
 **Pipeline field rules** (validated at load; a violation raises a clear error):
 

@@ -1,4 +1,4 @@
-"""WandsDataset adapter: label->gain, search_text concat (docs/experiment.md §3.2, §5.1, §7). Phase 8.
+"""WandsDataset adapter: label->gain, search_text concat (docs/architecture.md §3.2, §5.1 + docs/methodology.md §7). Phase 8.
 
 Adapter deriving from the ``Dataset`` ABC (§3.2): reads the WANDS ``query.csv`` / ``product.csv`` /
 ``label.csv`` (all **tab-separated** despite the ``.csv`` extension — product descriptions contain

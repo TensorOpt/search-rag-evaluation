@@ -1,4 +1,4 @@
-"""Unit tests for benchmark.common.ranking — fuse_rrf_local + rerank_local (docs/experiment.md §3.7, §9.1).
+"""Unit tests for benchmark.common.ranking — fuse_rrf_local + rerank_local (docs/architecture.md §3.7, §9.1).
 
 Merged from the former test_fusion.py + test_rerank.py (the two pure windowed primitives now live in
 ``benchmark.common.ranking``). Behavioral assertions are unchanged.

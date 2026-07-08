@@ -1,5 +1,5 @@
 # Single-node ElasticSearch for local evaluation.
-# Image tag is >= 8.15 (hard floor, docs/experiment.md §1.1); do NOT downgrade.
+# Image tag is >= 8.15 (hard floor, docs/methodology.md §1.1); do NOT downgrade.
 # Security is relaxed for local eval only. Port 9200 published. Heap pinned.
 services:
   elasticsearch:

@@ -1,5 +1,7 @@
 # Refactor design — layered, domain-driven module reorganization
 
+> **Historical design record; implemented.** Authoritative docs: docs/methodology.md + docs/architecture.md.
+
 **Scope.** Pure module reorganization of `benchmark/` into the layered `a–g` structure. **No**
 behavior change, **no** metrics/stats math change, **no** change to the frozen CSV / `run_config`
 schemas. The offline test suite still passes; test files relocate to mirror the layout and update

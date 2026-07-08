@@ -1,4 +1,4 @@
-"""Pure frozen data models and shared enums (docs/experiment.md §3.1-§3.5). Phase 1.
+"""Pure frozen data models and shared enums (docs/architecture.md §3.1-§3.5). Phase 1.
 
 Plain frozen dataclasses + enums ONLY. No Protocols/ABCs and no business logic live here
 (the abstraction seams ``Searcher``/``Fuser``/``Reranker`` + the ingest Protocols are in

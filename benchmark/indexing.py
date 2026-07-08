@@ -1,4 +1,4 @@
-"""Domain indexing seam (a): the backend-agnostic ``Indexer`` + embed-at-ingest streaming (docs/experiment.md §3.5).
+"""Domain indexing seam (a): the backend-agnostic ``Indexer`` + embed-at-ingest streaming (docs/architecture.md §3.5).
 
 The orchestration that used to live in the ES adapter's ``ESIndexer.build`` is now a clean,
 backend-agnostic domain object. ``Indexer`` composes an injected :class:`~benchmark.common.protocols.IndexWriter`
@@ -44,7 +44,7 @@ class Indexer:
         return {embedder.id: self.writer.sem_field_name(embedder.id) for embedder in self.embedders}
 
     def mapping(self, dataset: Dataset) -> IndexMapping:
-        """The ``IndexMapping`` for QUERYING an already-built index (§8.0) — field names only.
+        """The ``IndexMapping`` for QUERYING an already-built index (§6) — field names only.
 
         No dim probe, no (re)indexing. ``eval:run`` uses this to name the leaf searchers' fields
         against an index a prior ``eval:index`` populated; ``backend_mapping`` (used only to CREATE

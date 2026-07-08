@@ -1,4 +1,4 @@
-"""Composite-model composer tests (docs/experiment.md §3.6/§3.7, plan Phase 5).
+"""Composite-model composer tests (docs/architecture.md §3.6/§3.7, plan Phase 5).
 
 Exercises the three backend-agnostic composers against ``FakeSearcher``/``FakeReranker``:
 ``RRFFuser`` fuses, ``HybridSearch`` retrieves-at-window then fuses then truncates,

@@ -1,4 +1,4 @@
-"""Offline unit tests for the domain ``benchmark.indexing.Indexer`` (docs/experiment.md §3.5).
+"""Offline unit tests for the domain ``benchmark.indexing.Indexer`` (docs/architecture.md §3.5).
 
 The backend-agnostic ``Indexer`` orchestration was split out of the old ES ``ESIndexer.build``: it
 discovers each embedder's dim, asks the injected ``IndexWriter`` for the ``IndexMapping``, ensures the

@@ -1,4 +1,4 @@
-"""Phase 1 unit tests for benchmark.models (docs/experiment.md §3.1-§3.5)."""
+"""Phase 1 unit tests for benchmark.models (docs/architecture.md §3.1-§3.5)."""
 
 from __future__ import annotations
 

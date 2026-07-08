@@ -1,4 +1,4 @@
-"""Config load/resolve, ${VAR} substitution, service registry, pipeline validation, factory dispatch (docs/experiment.md §10, §11, plan Phase 6).
+"""Config load/resolve, ${VAR} substitution, service registry, pipeline validation, factory dispatch (docs/architecture.md §10, §11, plan Phase 6).
 
 All offline: no adapter module is imported (the factories dispatch to dotted-path targets and are
 never resolved here). Exercises env-var substitution, the typed services registry, every §10

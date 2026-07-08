@@ -1,4 +1,4 @@
-"""Unit tests for benchmark.common.protocols (docs/experiment.md §3.2-§3.5).
+"""Unit tests for benchmark.common.protocols (docs/architecture.md §3.2-§3.5).
 
 Two seam kinds:
 - structural Protocols (``Embedder``, ``RerankClient``, ``IndexWriter``): a trivial in-test class
