@@ -137,7 +137,7 @@ def test_condensed_reaches_past_rank_ten():
     #   n_scored = 10, n_missing = 2 (the two missing docs in the scanned prefix, ranks 1-2).
     #   All 10 condensed gains are 1.0 -> a perfect top-10. R = 10 judged relevant.
     #   IDCG@10 = Σ_{i=1..10} 1/log2(i+1); DCG over condensed == IDCG -> nDCG == 1.0.
-    # Under the CONDENSED policy (P0-2) recall slices the SAME condensed eval list (MISSING dropped):
+    # Under the CONDENSED policy recall slices the SAME condensed eval list (MISSING dropped):
     #   the condensed list is [p0..p9] (all 10 judged), so recall@10 = 10/R = 10/10 = 1.0. The two
     #   MISSING docs are dropped, NOT scored — recall@50/@100 are likewise 1.0.
     judged = [Qrel("q1", f"p{i}", 1.0) for i in range(10)]
@@ -319,7 +319,7 @@ def test_score_run_keyed_by_query_id():
     assert all(isinstance(v, Metrics) for v in out.values())
 
 
-# --- P0-2: one uniform policy over all metrics -----------------------------------------------
+# --- one uniform policy over all metrics -----------------------------------------------
 
 
 @pytest.mark.parametrize("unjudged", ["condensed", "irrelevant"])
@@ -377,7 +377,7 @@ def test_relevance_threshold_injected_into_qrelindex():
     assert idx.relevant_count("q1") == 1
 
 
-# --- P0-3: qrels digest ------------------------------------------------------------------------
+# --- qrels digest ------------------------------------------------------------------------
 
 
 def test_qrels_digest_stable_and_sensitive():
@@ -393,7 +393,7 @@ def test_qrels_digest_stable_and_sensitive():
 
 
 def test_recall_cutoffs_independent_of_cutoff():
-    # P2-2: `cutoff` governs ONLY the point metrics; RECALL_CUTOFFS are independent and untruncated
+    # `cutoff` governs ONLY the point metrics; RECALL_CUTOFFS are independent and untruncated
     # by it. Two evaluators with different cutoffs produce the SAME recall@k.
     judged = [Qrel("q1", f"p{i}", 1.0) for i in range(60)]
     qrels = QrelIndex(judged)
@@ -413,7 +413,7 @@ def test_custom_cutoff_condensed_denominator():
     # p2(1.0), p3(1.0).
     #   scan: p1 judged (1), p_miss skipped (n_missing=1), p2 judged (2) -> stop at k=2.
     #   condensed = [1.0, 1.0], n_scored = 2. avg = 2/2 = 1.0. precision = 2/2 = 1.0.
-    # STANDARD recall@10 (Fix 4) is INDEPENDENT of the condensed cutoff: it scans result.docs[:10] =
+    # STANDARD recall@10 is INDEPENDENT of the condensed cutoff: it scans result.docs[:10] =
     #   all 4 returned; relevant hits = p1, p2, p3 = 3; R = 3 -> recall@10 = 3/3 = 1.0.
     qrels = QrelIndex(
         [Qrel("q1", "p1", 1.0), Qrel("q1", "p2", 1.0), Qrel("q1", "p3", 1.0)]

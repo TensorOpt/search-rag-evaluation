@@ -1,8 +1,8 @@
-"""Offline tests for the P1-3 stage-latency profiling Decorators (docs/architecture.md §5.5).
+"""Offline tests for the stage-latency profiling Decorators (docs/architecture.md §5.5).
 
 The timing Decorators wrap the ``Searcher`` / ``Reranker`` seams and record per-call wall-clock
 WITHOUT changing the result — pass-through fakes prove the wrapped output equals the inner's and that
-one sample is recorded per call (retrieval batch-amortized, rerank per query, SF-3). ``summarize``
+one sample is recorded per call (retrieval batch-amortized, rerank per query). ``summarize``
 converts seconds -> ms stats; ``time.perf_counter`` is patched so the assertions are deterministic.
 """
 
@@ -48,7 +48,7 @@ def test_timing_searcher_passes_through_and_records_one_sample_per_call(
 
     assert timed.search("q", top_k=2) == _DOCS[:2]  # result unchanged
     # The inner's bulk_search (ABC default) loops its OWN search internally; the timer wraps the whole
-    # batch in ONE sample (batch-amortized, SF-3), not one per query.
+    # batch in ONE sample (batch-amortized), not one per query.
     assert timed.bulk_search(["q1", "q2"], top_k=3) == [_DOCS, _DOCS]
     assert timed.samples == pytest.approx([0.5, 0.2])  # one sample per timer call
 

@@ -24,7 +24,7 @@ Serialization rules (fixed so golden files are stable, §9/CLAUDE.md):
 - ``comparison``: one row per (contrast, canonical metric). ``value_a``/``value_b``/``delta``/CI are
   numeric, or EMPTY for an empty paired set (``None``, §8.1). ``significant_raw``/``in_family`` are
   lowercase ``true``/``false``; ``significant`` is ``true``/``false`` for family rows and EMPTY for
-  non-family rows (M3); ``p_value`` is numeric, ``p_value_adjusted`` numeric for family rows and
+  non-family rows; ``p_value`` is numeric, ``p_value_adjusted`` numeric for family rows and
   EMPTY otherwise; ``n_common`` is a plain int.
 - :func:`write_run_config` serializes the fully-resolved config via ``dataclasses.asdict`` +
   ``json.dumps`` (deterministic, ``sort_keys=True``, with ``default=str`` catching any non-JSON
@@ -103,10 +103,10 @@ def _float_cell(value: float | None) -> str:
 
 
 def _bool_cell(value: bool | None) -> str:
-    """Serialize a boolean flag as lowercase ``true``/``false``; ``None`` -> EMPTY (§9, M3).
+    """Serialize a boolean flag as lowercase ``true``/``false``; ``None`` -> EMPTY (§9).
 
     ``significant`` is ``None`` on non-family rows (``in_family=false``) and serializes empty, so the
-    M3 rule ``in_family == false ⟺ empty p_value_adjusted AND empty significant`` holds. ``in_family``
+    rule ``in_family == false ⟺ empty p_value_adjusted AND empty significant`` holds. ``in_family``
     and ``significant_raw`` are plain bools (never ``None``).
     """
     if value is None:
@@ -185,7 +185,7 @@ def write_comparison_csv(
     variant-vs-variant contrast is written the same way). ``value_a``/``value_b``/``delta``/CI cells
     are empty for an empty paired set (``None``) and numeric otherwise; ``significant_raw``/
     ``in_family`` are lowercase ``true``/``false``; ``p_value_adjusted``/``significant`` are populated
-    only on family rows and empty otherwise (M3); ``n_common`` is a plain int (§9).
+    only on family rows and empty otherwise; ``n_common`` is a plain int (§9).
     """
     path = _artifact_path(output_dir, f"comparison_{timestamp}.csv")
     handle, writer = _open_csv_writer(path)
@@ -226,19 +226,19 @@ def write_run_config(
     (embedder/reranker/searcher configs), the pipelines (baseline + variants), the stats block
     (bootstrap_B, ci_level, alpha as both the raw threshold and the FDR level q, correction, test +
     wilcoxon zero/tie params, seed, contrasts, fdr_metrics), cutoff, top_k, timestamp, and seed are
-    all captured (§9.1). ``diagnostics`` (Fix 6) is merged as a top-level ``diagnostics`` key: the
+    all captured (§9.1). ``diagnostics`` is merged as a top-level ``diagnostics`` key: the
     per-metric common-subset sizes (``n_common``/``n_excluded``) and per-system retrieval-failure
     counts (queries with ``n_results == 0``). It is keyword-only + defaulted so existing callers keep
     working; when absent the key is written as ``null``.
     """
     path = _artifact_path(output_dir, f"run_config_{cfg.timestamp}.json")
     payload = dataclasses.asdict(cfg)
-    # P0-1: pop the secret placeholder map (never serialized), then redact every secret-named key to
+    # pop the secret placeholder map (never serialized), then redact every secret-named key to
     # its ``${VAR}`` placeholder (``${REDACTED}`` backstop if the lookup misses). Redaction is by key
     # name and unconditional, so a secret value can never pass through even if a ref is absent.
     refs = payload.pop("secret_env_refs", {})
     _redact_secrets(payload, refs)
-    # P2-2 (MF-3): omit the wilcoxon-only params from the serialized stats block when the test isn't
+    # omit the wilcoxon-only params from the serialized stats block when the test isn't
     # wilcoxon, so a permutation-run manifest never implies Wilcoxon was used. The StatsCfg fields
     # stay (Wilcoxon selectable); config load already rejects the keys under a non-wilcoxon test.
     stats_block = payload.get("stats")
@@ -253,9 +253,9 @@ def write_run_config(
     return path
 
 
-#: Per-system cost+latency table header (P1-3). Diagnostic, NON-frozen (no golden) — it rides
+#: Per-system cost+latency table header. Diagnostic, NON-frozen (no golden) — it rides
 #: alongside the frozen metrics table only under ``--profile``. Latency cells are ms; API cells are
-#: counts (the PRIMARY cost figure). Retrieval is batch-amortized (total + per-query average, SF-3),
+#: counts (the PRIMARY cost figure). Retrieval is batch-amortized (total + per-query average),
 #: rerank is per-query (p50/p95); rerank cells are EMPTY for a system with no reranker.
 _COST_LATENCY_HEADER: tuple[str, ...] = (
     "system",
@@ -279,10 +279,10 @@ def write_cost_latency_csv(
     *,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> Path:
-    """Write ``cost_latency_{ts}.csv`` — the per-system P1-3 cost+latency table (§9.1, diagnostic).
+    """Write ``cost_latency_{ts}.csv`` — the per-system cost+latency table (§9.1, diagnostic).
 
     One row per system (baseline first, insertion order). ``retrieval_*`` are batch-amortized wall-clock
-    (one ``_msearch`` per query set, SF-3); ``rerank_p50/p95_ms`` are per-query rerank latency (the cost
+    (one ``_msearch`` per query set); ``rerank_p50/p95_ms`` are per-query rerank latency (the cost
     driver) and are EMPTY for a system with no reranker. ``*_calls``/``*_docs``/``*_tokens`` are the
     connector counters (the PRIMARY, rate-limit-independent cost figure). NON-frozen (no golden): it is
     emitted only under ``eval:run --profile`` and never affects the frozen metric/comparison artifacts.
@@ -316,7 +316,7 @@ def write_cost_latency_csv(
 
 
 def _redact_secrets(obj: Any, refs: Mapping[str, str]) -> None:
-    """Walk ``obj`` in place, redacting every secret-named key to its ``${VAR}`` name (P0-1).
+    """Walk ``obj`` in place, redacting every secret-named key to its ``${VAR}`` name.
 
     For any mapping key matching ``_SECRET_KEY_RE`` (``api_key``/``token``/``secret``/``password``/
     ``credential``, case-insensitive), the value is replaced by ``refs[value]`` (the ``${VAR}``

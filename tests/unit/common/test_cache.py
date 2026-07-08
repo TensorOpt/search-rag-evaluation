@@ -104,7 +104,7 @@ class CountingReranker(RerankClient):
 
 
 class CountingSearcher(Searcher):
-    """Ranked list derived from query + top_k; records each query searched (S1-S4)."""
+    """Ranked list derived from query + top_k; records each query searched."""
 
     def __init__(self) -> None:
         self.searched: list[str] = []
@@ -120,7 +120,7 @@ class CountingSearcher(Searcher):
         return out
 
 
-# --- DiskCache store tests (Phase A) ----------------------------------------------------------
+# --- DiskCache store tests ----------------------------------------------------------
 
 
 def test_store_roundtrip(tmp_path) -> None:
@@ -298,7 +298,7 @@ def test_no_inner_call_on_hit(tmp_path) -> None:
     cache.close()
 
 
-# --- S1 shared-leaf recompute-once ------------------------------------------------------------
+# --- shared-leaf recompute-once ---------------------------------------------------------------
 
 
 def test_s1_shared_leaf_recompute_once(tmp_path) -> None:
@@ -315,7 +315,7 @@ def test_s1_shared_leaf_recompute_once(tmp_path) -> None:
     cache.close()
 
 
-# --- S2 bulk_search partial miss --------------------------------------------------------------
+# --- bulk_search partial miss -----------------------------------------------------------------
 
 
 def test_s2_partial_miss(tmp_path) -> None:
@@ -335,7 +335,7 @@ def test_s2_partial_miss(tmp_path) -> None:
     cache.close()
 
 
-# --- S3 key sensitivity — every field (the staleness guard) -----------------------------------
+# --- key sensitivity — every field (the staleness guard) --------------------------------------
 
 
 def test_s3_key_sensitivity(tmp_path) -> None:
@@ -358,7 +358,7 @@ def test_s3_key_sensitivity(tmp_path) -> None:
     cache.close()
 
 
-# --- S4 ScoredDoc round-trip ------------------------------------------------------------------
+# --- ScoredDoc round-trip ---------------------------------------------------------------------
 
 
 def test_s4_scoreddoc_roundtrip(tmp_path) -> None:

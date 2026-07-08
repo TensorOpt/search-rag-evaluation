@@ -39,11 +39,11 @@ logger = get_logger(__name__)
 
 @runtime_checkable
 class _Countable(Protocol):
-    """The P1-3 cost-counter surface a provider connector exposes (``inference._Connector``).
+    """The cost-counter surface a provider connector exposes (``inference._Connector``).
 
     Local to this module (common must name no provider, §11): the embed/rerank Decorators delegate
     :meth:`counters` to their inner connector so the runner can read a connector's provider
-    call/doc/token counts through the caching wrapper it built (P1-3).
+    call/doc/token counts through the caching wrapper it built.
     """
 
     def counters(self) -> Mapping[str, int]: ...
@@ -232,8 +232,8 @@ class CachingEmbedder(Embedder):
         return self._inner.dim  # delegate (probe/settings.dims live in the connector)
 
     def counters(self) -> dict[str, int]:
-        """Delegate the P1-3 cost counters to the inner connector (cache hits cost the provider
-        nothing, so they are correctly NOT counted — the inner only counts real requests, P1-3)."""
+        """Delegate the cost counters to the inner connector (cache hits cost the provider
+        nothing, so they are correctly NOT counted — the inner only counts real requests)."""
         return dict(cast(_Countable, self._inner).counters())
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
@@ -263,7 +263,7 @@ class CachingRerankClient(RerankClient):
         self._provider, self._model_id, self._endpoint = provider, model_id, endpoint
 
     def counters(self) -> dict[str, int]:
-        """Delegate the P1-3 cost counters to the inner rerank connector (cache hits are free, P1-3)."""
+        """Delegate the cost counters to the inner rerank connector (cache hits are free)."""
         return dict(cast(_Countable, self._inner).counters())
 
     def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]:

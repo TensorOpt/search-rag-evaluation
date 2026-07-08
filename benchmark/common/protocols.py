@@ -145,7 +145,7 @@ class Dataset(ABC):
         )
 
     def gain_mapping(self) -> Mapping[str, float]:
-        """The human-readable label->gain map this adapter applied to ``qrels()`` (§7, P0-3, SF-1).
+        """The human-readable label->gain map this adapter applied to ``qrels()`` (§7).
 
         Recorded in the run manifest alongside the qrels digest so a human can read the resolved
         grading (a hash cannot provide it). A string-labeled dataset (WANDS ``Exact``/``Partial``/
@@ -231,7 +231,7 @@ class IndexWriter(Protocol):
     def doc_count(self) -> int | None: ...
 
     def resolved_index_profile(self) -> Mapping[str, Any]:
-        """The lexical scoring profile RESOLVED FROM THE INDEX, for the manifest (§5, P1-2).
+        """The lexical scoring profile RESOLVED FROM THE INDEX, for the manifest (§5).
 
         Read back from the live backend (never assumed): the BM25 ``similarity`` params (``k1``/``b``)
         and the ``analysis`` chain (``analyzer``/``tokenizer``/``filters``) the ``search_text`` field

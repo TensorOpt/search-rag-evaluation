@@ -1,4 +1,4 @@
-"""eval:sweep — one-shot diagnostic parameter sweeps over the SINGLE runner (P1-2/P2-1/P3-1).
+"""eval:sweep — one-shot diagnostic parameter sweeps over the SINGLE runner.
 
     eval:sweep --axis {rerank_window | rrf_k | bm25_k1_b} --config config.yaml [--out results/sweep]
 
@@ -12,12 +12,12 @@ NOT part of ``eval:run``. Sweeps re-run retrieval/eval, so a real sweep needs a 
 keys (the user runs those); the axis handlers are unit-testable OFFLINE via the in-memory fake factories
 (``tests/unit/test_runner.py::patch_runner_factories``).
 
-- **rerank_window (P2-1):** ``rerank_window_size ∈ {10,25,50,100}`` at ``top_k=100`` for the rerank
+- **rerank_window:** ``rerank_window_size ∈ {10,25,50,100}`` at ``top_k=100`` for the rerank
   variants; per window, ``ndcg@10`` + ``recall@50`` with the paired bootstrap CI of Δ vs the
   corresponding UNRERANKED base (from the Comparator). No reindex — only rerank re-runs.
-- **rrf_k (P3-1):** ``rank_constant ∈ {20,60,100}`` for each pure hybrid (fuser, no reranker);
+- **rrf_k:** ``rank_constant ∈ {20,60,100}`` for each pure hybrid (fuser, no reranker);
   ``ndcg@10``/``precision@10``/``recall@100`` per k on the finite subset. No reindex — only fusion re-runs.
-- **bm25_k1_b (P1-2):** ``k1 ∈ {0.9,1.2,1.5,2.0} × b ∈ {0.3,0.5,0.75,0.9}`` (16 cells); ``ndcg@10`` per
+- **bm25_k1_b:** ``k1 ∈ {0.9,1.2,1.5,2.0} × b ∈ {0.3,0.5,0.75,0.9}`` (16 cells); ``ndcg@10`` per
   cell on the finite subset. BM25 params are INDEX-TIME, so this REINDEXES a scratch index per cell
   (reuse ``ExperimentRunner.build_index``), runs the baseline only, then tears the scratch index down.
 """
@@ -44,13 +44,13 @@ log = get_logger(__name__)
 #: Sweep axes (exhaustive — an unknown axis raises a clear :class:`ConfigError`).
 AXES = ("rerank_window", "rrf_k", "bm25_k1_b")
 
-#: P2-1 rerank-window grid + the two reported metrics; top_k stays fixed at the config's value (100).
+#: Rerank-window grid + the two reported metrics; top_k stays fixed at the config's value (100).
 _RERANK_WINDOWS = (10, 25, 50, 100)
 _RERANK_METRICS = ("ndcg@10", "recall@50")
-#: P3-1 RRF rank_constant grid + the three reported metrics.
+#: RRF rank_constant grid + the three reported metrics.
 _RRF_CONSTANTS = (20, 60, 100)
 _RRF_METRICS = ("ndcg@10", "precision@10", "recall@100")
-#: P1-2 BM25 k1×b grid + the reported metric.
+#: BM25 k1×b grid + the reported metric.
 _BM25_K1 = (0.9, 1.2, 1.5, 2.0)
 _BM25_B = (0.3, 0.5, 0.75, 0.9)
 _BM25_METRIC = "ndcg@10"
@@ -101,7 +101,7 @@ def _mean_on_finite(metrics: dict[str, Metrics], metric_key: str) -> tuple[float
 def _sweep_rerank_window(
     runner: ExperimentRunner, cfg: ResolvedConfig, cache: Any
 ) -> list[SweepRow]:
-    """P2-1: rescore each rerank variant at every window vs its unreranked base (paired CIs)."""
+    """Rescore each rerank variant at every window vs its unreranked base (paired CIs)."""
     ctx = runner._build_search_context(cfg, cache)
     rows: list[SweepRow] = []
     for rerank_pcfg in [p for p in cfg.pipelines() if p.reranker is not None]:
@@ -136,7 +136,7 @@ def _sweep_rerank_window(
 
 
 def _sweep_rrf_k(runner: ExperimentRunner, cfg: ResolvedConfig, cache: Any) -> list[SweepRow]:
-    """P3-1: rescore each pure hybrid (fuser, no reranker) at every RRF rank_constant."""
+    """Rescore each pure hybrid (fuser, no reranker) at every RRF rank_constant."""
     ctx = runner._build_search_context(cfg, cache)
     rows: list[SweepRow] = []
     hybrids = [p for p in cfg.pipelines() if p.fuser is not None and p.reranker is None]
@@ -182,7 +182,7 @@ def _teardown_index(writer: Any) -> None:
 
 
 def _sweep_bm25_k1_b(runner: ExperimentRunner, cfg: ResolvedConfig, cache: Any) -> list[SweepRow]:
-    """P1-2: reindex a scratch index per (k1, b) cell, score the baseline, report ndcg@10, tear down."""
+    """Reindex a scratch index per (k1, b) cell, score the baseline, report ndcg@10, tear down."""
     rows: list[SweepRow] = []
     for k1 in _BM25_K1:
         for b in _BM25_B:

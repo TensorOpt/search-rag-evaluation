@@ -32,7 +32,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="measure per-system cost + stage latency (P1-3): emit a cost_latency_{ts}.csv and a "
+        help="measure per-system cost + stage latency: emit a cost_latency_{ts}.csv and a "
         "diagnostics.cost_latency manifest block. Off by default (a standard run stays byte-identical). "
         "Profile a COLD-cache run for a full read — a warm cache reports ~0 marginal API cost",
     )

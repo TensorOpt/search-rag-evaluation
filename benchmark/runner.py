@@ -54,13 +54,13 @@ from benchmark.io_csv import (
 logger = get_logger(__name__)
 
 
-#: recall@k is flagged low-information when k / median(|R|) falls below this (P2-3). On WANDS
+#: recall@k is flagged low-information when k / median(|R|) falls below this. On WANDS
 #: (median |R| ≈ 146) recall@10 (0.068) warns; recall@50 (0.34) / recall@100 (0.68) do not.
 _RECALL_LOW_INFO_RATIO = 0.2
 
 
 def _recall_information(relevant_counts: Sequence[int]) -> dict[str, float]:
-    """``recall@k -> k/median(|R|)``, warning where it is below the low-information floor (P2-3).
+    """``recall@k -> k/median(|R|)``, warning where it is below the low-information floor.
 
     ``|R|`` = per-query relevant-set size under the resolved threshold; the median is over queries
     WITH relevant docs (``R > 0``). A cutoff whose ratio falls below :data:`_RECALL_LOW_INFO_RATIO`
@@ -85,7 +85,7 @@ def _recall_information(relevant_counts: Sequence[int]) -> dict[str, float]:
 
 
 def _reranker_only_window(a: PipelineCfg, b: PipelineCfg) -> int | None:
-    """The reranked side's ``rerank_window_size`` iff ``(a, b)`` differ ONLY by a reranker (MF-1).
+    """The reranked side's ``rerank_window_size`` iff ``(a, b)`` differ ONLY by a reranker.
 
     Two systems differ only by a reranker when their retrieval graph is identical (same retrievers,
     same fuser) and exactly one of them applies a reranker. Returns that reranker's window ``W`` (the
@@ -102,7 +102,7 @@ def _reranker_only_window(a: PipelineCfg, b: PipelineCfg) -> int | None:
 
 
 def _structural_exclusions(cfg: ResolvedConfig) -> dict[tuple[str, str, str], str]:
-    """``(a, b, "recall@k") -> reason`` for every reranker-only contrast where ``W == k`` (MF-1).
+    """``(a, b, "recall@k") -> reason`` for every reranker-only contrast where ``W == k``.
 
     ``recall@k`` is not identified for a contrast between two systems differing only by a reranker
     when ``rerank_window_size == k`` (top-k-set identity): reranking permutes the top-k set without
@@ -124,19 +124,19 @@ def _structural_exclusions(cfg: ResolvedConfig) -> dict[tuple[str, str, str], st
                 metric = f"recall@{k}"
                 exclusions[(contrast.a, contrast.b, metric)] = (
                     f"{metric} not identified: {contrast.a} vs {contrast.b} differ only by a "
-                    f"reranker with rerank_window_size == {k} (top-k set identity, MF-1)"
+                    f"reranker with rerank_window_size == {k} (top-k set identity)"
                 )
     return exclusions
 
 
 def _counter_delta(after: Mapping[str, int], before: Mapping[str, int]) -> dict[str, int]:
-    """Per-key delta of two connector counter dicts (P1-3): ``after − before``, missing key = 0."""
+    """Per-key delta of two connector counter dicts: ``after − before``, missing key = 0."""
     return {k: int(after.get(k, 0)) - int(before.get(k, 0)) for k in ("n_calls", "n_docs", "n_tokens")}
 
 
 @dataclass
 class _SearchContext:
-    """The built search-side state shared by ``run`` and ``eval:sweep`` (§6, P1-3/P2-1/P3-1).
+    """The built search-side state shared by ``run`` and ``eval:sweep`` (§6).
 
     Everything the setup prelude builds ONCE over a verified index: the leaf ``searchers`` / bound
     ``rerankers`` (timing-wrapped under ``--profile``), the provider ``embedders`` / ``rerank_clients``
@@ -162,13 +162,13 @@ class _SearchContext:
 
 
 class _Profiler:
-    """Per-system cost+latency capture over the profiling Decorators + connector counters (P1-3).
+    """Per-system cost+latency capture over the profiling Decorators + connector counters.
 
     Built ONLY under ``--profile``. Snapshots the timing samples + connector counters each pipeline's
     components accumulate DURING its scoring pass, so the per-system table attributes retrieval/rerank
     latency + API call/doc/token counts to the pipeline that caused them (deltas — robust to the shared
     component graph and to caching absorbing repeats). Retrieval is BATCH-AMORTIZED (one ``_msearch``
-    for the query set, labeled — never per-query p50/p95, SF-3); rerank is PER-QUERY p50/p95 (the cost
+    for the query set, labeled — never per-query p50/p95); rerank is PER-QUERY p50/p95 (the cost
     driver). API call/doc/token counts are the PRIMARY cost figure; latency is indicative (rate-limit
     contaminated).
     """
@@ -211,7 +211,7 @@ class _Profiler:
                 embed_delta[key] += value
         entry: dict[str, Any] = {
             "retrieval": {
-                "batch_amortized": True,  # one _msearch for the query set (SF-3), NOT per-query p50/p95
+                "batch_amortized": True,  # one _msearch for the query set, NOT per-query p50/p95
                 "total_ms": total_ms,
                 "per_query_ms": total_ms / self._n_queries if self._n_queries else 0.0,
                 "n_batches": len(retrieval_samples),
@@ -281,7 +281,7 @@ class ExperimentRunner:
         ``eval:index``. This verifies the index exists and holds the whole corpus (doc count == the
         dataset's document count), raising :class:`IndexNotReadyError` otherwise, then builds the leaf
         searchers / bound rerankers / provider connectors / evaluator ONCE. Under ``profile`` the
-        searchers/rerankers are wrapped in the timing Decorators (P1-3) — an opt-in cross-cutting
+        searchers/rerankers are wrapped in the timing Decorators — an opt-in cross-cutting
         layer, no domain-engine change (§5.5). ``cache`` is the live disk cache (or ``None``).
         """
         dataset = config.load_dataset(cfg.dataset)
@@ -307,7 +307,7 @@ class ExperimentRunner:
             "index %r ready: %d docs match the dataset; running eval (no re-indexing)",
             mapping.index_name, indexed,
         )
-        # P1-2: the BM25 similarity + analysis chain, RESOLVED from the live index (never assumed).
+        # the BM25 similarity + analysis chain, RESOLVED from the live index (never assumed).
         index_profile = writer.resolved_index_profile()
 
         rerank_clients = config.make_rerankers(cfg.services, cache=cache)  # name -> RerankClient (§3.4/§5.4)
@@ -325,15 +325,15 @@ class ExperimentRunner:
             )
         )
         if profile:
-            # Wrap the shared leaves/rerankers in the timing Decorators (P1-3): retrieval batch time
+            # Wrap the shared leaves/rerankers in the timing Decorators: retrieval batch time
             # per leaf, per-query rerank time. Composition-layer only — build_pipeline composes the
             # wrapped Searcher/Reranker unchanged (DRY one-path intact).
             searchers = {name: profiling.TimingSearcher(s) for name, s in searchers.items()}
             rerankers = {name: profiling.TimingReranker(r) for name, r in rerankers.items()}
 
         queries = list(dataset.queries())  # frozen, shared query set
-        # ONE relevance policy over every metric (§7, P0-2): the configured threshold feeds BOTH the
-        # QrelIndex (R / digest, N-3) AND the Evaluator; the unjudged policy feeds the Evaluator.
+        # ONE relevance policy over every metric (§7): the configured threshold feeds BOTH the
+        # QrelIndex (R / digest) AND the Evaluator; the unjudged policy feeds the Evaluator.
         threshold = cfg.metrics.relevance_threshold
         qrels_list = list(dataset.qrels())
         qrel_index = QrelIndex(qrels_list, relevance_threshold=threshold)
@@ -390,7 +390,7 @@ class ExperimentRunner:
         Each pipeline traverses the identical path: R0 cap → ``build_pipeline`` → ONE ``bulk_search``
         over the frozen query set (leaves batch via ``_msearch``, §5.3) → ``evaluator.score_run``. No
         per-variant code, no forked metric computation — the sweep re-runs THIS to score each grid
-        cell. Insertion order is preserved (baseline first for ``run``). ``profiler`` (P1-3) captures
+        cell. Insertion order is preserved (baseline first for ``run``). ``profiler`` captures
         per-pipeline cost/latency deltas when set.
         """
         results_by_variant: dict[str, list[RankedResult]] = {}
@@ -422,7 +422,7 @@ class ExperimentRunner:
         """Run every pipeline baseline-first, then the family-wide comparator pass (§6).
 
         ``eval:run`` does NOT (re)index — it REQUIRES an index already built by ``eval:index`` (verified
-        in :meth:`_build_search_context`). ``profile`` (``--profile``, P1-3) turns on the opt-in stage
+        in :meth:`_build_search_context`). ``profile`` (``--profile``) turns on the opt-in stage
         timing + emits a per-system ``cost_latency`` block into the manifest and a
         ``cost_latency_{ts}.csv`` alongside the metrics; off by default so a standard run stays
         byte-identical (§9.1).
@@ -453,7 +453,7 @@ class ExperimentRunner:
                 vid: {query_id: m.as_dict() for query_id, m in metrics.items()}
                 for vid, metrics in per_query.items()
             }
-            # Structural (config-derived) recall@k exclusions for reranker-only contrasts (MF-1);
+            # Structural (config-derived) recall@k exclusions for reranker-only contrasts;
             # emitted with a reason string, never a silent NaN, and never counted in the FDR family.
             structural_exclusions = _structural_exclusions(cfg)
             rows = Comparator(cfg.stats).compare(
@@ -461,7 +461,7 @@ class ExperimentRunner:
             )  # family FDR inside
             write_comparison_csv(rows, cfg.timestamp, output_dir=output_dir)
 
-            # Reproducibility diagnostics (§9.1, Fix 6): per-metric common-subset sizes (all rows of a
+            # Reproducibility diagnostics (§9.1): per-metric common-subset sizes (all rows of a
             # metric share n_common) and per-system retrieval-failure counts (queries with 0 results).
             n_queries = len(ctx.queries)
             common_subset = {
@@ -472,7 +472,7 @@ class ExperimentRunner:
                 vid: sum(1 for m in metrics.values() if m.n_results == 0)
                 for vid, metrics in per_query.items()
             }
-            # P0-3: the qrels provenance — digest (over the gain-mapped triples + threshold), the
+            # the qrels provenance — digest (over the gain-mapped triples + threshold), the
             # human-readable gain mapping, the resolved threshold, and n_qrels. Two runs with
             # differing digests are not comparable (report guidance, §7 provenance note).
             dataset_diag = {
@@ -483,7 +483,7 @@ class ExperimentRunner:
                 "gain_mapping": dict(ctx.dataset.gain_mapping()),
                 "n_qrels": len(ctx.qrels_list),
             }
-            # P1-1: the FDR family — size m (number of in-family real tests), full membership, and
+            # the FDR family — size m (number of in-family real tests), full membership, and
             # the structurally-excluded contrasts with their reason strings. Recorded so a reader can
             # audit the multiple-comparison regime (8 contrasts × 1 metric = 8 tests on WANDS).
             family_members = [
@@ -501,7 +501,7 @@ class ExperimentRunner:
                 "family_members": family_members,
                 "excluded": excluded,
             }
-            # P2-3: flag recall@k that is structurally uninformative on this dataset (k/median(|R|)
+            # flag recall@k that is structurally uninformative on this dataset (k/median(|R|)
             # below the floor) and record the ratios. |R| is dataset-level (from qrels), one per query.
             recall_information = _recall_information(
                 [ctx.qrel_index.relevant_count(q.query_id) for q in ctx.queries]
@@ -515,7 +515,7 @@ class ExperimentRunner:
                 "recall_information": recall_information,
             }
             if profiler is not None:
-                # P1-3: the per-system cost+latency table (rerank p50/p95 per query, retrieval batch
+                # the per-system cost+latency table (rerank p50/p95 per query, retrieval batch
                 # totals, connector API call/doc/token counts). Diagnostic + non-frozen — only under
                 # --profile, so a standard run's manifest is unchanged (§9.1 reproducibility guard).
                 diagnostics["cost_latency"] = profiler.cost_latency

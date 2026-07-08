@@ -142,7 +142,7 @@ def test_metrics_header_ends_with_counts(tmp_path: Path) -> None:
 
 
 def test_metrics_csv_has_n_relevant(tmp_path: Path) -> None:
-    """P2-3: the metrics CSV carries |R| as a trailing n_relevant int column."""
+    """The metrics CSV carries |R| as a trailing n_relevant int column."""
     path = write_metrics_csv(
         {
             "bm25": {
@@ -183,7 +183,7 @@ def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None
 
 
 def _comparison_rows() -> list[ComparisonResult]:
-    """A normal family row + empty_paired_set + all_zero_delta, exercising value_a/value_b + M3."""
+    """A normal family row + empty_paired_set + all_zero_delta, exercising value_a/value_b + empty adjusted/significant cells."""
     return [
         ComparisonResult(
             system_a="semantic_e5",
@@ -258,7 +258,7 @@ def test_comparison_header_is_fourteen_columns(tmp_path: Path) -> None:
 
 
 def test_comparison_empty_paired_set_row(tmp_path: Path) -> None:
-    """empty_paired_set: values/delta/CI empty, p=1.0; in_family=false -> adjusted+significant empty (M3)."""
+    """empty_paired_set: values/delta/CI empty, p=1.0; in_family=false -> adjusted+significant empty."""
     row = ComparisonResult(
         system_a="v", system_b="bm25", metric="recall@10", value_a=None, value_b=None,
         delta=None, delta_ci_lo=None, delta_ci_high=None,
@@ -272,7 +272,7 @@ def test_comparison_empty_paired_set_row(tmp_path: Path) -> None:
 
 
 def test_comparison_all_zero_delta_row(tmp_path: Path) -> None:
-    """all_zero_delta: value_a==value_b, delta=0.0, CI 0.0/0.0, p=1.0; adjusted+significant empty (M3)."""
+    """all_zero_delta: value_a==value_b, delta=0.0, CI 0.0/0.0, p=1.0; adjusted+significant empty."""
     row = ComparisonResult(
         system_a="v", system_b="bm25", metric="ndcg@10", value_a=0.3, value_b=0.3,
         delta=0.0, delta_ci_lo=0.0, delta_ci_high=0.0,
@@ -374,12 +374,12 @@ def test_run_config_round_trips_and_has_section_9_1_fields(tmp_path: Path) -> No
     assert stats["correction"] == "bh"
     assert stats["bootstrap_B"] == 10000
     assert stats["ci_level"] == 0.95
-    assert stats["test"] == "permutation"  # Fix 2: mean-δ permutation is the default
-    # P2-2 (MF-3): wilcoxon_* params are omitted from the manifest when the test isn't wilcoxon.
+    assert stats["test"] == "permutation"  # mean-δ permutation is the default
+    # wilcoxon_* params are omitted from the manifest when the test isn't wilcoxon.
     assert "wilcoxon_zero_method" not in stats
     assert "wilcoxon_correction" not in stats
     assert stats["seed"] == 1234
-    assert stats["fdr_metrics"] == ["ndcg@10"]  # StatsCfg default (P1-1: ndcg@10 only)
+    assert stats["fdr_metrics"] == ["ndcg@10"]  # StatsCfg default (ndcg@10 only)
     assert stats["contrasts"] == []  # StatsCfg default (no contrasts synthesized outside resolve)
 
     # Diagnostics key is always present (null when the writer is called without diagnostics).
@@ -390,7 +390,7 @@ def test_run_config_round_trips_and_has_section_9_1_fields(tmp_path: Path) -> No
 def test_run_config_redacts_secrets(
     tmp_path: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P0-1 / verification test 6: no substring of a secret appears in the manifest; ${VAR} emitted."""
+    """No substring of a secret appears in the manifest; ${VAR} emitted."""
     from benchmark.config import load_config
 
     secret = "sk-cohere-SECRET-value-do-not-leak"

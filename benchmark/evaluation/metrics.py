@@ -4,7 +4,7 @@ Per-query metrics computed once and returned in memory keyed by ``query_id`` so 
 reuse them without re-parsing CSV. The point/quality metrics (``avg_relevance``/``ndcg@10``/
 ``precision@10``) are cut at ``cutoff`` (=10); recall is reported at cutoffs ``{10, 50, 100}``.
 
-**ONE uniform relevance policy governs ALL SIX metrics (§7, P0-2).** A returned doc with a qrel
+**ONE uniform relevance policy governs ALL SIX metrics (§7).** A returned doc with a qrel
 entry uses its float gain (``0.0``/``0.5``/``1.0``); a returned doc with NO qrel entry is MISSING
 (``math.nan``). ``metrics.unjudged`` (injected as ``unjudged``) selects how MISSING is handled,
 UNIFORMLY across every metric — there is no per-metric carve-out:
@@ -33,7 +33,7 @@ slice (``m = len(eval_list[:cutoff])``):
   the query over ALL qrels; ``math.nan`` iff ``R == 0``, else defined (0 for an empty/failed result).
 
 The binary-relevance ``threshold`` (default 0.5; the runner injects ``metrics.relevance_threshold``)
-is applied to every binary metric AND to ``QrelIndex.relevant_count`` / :func:`qrels_digest` (N-3).
+is applied to every binary metric AND to ``QrelIndex.relevant_count`` / :func:`qrels_digest`.
 
 Two per-query DIAGNOSTIC counts are recorded (ALWAYS condensed semantics, cutoff depth, in BOTH
 policies):
@@ -41,7 +41,7 @@ policies):
 - ``n_scored`` = size of the condensed top-cutoff (judged docs, ``<= cutoff``).
 - ``n_missing`` = number of MISSING docs skipped while scanning to the cutoff-th judged doc.
 
-``n_relevant`` = ``|R|`` (P2-3), the relevant-set size under the resolved threshold.
+``n_relevant`` = ``|R|``, the relevant-set size under the resolved threshold.
 
 Each metric may independently be ``math.nan``: ``avg_relevance``/``ndcg@10``/``precision@10`` when
 ``m == 0``; every ``recall@k`` when ``R == 0``. The comparator excludes NaN queries per metric
@@ -69,7 +69,7 @@ RECALL_CUTOFFS = (10, 50, 100)
 #: QrelIndex; this constant is only the standalone default for tests / bare construction.
 RELEVANCE_THRESHOLD = 0.5
 
-#: Default unjudged policy (§7, P0-2): ``"condensed"`` (Sakai) or ``"irrelevant"`` (trec_eval).
+#: Default unjudged policy (§7): ``"condensed"`` (Sakai) or ``"irrelevant"`` (trec_eval).
 DEFAULT_UNJUDGED = "condensed"
 
 #: Absolute tolerance for treating a computed float as zero (never use `== 0.0` on floats).
@@ -98,7 +98,7 @@ class QrelIndex:
         for qr in qrels:
             index.setdefault(qr.query_id, {})[qr.doc_id] = qr.gain
         self._index = index
-        # N-3: the injected threshold feeds BOTH R (recall denom) AND the P0-3 digest, so it must not
+        # the injected threshold feeds BOTH R (recall denom) AND the digest, so it must not
         # silently keep 0.5 while the metrics use the config threshold.
         self._threshold = relevance_threshold
 
@@ -123,7 +123,7 @@ class Metrics:
     docstring for the per-metric NaN conditions). ``as_dict()`` exposes only the six metrics under
     the canonical §9 metric-name keys that the comparator and CSV writers key on; the four counts
     (``n_results``, ``n_scored``, ``n_missing``, ``n_relevant``) are non-negative ints exposed as
-    fields, not in ``as_dict()``. ``n_relevant`` (P2-3) is ``|R|``, the per-query relevant-set size
+    fields, not in ``as_dict()``. ``n_relevant`` is ``|R|``, the per-query relevant-set size
     under the resolved threshold. Field order matches the §9 metrics-CSV column order.
     """
 
@@ -197,7 +197,7 @@ class Evaluator:
                 if n_scored >= cutoff:
                     break
 
-        # ONE full policy eval list (§7, P0-2), scanned to max(RECALL_CUTOFFS) so every metric's
+        # ONE full policy eval list (§7), scanned to max(RECALL_CUTOFFS) so every metric's
         # slice is deep enough. condensed = judged docs in rank order (MISSING dropped); irrelevant =
         # raw positions with MISSING scored as gain 0.0 (kept, not dropped). Each metric then slices.
         max_depth = max(RECALL_CUTOFFS)
@@ -252,7 +252,7 @@ class Evaluator:
 
 
 def qrels_digest(qrels: Iterable[Qrel], *, relevance_threshold: float) -> str:
-    """SHA-256 over the sorted ``(query_id, doc_id, gain)`` triples + the threshold (P0-3).
+    """SHA-256 over the sorted ``(query_id, doc_id, gain)`` triples + the threshold.
 
     A stable fingerprint of the loaded, gain-mapped qrels: two runs with the SAME judgements and
     threshold get the SAME digest; flipping any grade, adding/removing a triple, or changing the

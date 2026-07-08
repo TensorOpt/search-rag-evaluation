@@ -68,10 +68,10 @@ stats:
     - { a: hybrid_co_rerank,   b: hybrid_co_k60,      family: true }   # rerank isolation on hybrid
     - { a: semantic_co_rerank, b: bm25_rerank,        family: true }   # do embeddings add anything once reranking is present?
     - { a: hybrid_co_rerank,   b: semantic_co_rerank, family: true }   # does fusion add anything once reranking is present?
-  fdr_metrics: [ndcg@10]        # the ONLY metric in the BH family (§8.3, P1-1): 8 contrasts × 1 = 8 tests
-metrics:                        # ONE relevance policy over ALL SIX metrics (§7, P0-2)
+  fdr_metrics: [ndcg@10]        # the ONLY metric in the BH family (§8.3): 8 contrasts × 1 = 8 tests
+metrics:                        # ONE relevance policy over ALL SIX metrics (§7)
   unjudged: condensed           # condensed (Sakai deletion; recall reverts to condensed) | irrelevant (trec_eval)
-  relevance_threshold: 0.5      # binary-relevance cut for precision/recall + R + qrels digest (N-3)
+  relevance_threshold: 0.5      # binary-relevance cut for precision/recall + R + qrels digest
 cutoff: 10                      # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
 top_k: 100                      # uniform retrieval depth: fuser.window == rerank_window_size == top_k (§5.3)
 cache:                          # persistent inference/result cache (docs/architecture.md §5.5)

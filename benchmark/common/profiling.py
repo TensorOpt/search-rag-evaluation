@@ -1,4 +1,4 @@
-"""Opt-in stage-latency profiling Decorators (docs/architecture.md §5.5, §9.1; P1-3).
+"""Opt-in stage-latency profiling Decorators (docs/architecture.md §5.5, §9.1).
 
 A cross-cutting infra layer like caching (§5.5) and logging (§11): imports only stdlib + the
 ``common`` seams — never a provider/backend/dataset — so it adds no forbidden import edge (§11,
@@ -9,7 +9,7 @@ profiling on (``eval:run --profile``):
 - :class:`TimingSearcher` (:class:`~benchmark.common.protocols.Searcher`) — records the wall-clock of
   each ``search`` / ``bulk_search`` call. Retrieval batches the WHOLE query set in one ``_msearch``
   (§5.3), so each sample is a **batch-amortized** total, NOT a per-query figure — the runner reports it
-  as a total / per-query-average, never as retrieval p50/p95 (SF-3).
+  as a total / per-query-average, never as retrieval p50/p95.
 - :class:`TimingReranker` (:class:`~benchmark.common.protocols.Reranker`) — records the wall-clock of
   each PER-QUERY ``rerank`` call. Rerank is the cost driver and IS per-query, so its samples yield the
   meaningful p50/p95 (§5.4).
@@ -17,7 +17,7 @@ profiling on (``eval:run --profile``):
 Profiling is **off by default** and never feeds cached values or metrics — the wrappers only observe
 timing, so a standard run stays byte-identical (§9.1). Wall-clock is contaminated by the connector
 ``RateLimiter`` (``requests_per_minute``): the API call/doc/token counters (``inference._Connector``)
-are the PRIMARY cost figure, latency is indicative (P1-3).
+are the PRIMARY cost figure, latency is indicative.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class TimingSearcher(Searcher):
     def __init__(self, inner: Searcher) -> None:
         self._inner = inner
         #: Seconds per ``search`` / ``bulk_search`` call. One ``bulk_search`` covers the whole query
-        #: set (one ``_msearch``), so a sample is a BATCH total, not a per-query time (SF-3).
+        #: set (one ``_msearch``), so a sample is a BATCH total, not a per-query time.
         self.samples: list[float] = []
 
     def search(self, query: str, *, top_k: int) -> list[ScoredDoc]:
@@ -93,7 +93,7 @@ def summarize(samples_s: Sequence[float]) -> dict[str, float]:
 
     ``n`` is the sample count, ``total_ms`` the summed wall-clock. ``p50_ms``/``p95_ms`` are the
     percentiles over the per-call samples — meaningful for rerank (per query); for retrieval the
-    runner uses ``total_ms`` / a per-query average instead (batch-amortized, SF-3).
+    runner uses ``total_ms`` / a per-query average instead (batch-amortized).
     """
     ms = sorted(sample * 1000.0 for sample in samples_s)
     return {

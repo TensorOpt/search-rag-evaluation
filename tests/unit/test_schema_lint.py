@@ -101,7 +101,7 @@ def test_artifact_schemas_match_section_9(
 
 
 def test_manifest_completeness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Verification test 7: every number-affecting parameter appears in the manifest (PART 4)."""
+    """Manifest completeness: every number-affecting parameter appears in the manifest."""
     from benchmark.runner import ExperimentRunner
 
     patch_runner_factories(monkeypatch)
@@ -117,7 +117,7 @@ def test_manifest_completeness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     # Stats knobs (raw threshold + FDR regime + declared family).
     for key in ("bootstrap_B", "ci_level", "alpha", "correction", "test", "seed", "contrasts", "fdr_metrics"):
         assert key in payload["stats"], key
-    # MF-3: NO wilcoxon_* keys in a permutation-run manifest.
+    # NO wilcoxon_* keys in a permutation-run manifest.
     assert "wilcoxon_zero_method" not in payload["stats"]
     assert "wilcoxon_correction" not in payload["stats"]
 

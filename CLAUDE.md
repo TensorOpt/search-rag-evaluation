@@ -95,4 +95,7 @@ OpenAI) in `benchmark/providers/inference.py` — ES runs no `_inference`.
   `logs/run_{timestamp}.log`. Pass the run's timestamp so the log lines up with that run's artifacts.
 - Before changing a name/schema, check it against `docs/methodology.md` (metrics/stats) or
   `docs/architecture.md` (abstractions/schemas/config/layout) and keep code and docs consistent.
+- Cross-references in code and docs may point **only** to `docs/methodology.md` and
+  `docs/architecture.md` (by section, e.g. `§7` / `architecture.md §5.5`); never to ephemeral
+  fix-tracking IDs (`P0-x`, `MF-x`, etc.) or any other transient document.
 - Don't commit `dataset/`, `results/`, or `logs/` artifacts.

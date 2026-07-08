@@ -7,7 +7,7 @@ another system, and "variant vs bm25" is one contrast among many (§8.1). It imp
 coherent multiple-comparison regime of §8 — **False Discovery Rate (FDR)** control, Benjamini-Hochberg
 by default:
 
-- **Family-wide common subset (§8.1, Fix 6).** For each metric, ONE shared subset of queries is used:
+- **Family-wide common subset (§8.1).** For each metric, ONE shared subset of queries is used:
   those whose metric value is finite (not NaN) for EVERY system REFERENCED BY THE CONTRASTS. Every
   referenced system — the baseline included — therefore has exactly ONE mean per metric, and every
   contrast on that metric is scored on the same query set. Any metric may be NaN for a query
@@ -19,7 +19,7 @@ by default:
   ``significant_raw = False``, ``note="empty_paired_set"``. *All-zero deltas* (>=1 paired query, every
   delta 0) yield ``delta = 0.0``, CI ``0.0/0.0``, ``p_value = 1.0``, ``significant_raw = False``,
   ``note="all_zero_delta"``. Degenerate rows are never in the FDR family: ``in_family = False`` and
-  (per M3) ``p_value_adjusted = None`` / ``significant = None`` → empty CSV cells. They never trigger
+  ``p_value_adjusted = None`` / ``significant = None`` → empty CSV cells. They never trigger
   scipy or the RNG.
 - **Effect-size CI (§8.2).** Percentile bootstrap over PAIRED QUERY INDICES with replacement,
   ``B = bootstrap_B`` resamples, using a FRESH ``numpy.random.default_rng(seed)`` per ``(contrast, metric)``
@@ -30,11 +30,11 @@ by default:
   (default — the same estimand as the point estimate and CI), or two-sided Wilcoxon signed-rank
   (``zero_method``/``correction`` pinned), selected by ``StatsCfg.test``. ``significant_raw`` is the
   uncorrected per-test decision ``p_value <= alpha``, computed independently of the family.
-- **FDR (§8.3), over the family only (Fix 7).** A row is in the family iff ``contrast.family AND
+- **FDR (§8.3), over the family only.** A row is in the family iff ``contrast.family AND
   metric ∈ cfg.fdr_metrics AND the row is non-degenerate``. Benjamini-Hochberg (default) or
   Benjamini-Yekutieli adjusted p-values (q-values) are computed over the family; family rows get
   ``significant = (p_value_adjusted <= alpha)``. Every non-family row (descriptive real test AND
-  degenerate) carries ``p_value_adjusted = None`` / ``significant = None`` (M3 rule:
+  degenerate) carries ``p_value_adjusted = None`` / ``significant = None`` (rule:
   ``in_family == false ⟺ both empty``); ``significant_raw`` stays populated on every real-test row.
   ``alpha`` is BOTH the raw per-test threshold AND the FDR target level ``q``.
 
@@ -53,7 +53,7 @@ import numpy as np
 from scipy import stats as scipy_stats  # type: ignore[import-untyped]
 
 #: Canonical metric names, in the fixed iteration order used for every comparison, matching the §9
-#: metrics-CSV column order (§7, §9, Fix 4).
+#: metrics-CSV column order (§7, §9).
 CANONICAL_METRICS: tuple[str, ...] = (
     "avg_relevance",
     "ndcg@10",
@@ -63,10 +63,10 @@ CANONICAL_METRICS: tuple[str, ...] = (
     "precision@10",
 )
 
-#: Default FDR headline metric (§8.3, P1-1): the single ranking-quality claim. Only this enters the
+#: Default FDR headline metric (§8.3): the single ranking-quality claim. Only this enters the
 #: BH/BY family (subject to each contrast's ``family`` flag); recall@50/recall@100 are descriptive.
 #: ``recall@100`` is degenerate for rerank-only contrasts (W==k) and produced a duplicate family
-#: member, so the family is ONE metric — 8 contrasts × 1 metric = 8 BH tests (P1-1, N-6).
+#: member, so the family is ONE metric — 8 contrasts × 1 metric = 8 BH tests.
 DEFAULT_FDR_METRICS: tuple[str, ...] = ("ndcg@10",)
 
 #: Absolute tolerance for treating a computed float as zero (never use `== 0.0` on floats).
@@ -75,11 +75,11 @@ ZERO_ABS_TOL = 1e-6
 
 @dataclass(frozen=True)
 class Contrast:
-    """One contrast between two systems (§8.1, Fix 3).
+    """One contrast between two systems (§8.1).
 
     ``a``/``b`` are system ids; ``delta = value(a) − value(b)`` ("how much better is ``a`` than
     ``b``", positive = ``a`` wins). ``family`` is True when the contrast is eligible for the FDR
-    family (Fix 7); False makes it descriptive-only (delta + CI + raw p, no FDR adjustment).
+    family; False makes it descriptive-only (delta + CI + raw p, no FDR adjustment).
     """
 
     a: str
@@ -98,7 +98,7 @@ class StatsCfg:
     ``NotImplementedError``. ``test`` defaults to the mean-δ permutation test (§8.2) so the p-value,
     point estimate, and CI share one estimand; ``"wilcoxon"`` stays selectable. ``contrasts`` is the
     explicit list of system-pair contrasts to score (config synthesizes every-variant-vs-baseline
-    when absent, §10); ``fdr_metrics`` is the set of metrics eligible for the FDR family (Fix 7).
+    when absent, §10); ``fdr_metrics`` is the set of metrics eligible for the FDR family.
     """
 
     bootstrap_B: int = 10000
@@ -118,13 +118,13 @@ class ComparisonResult:
     """One ``(contrast, metric)`` comparison result (§8.1 table, §9 comparison CSV).
 
     ``value_a``/``value_b`` are the means of system ``a``/``b``'s metric over the family-wide common
-    subset for that metric (§8.1, Fix 6), so ``delta == value_a - value_b``; all three (and the CI)
+    subset for that metric (§8.1), so ``delta == value_a - value_b``; all three (and the CI)
     are ``None`` for an empty paired set (serialized as empty cells, §9). ``p_value`` is the RAW,
     uncorrected test p-value (permutation or Wilcoxon; ``1.0`` for degenerate rows) and
     ``significant_raw`` is the uncorrected per-test decision (``p_value <= alpha``), independent of the
-    family. ``in_family`` is FDR-family membership (Fix 7). ``p_value_adjusted`` (FDR q-value) and
+    family. ``in_family`` is FDR-family membership. ``p_value_adjusted`` (FDR q-value) and
     ``significant`` (FDR decision) are populated ONLY for family rows; for every non-family row
-    (descriptive real test AND degenerate) both are ``None`` → empty CSV cells (M3 rule:
+    (descriptive real test AND degenerate) both are ``None`` → empty CSV cells (rule:
     ``in_family == false ⟺ both empty``). Either significance flag may disagree with the CI.
     ``n_common`` is the common-subset size (always present). ``note`` records a degenerate case:
     ``"empty_paired_set"`` | ``"all_zero_delta"`` | ``None``.
@@ -177,13 +177,13 @@ class Comparator:
         ``systems`` maps ``system_id -> query_id -> {metric_name: value}`` (exactly what
         ``Metrics.as_dict()`` produces per query, for EVERY pipeline incl. the baseline). ``contrasts``
         is the explicit list of system-pair contrasts (``delta = value(a) − value(b)``). For each
-        metric a single family-wide common subset (finite in every contrast-referenced system, Fix 6)
+        metric a single family-wide common subset (finite in every contrast-referenced system)
         is computed once; each system then has one mean per metric. The FDR correction (BH/BY) is
         applied only over the family rows (``contrast.family AND metric ∈ fdr_metrics AND
-        non-degenerate``, Fix 7).
+        non-degenerate``).
 
         ``structural_exclusions`` maps ``(system_a, system_b, metric) -> reason`` for contrasts a
-        metric is **not identified** for by pipeline STRUCTURE (MF-1: a reranker-only contrast on
+        metric is **not identified** for by pipeline STRUCTURE (a reranker-only contrast on
         ``recall@k`` with ``rerank_window_size == k`` — top-k-set identity). Such a row is emitted
         **structurally decided** (not by observing ``delta == 0``): ``in_family=False``, empty
         adjusted/significant, ``note=<reason>``, and NO test/bootstrap call. The runner computes the
@@ -195,7 +195,7 @@ class Comparator:
         # (index into rows, raw p-value) for each FDR-family row.
         family: list[tuple[int, float]] = []
 
-        # ONE shared common subset per metric, over the systems referenced by the contrasts (S2), so
+        # ONE shared common subset per metric, over the systems referenced by the contrasts, so
         # every referenced system keeps ONE value per metric across all contrasts.
         common_by_metric = {
             metric: _common_qids(systems, contrasts, metric) for metric in CANONICAL_METRICS
@@ -212,7 +212,7 @@ class Comparator:
 
                 reason = exclusions.get((contrast.a, contrast.b, metric))
                 if reason is not None:
-                    # Structurally not identified (MF-1): emit a reasoned row, no test/bootstrap.
+                    # Structurally not identified: emit a reasoned row, no test/bootstrap.
                     # Take precedence over the data-dependent degenerate notes below — the exclusion
                     # is a structural fact, not an observed delta==0. Means are reported for context.
                     value_a = float(np.mean(a_arr)) if a_arr.size else None
@@ -298,7 +298,7 @@ class Comparator:
                 delta = float(np.mean(deltas))
                 ci_lo, ci_high = self._bootstrap_ci(deltas)
                 p_value = self._p_value(deltas)
-                # Family membership (Fix 7): eligible contrast AND headline metric (non-degenerate here).
+                # Family membership: eligible contrast AND headline metric (non-degenerate here).
                 in_family = contrast.family and metric in cfg.fdr_metrics
 
                 idx = len(rows)
@@ -316,8 +316,8 @@ class Comparator:
                         # Raw per-test decision, independent of the family (§8.3).
                         significant_raw=p_value <= cfg.alpha,
                         in_family=in_family,
-                        p_value_adjusted=None,  # family rows set below; non-family stay None (M3)
-                        significant=None,  # family rows set below; non-family stay None (M3)
+                        p_value_adjusted=None,  # family rows set below; non-family stay None
+                        significant=None,  # family rows set below; non-family stay None
                         n_common=n_common,
                         note=None,
                     )
@@ -325,7 +325,7 @@ class Comparator:
                 if in_family:
                     family.append((idx, p_value))
 
-        # FDR (BH/BY) over the family rows only (§8.3, Fix 7). Non-family rows keep None (M3).
+        # FDR (BH/BY) over the family rows only (§8.3). Non-family rows keep None.
         adjusted_by_idx = _fdr_adjust([p for _, p in family], cfg.correction)
         for (idx, _p), q in zip(family, adjusted_by_idx):
             rows[idx] = replace(rows[idx], p_value_adjusted=q, significant=q <= cfg.alpha)
@@ -397,7 +397,7 @@ def _common_qids(
     contrasts: Sequence[Contrast],
     metric: str,
 ) -> list[str]:
-    """The family-wide common subset for ``metric`` (§8.1, Fix 6, S2).
+    """The family-wide common subset for ``metric`` (§8.1).
 
     The sorted query ids for which ``metric`` is finite (not NaN) in EVERY system referenced by the
     contrasts. Scoped to contrast-referenced systems only (a system in no contrast cannot shrink the
@@ -422,7 +422,7 @@ def _paired_values(
     metric: str,
     common_qids: Sequence[str],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Aligned ``a``/``b`` ``metric`` arrays over the precomputed common subset (§8.1, Fix 6).
+    """Aligned ``a``/``b`` ``metric`` arrays over the precomputed common subset (§8.1).
 
     Selects ``metric`` for each qid in ``common_qids`` from both systems' maps. The subset is already
     finite-in-every-referenced-system (:func:`_common_qids`), so ``a`` and ``b`` are both finite on it

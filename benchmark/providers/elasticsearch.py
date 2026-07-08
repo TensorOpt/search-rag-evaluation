@@ -69,7 +69,7 @@ _KNN_NUM_CANDIDATES = 100
 #: Log an ingest progress line every this many successfully-indexed docs.
 _BULK_PROGRESS_EVERY = 10_000
 
-#: Name of the named BM25 similarity the ``search_text`` field carries (§5, P1-2). Set EXPLICITLY on
+#: Name of the named BM25 similarity the ``search_text`` field carries (§5). Set EXPLICITLY on
 #: the field + defined in index settings so the resolved ``k1``/``b`` read back from ``_settings``.
 _BM25_SIMILARITY = "bm25_tuned"
 
@@ -164,9 +164,9 @@ class ESIndexWriter(IndexWriter):
         settings = indexer_cfg["settings"]
         self.bulk_chunk_size: int = int(settings.get("bulk_chunk_size", _BULK_CHUNK_SIZE))
         self.embed_batch_size: int = int(settings.get("embed_batch_size", _EMBED_BATCH_SIZE))
-        # P1-2: explicit BM25 similarity (k1/b) + analyzer, baked into the index at build so the
+        # explicit BM25 similarity (k1/b) + analyzer, baked into the index at build so the
         # baseline is recorded, not ES defaults applied silently. Absent -> the ES defaults, set
-        # EXPLICITLY so they read back from _settings/_mapping (SF-2).
+        # EXPLICITLY so they read back from _settings/_mapping.
         bm25 = settings.get("bm25") or {}
         self.bm25_k1: float = float(bm25.get("k1", _DEFAULT_BM25_K1))
         self.bm25_b: float = float(bm25.get("b", _DEFAULT_BM25_B))
@@ -200,7 +200,7 @@ class ESIndexWriter(IndexWriter):
         )
 
     def _index_settings(self) -> dict[str, Any]:
-        """Index settings baking the explicit BM25 similarity (k1/b) into the index (§5, P1-2).
+        """Index settings baking the explicit BM25 similarity (k1/b) into the index (§5).
 
         The tuned similarity is referenced by name on the ``search_text`` field (``_schema_to_mapping``)
         and defined here, so its ``k1``/``b`` read back from ``_settings``. The analyzer is the
@@ -236,7 +236,7 @@ class ESIndexWriter(IndexWriter):
         return int(self.client.count(index=self.index)["count"])
 
     def resolved_index_profile(self) -> dict[str, Any]:
-        """The BM25 similarity + analysis chain RESOLVED FROM the live index (§5, P1-2).
+        """The BM25 similarity + analysis chain RESOLVED FROM the live index (§5).
 
         Reads ``_mapping`` (the ``search_text`` field's ``similarity``/``analyzer`` names) and
         ``_settings?include_defaults=true`` (the named similarity's ``k1``/``b`` — falling back to the
@@ -508,7 +508,7 @@ def _schema_to_mapping(
     """Translate a ``FieldSchema`` into the ES ``{"properties": {...}}`` mapping body (§5.2).
 
     The canonical ``search_text`` field is a ``text`` field (BM25 target) carrying an EXPLICIT
-    ``similarity`` (the tuned BM25, defined in index settings) and ``analyzer`` (P1-2) so the resolved
+    ``similarity`` (the tuned BM25, defined in index settings) and ``analyzer`` so the resolved
     scoring profile reads back verbatim from ``_mapping``. Each embedder gets
     one ``dense_vector`` field (``dims`` = the embedder's output dim, ``index: true``,
     ``similarity: cosine`` — cosine suits the normalized embeddings these providers emit). NUMERIC

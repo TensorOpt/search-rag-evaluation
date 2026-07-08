@@ -335,11 +335,11 @@ def test_connector_requires_api_key_and_model_id() -> None:
         CohereReranker("co", {"api_key": "k"})
 
 
-# --- P1-3 cost counters -----------------------------------------------------------------------
+# --- cost counters -----------------------------------------------------------------------
 
 
 def test_embedder_counts_calls_docs_and_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
-    # P1-3: batch_size 2 over 3 docs -> TWO provider requests; n_docs = 3; tokens summed from usage.
+    # batch_size 2 over 3 docs -> TWO provider requests; n_docs = 3; tokens summed from usage.
     _install(monkeypatch, [
         {"data": [{"index": 0, "embedding": [0.0]}, {"index": 1, "embedding": [1.0]}],
          "usage": {"total_tokens": 12}},
@@ -370,7 +370,7 @@ def test_embedder_counts_docs_when_provider_omits_usage(monkeypatch: pytest.Monk
 
 
 def test_reranker_counts_calls_and_docs_scored(monkeypatch: pytest.MonkeyPatch) -> None:
-    # P1-3: rerank calls (one per query) + documents scored are the PRIMARY rerank cost figure.
+    # rerank calls (one per query) + documents scored are the PRIMARY rerank cost figure.
     _install(monkeypatch, [
         {"results": [{"index": i, "relevance_score": 1.0 / (i + 1)} for i in range(3)]},
         {"results": [{"index": i, "relevance_score": 1.0 / (i + 1)} for i in range(2)]},

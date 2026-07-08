@@ -2,10 +2,10 @@
 
 Covers: seeded bootstrap-CI determinism and B honoring; the two degenerate short-circuits
 (empty paired set / all-zero deltas) with a hard assertion that scipy/bootstrap/RNG are NEVER
-called and that per M3 they carry ``in_family=false`` + empty ``p_value_adjusted``/``significant``;
+called and that they carry ``in_family=false`` + empty ``p_value_adjusted``/``significant``;
 the family-wide common subset (one value per system, baseline included) and the per-metric NaN
 exclusion; arbitrary contrasts (variant-vs-variant, not just vs baseline); FDR family gating by
-``contrast.family`` × ``fdr_metrics`` (Fix 7); family-wide FDR (Benjamini-Hochberg step-up + q-values,
+``contrast.family`` × ``fdr_metrics``; family-wide FDR (Benjamini-Hochberg step-up + q-values,
 BY as more-conservative); raw-vs-FDR significance; CI-vs-significant disagreement; the Wilcoxon
 zero_method/correction/two-sided path and the seeded reproducible permutation path.
 """
@@ -130,7 +130,7 @@ def test_bootstrap_B_is_honored(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Degenerate short-circuits (§8.1 table): no scipy/bootstrap/RNG; NOT in family; empty adjusted (M3).
+# Degenerate short-circuits (§8.1 table): no scipy/bootstrap/RNG; NOT in family; empty adjusted.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -162,8 +162,8 @@ def test_empty_paired_set_row_and_no_scipy(monkeypatch: pytest.MonkeyPatch) -> N
         assert r.p_value == 1.0
         assert r.significant_raw is False
         assert r.in_family is False
-        assert r.p_value_adjusted is None  # M3: in_family=false -> empty
-        assert r.significant is None  # M3: in_family=false -> empty
+        assert r.p_value_adjusted is None  # in_family=false -> empty
+        assert r.significant is None  # in_family=false -> empty
         assert r.n_common == 0
         assert r.note == "empty_paired_set"
 
@@ -185,8 +185,8 @@ def test_all_zero_delta_row_and_no_scipy(monkeypatch: pytest.MonkeyPatch) -> Non
         assert r.p_value == 1.0
         assert r.significant_raw is False
         assert r.in_family is False
-        assert r.p_value_adjusted is None  # M3
-        assert r.significant is None  # M3
+        assert r.p_value_adjusted is None
+        assert r.significant is None
         assert r.n_common == 10
         assert r.note == "all_zero_delta"
 
@@ -221,7 +221,7 @@ def test_degenerate_rows_excluded_from_fdr_family() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Family-wide common subset (§8.1, Fix 6) — one value per system, per-metric NaN exclusion.
+# Family-wide common subset (§8.1) — one value per system, per-metric NaN exclusion.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -283,7 +283,7 @@ def test_common_subset_gives_baseline_one_value_across_contrasts() -> None:
 
 
 def test_common_qids_scoped_to_referenced_systems() -> None:
-    # A system in NO contrast must not shrink the common subset (S2). `spoiler` is all-NaN but is not
+    # A system in NO contrast must not shrink the common subset. `spoiler` is all-NaN but is not
     # referenced by any contrast, so the (v, bm25) subset is unaffected.
     base = _qmap({"q0": 0.1, "q1": 0.2})
     var = _qmap({"q0": 0.5, "q1": 0.6})
@@ -296,7 +296,7 @@ def test_common_qids_scoped_to_referenced_systems() -> None:
 
 
 def test_empty_common_subset_is_empty_paired_set() -> None:
-    # recall@10 NaN (R==0) for the ONLY query in the baseline -> empty subset for recall@10 (S3).
+    # recall@10 NaN (R==0) for the ONLY query in the baseline -> empty subset for recall@10.
     base = {"q0": {**_all_metrics(0.4), "recall@10": math.nan}}
     var = {"q0": {**_all_metrics(0.6), "recall@10": 0.6}}
     rows = _compare(StatsCfg(bootstrap_B=100), base, {"v": var})
@@ -311,7 +311,7 @@ def test_empty_common_subset_is_empty_paired_set() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Arbitrary contrasts (Fix 3) — variant-vs-variant, not just vs baseline.
+# Arbitrary contrasts — variant-vs-variant, not just vs baseline.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -348,7 +348,7 @@ def test_rows_ordered_by_contrast_then_canonical_metric() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# FDR family gating (Fix 7) — only contrast.family × fdr_metrics rows are adjusted.
+# FDR family gating — only contrast.family × fdr_metrics rows are adjusted.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -374,7 +374,7 @@ def test_in_family_gating_only_headline_metrics_adjusted() -> None:
     for m in ("avg_relevance", "recall@10", "recall@50", "precision@10"):
         r = _row(rows, "v", m)
         assert r.in_family is False
-        assert r.p_value_adjusted is None  # M3: descriptive -> empty adjusted cells
+        assert r.p_value_adjusted is None  # descriptive -> empty adjusted cells
         assert r.significant is None
         assert r.significant_raw is True  # raw per-test decision still populated on descriptive rows
 
@@ -397,14 +397,14 @@ def test_non_family_contrast_is_descriptive() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Structural exclusions + family integrity (P1-1, MF-1) — verification tests 4 & 5.
+# Structural exclusions + family integrity.
 # --------------------------------------------------------------------------------------------------
 
 
 def _delta_vector(
     systems: dict[str, dict[str, dict[str, float]]], row: ComparisonResult
 ) -> np.ndarray:
-    """Recompute a comparison row's per-query delta vector from the systems map (tests 4/5)."""
+    """Recompute a comparison row's per-query delta vector from the systems map."""
     qids = sorted(systems[row.system_a])
     return np.array(
         [systems[row.system_a][q][row.metric] - systems[row.system_b][q][row.metric] for q in qids]
@@ -412,14 +412,14 @@ def _delta_vector(
 
 
 def test_structural_exclusion_emits_reason_not_nan() -> None:
-    # MF-1: a reranker-only contrast on recall@100 (W==100) is excluded WITH a reason string, never
+    # a reranker-only contrast on recall@100 (W==100) is excluded WITH a reason string, never
     # enters the family, and reports means for context (not a silent NaN) — independent of the delta.
     # recall@10 (k != W) is NOT excluded: scored as an ordinary real test.
     base = _baseline({f"q{i}": 0.5 for i in range(10)})
     var = _variant({f"q{i}": 0.6 for i in range(10)})  # non-zero delta everywhere
     systems = {"bm25": base, "rerank": var}
     contrasts = [Contrast("rerank", "bm25", True)]
-    reason = "recall@100 not identified: rerank vs bm25 differ only by a reranker (MF-1)"
+    reason = "recall@100 not identified: rerank vs bm25 differ only by a reranker"
     exclusions = {("rerank", "bm25", "recall@100"): reason}
     rows = Comparator(
         replace(StatsCfg(bootstrap_B=100, seed=1), fdr_metrics=("ndcg@10",))
@@ -438,7 +438,7 @@ def test_structural_exclusion_emits_reason_not_nan() -> None:
 
 
 def test_no_structurally_null_family_members() -> None:
-    # Test 5: no FDR family member has an identically-zero per-query delta vector.
+    # no FDR family member has an identically-zero per-query delta vector.
     base = _baseline({f"q{i}": 0.5 for i in range(10)})
     strong = _variant({f"q{i}": 0.8 for i in range(10)})  # ndcg delta +0.3 (non-null)
     systems = {"bm25": base, "v": strong}
@@ -453,7 +453,7 @@ def test_no_structurally_null_family_members() -> None:
 
 
 def test_no_duplicate_family_members() -> None:
-    # Test 4: two family contrasts with DISTINCT delta vectors -> no duplicate members.
+    # two family contrasts with DISTINCT delta vectors -> no duplicate members.
     base = _baseline({f"q{i}": 0.5 for i in range(10)})
     v1 = _variant({f"q{i}": 0.6 for i in range(10)})
     v2 = _variant({f"q{i}": 0.7 for i in range(10)})
@@ -640,7 +640,7 @@ def test_wilcoxon_receives_zero_method_correction_two_sided(monkeypatch: pytest.
 
 
 def test_permutation_is_the_default_test() -> None:
-    # Fix 2: the default StatsCfg().test is the mean-δ permutation test.
+    # the default StatsCfg().test is the mean-δ permutation test.
     assert StatsCfg().test == "permutation"
 
 
@@ -708,12 +708,12 @@ def test_value_a_and_value_b_use_the_same_nan_mask() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
-# Verification harness (PART 4) — tests 1 (estimand consistency) & 2 (single baseline value).
+# Verification harness — estimand consistency & single baseline value.
 # --------------------------------------------------------------------------------------------------
 
 
 def test_estimand_consistency() -> None:
-    # Test 1 (SF-5): per row, the UNADJUSTED bootstrap CI brackets 0 IFF the RAW p >= alpha (NOT the
+    # per row, the UNADJUSTED bootstrap CI brackets 0 IFF the RAW p >= alpha (NOT the
     # FDR flag). Both are Monte-Carlo off the same seed, so skip a comparison whose p sits within the
     # p-resolution floor eps = 2/(B+1) of alpha, where the two procedures can legitimately disagree.
     rng = np.random.default_rng(0)
@@ -752,7 +752,7 @@ def test_estimand_consistency() -> None:
 
 
 def test_single_baseline_value() -> None:
-    # Test 2: a system appearing in multiple contrasts reports ONE value per metric.
+    # a system appearing in multiple contrasts reports ONE value per metric.
     base = _qmap({f"q{i}": 0.1 for i in range(6)})
     v1 = _qmap({f"q{i}": 0.5 for i in range(6)})
     v2 = _qmap({f"q{i}": 0.7 for i in range(6)})

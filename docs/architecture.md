@@ -622,18 +622,18 @@ pure vector store.
 // mapping (the harness embeds the corpus client-side; ES only stores + searches the vectors):
 "mappings": {
   "properties": {
-    // search_text carries an EXPLICIT tuned BM25 similarity + analyzer (P1-2) so both read back:
+    // search_text carries an EXPLICIT tuned BM25 similarity + analyzer so both read back:
     "search_text": { "type": "text", "similarity": "bm25_tuned", "analyzer": "standard" },
     "sem__cohere": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" },
     "sem__voyage": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" },
     "sem__openai": { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" }
   }
 }
-// index settings define the named BM25 similarity (P1-2), so k1/b read back from _settings:
+// index settings define the named BM25 similarity, so k1/b read back from _settings:
 "settings": { "similarity": { "bm25_tuned": { "type": "BM25", "k1": 1.2, "b": 0.75 } } }
 ```
 
-**BM25 baseline is explicit + resolved-from-index (P1-2).** BM25 `k1`/`b` are a per-field
+**BM25 baseline is explicit + resolved-from-index.** BM25 `k1`/`b` are a per-field
 `similarity` and the analyzer is an index-time setting, so both belong to the **`indexer` block**
 (they bake into the index at `eval:index`): `indexer.settings.bm25: { k1, b }` and optional
 `indexer.settings.analysis: { analyzer }` (absent → the ES defaults `k1=1.2`, `b=0.75`, `standard`
@@ -814,7 +814,7 @@ The store, key derivation, and Decorator internals live in `benchmark/common/cac
 Two more **opt-in, diagnostic** layers ride on the SAME engine — the runner/evaluator/comparator — and
 never touch the frozen artifacts or a standard run's numbers.
 
-**Cost & latency profiling (P1-3).** Two facets, both off unless requested.
+**Cost & latency profiling.** Two facets, both off unless requested.
 
 - **Connector cost counters — the PRIMARY, rate-limit-independent cost figure.** Every provider
   connector (`inference._Connector`) counts, per run, `n_calls` (provider requests), `n_docs`
@@ -829,7 +829,7 @@ never touch the frozen artifacts or a standard run's numbers.
   same Decorator seam as caching, §5.5) — applied in the **composition layer** (the runner), no
   domain-engine change, DRY one-path intact. **Retrieval is BATCH-AMORTIZED:** `bulk_search` issues one
   `_msearch` for the whole query set (§5.3), so a sample is a batch total reported as a total /
-  per-query average, **never** as retrieval p50/p95 (SF-3). **Rerank IS per-query** (the cost driver),
+  per-query average, **never** as retrieval p50/p95. **Rerank IS per-query** (the cost driver),
   so its per-query samples yield the meaningful **p50/p95**. Wall-clock is contaminated by the
   connector `RateLimiter` (`requests_per_minute`), so latency is labelled **indicative** and the API
   call/doc/token counts are primary (a clean latency read is a separate unthrottled pass). Client-side
@@ -844,7 +844,7 @@ never touch the frozen artifacts or a standard run's numbers.
   are **diagnostic, NON-frozen** and appear ONLY under `--profile` (the §9.1 reproducibility guard: a
   standard run's manifest/artifacts are unchanged).
 
-**Parameter sweeps — `eval:sweep` (P1-2 / P2-1 / P3-1).** ONE flag-driven script
+**Parameter sweeps — `eval:sweep`.** ONE flag-driven script
 (`scripts/sweep.py`), NOT three bespoke ones:
 
 ```
@@ -859,12 +859,12 @@ on `--axis` (an unknown axis raises a clear `ConfigError`). Output is a tidy, **
 `sweep_{axis}_{ts}.csv` (`axis_value, system, metric, value, ci_lo, ci_high, n_common`) under `--out`;
 it never touches `result`/`metrics`/`comparison`/`run_config` and is **not** part of `eval:run`.
 
-- **`rerank_window` (P2-1):** `rerank_window_size ∈ {10,25,50,100}` at `top_k=100` for each rerank
+- **`rerank_window`:** `rerank_window_size ∈ {10,25,50,100}` at `top_k=100` for each rerank
   variant; per window, `ndcg@10` + `recall@50` with the **paired bootstrap CI of Δ vs the unreranked
   base** (from the Comparator). No reindex — only rerank re-runs over cached retrieval.
-- **`rrf_k` (P3-1):** `rank_constant ∈ {20,60,100}` for each pure hybrid (fuser, no reranker);
+- **`rrf_k`:** `rank_constant ∈ {20,60,100}` for each pure hybrid (fuser, no reranker);
   `ndcg@10`/`precision@10`/`recall@100` per k on the finite subset. No reindex — only fusion re-runs.
-- **`bm25_k1_b` (P1-2):** `k1 ∈ {0.9,1.2,1.5,2.0} × b ∈ {0.3,0.5,0.75,0.9}` (16 cells); `ndcg@10` per
+- **`bm25_k1_b`:** `k1 ∈ {0.9,1.2,1.5,2.0} × b ∈ {0.3,0.5,0.75,0.9}` (16 cells); `ndcg@10` per
   cell. BM25 `k1`/`b` are index-time (§5.2), so this **reindexes a scratch index per cell** (reuses
   `ExperimentRunner.build_index`), runs the baseline only, then tears the scratch index down.
 
@@ -1023,7 +1023,7 @@ baseline first, then variants in config order. `n_results`, `n_scored`, `n_missi
 are **non-negative integers, ALWAYS present** (never empty): `n_results` = docs the pipeline returned
 for the query (`<= top_k`); the condensed-list diagnostic counts of methodology.md §7 (`n_scored` =
 judged docs scored, `n_missing` = missing docs skipped, condensed-top-10); `n_relevant` = `|R|`, the
-relevant-set size under the resolved threshold (P2-3, appended at the end so the existing column order
+relevant-set size under the resolved threshold (appended at the end so the existing column order
 is untouched). Any of the **six metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`,
 `recall@100`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when
 its in-memory `Metrics` value is `NaN` (methodology.md §7): `avg_relevance`/`ndcg@10`/`precision@10`
@@ -1046,7 +1046,7 @@ family-wide common subset** (methodology.md §8.1) of `a` and `b`, and `delta = 
 **raw** (uncorrected) permutation (or Wilcoxon) p; `significant_raw` ∈ {`true`,`false`} is the
 **uncorrected per-test decision** (`p_value <= α`); `in_family` ∈ {`true`,`false`} is FDR-family
 membership (methodology.md §8.3). `p_value_adjusted` (BH/BY q-value) and `significant` (FDR decision,
-`q <= α`) are populated **only on family rows** and **empty** otherwise (**M3: `in_family == false ⟺
+`q <= α`) are populated **only on family rows** and **empty** otherwise (**`in_family == false ⟺
 both empty`**, methodology.md §8.3). `n_common` (int, always present) is the common-subset size for
 that metric. The CI is in a different role from the significance flags and **may disagree** with them
 (methodology.md §8.3). For a degenerate paired set, `value_a`/`value_b`/`delta`/CI cells are **empty**
@@ -1061,11 +1061,11 @@ methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_fam
   **`fdr_metrics`**; bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw
   per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test
   + its zero/tie params, dataset version, ES + endpoint versions, cutoff, uniform retrieval depth
-  (`top_k`), seed; and the **`metrics` policy** `unjudged`/`relevance_threshold`, P0-2) is serialized
+  (`top_k`), seed; and the **`metrics` policy** `unjudged`/`relevance_threshold`) is serialized
   to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits
   FDR-adjusted p-values (q-values) per family test in the comparison CSV (§9), so — unlike Holm — the
   adjusted significance is fully materialized.
-- **Secret redaction (P0-1).** Any config key matching `api_key|token|secret|password|credential`
+- **Secret redaction.** Any config key matching `api_key|token|secret|password|credential`
   (case-insensitive) is serialized as the **`${VAR}` env name it was read from**, never the value
   (`${REDACTED}` backstop if the lookup misses). Secrets must be supplied as `${VAR}` placeholders at
   load (a literal secret is rejected with a `ConfigError`), so the manifest is safe to publish.
@@ -1074,17 +1074,17 @@ methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_fam
   - `common_subset` (per metric: `n_common`, `n_excluded = n_queries − n_common`) and
     `retrieval_failures` (per system: `#queries with n_results == 0`; for WANDS exactly 1 — query 383
     under bm25/bm25_rerank — so DROP hides nothing).
-  - `dataset` — `qrels_digest` (SHA-256 over the gain-mapped `(qid, doc, gain)` triples + threshold,
-    P0-3), the human-readable `gain_mapping` (`Dataset.gain_mapping()`), the resolved
+  - `dataset` — `qrels_digest` (SHA-256 over the gain-mapped `(qid, doc, gain)` triples + threshold),
+    the human-readable `gain_mapping` (`Dataset.gain_mapping()`), the resolved
     `relevance_threshold`, and `n_qrels`. Two runs with differing digests are **not comparable**.
   - `index` — the BM25 similarity (`k1`/`b`) + analysis chain (`analyzer`/`tokenizer`/`filters`)
-    **resolved from the live index** (`resolved_index_profile()`, P1-2).
+    **resolved from the live index** (`resolved_index_profile()`).
   - `stats` — the FDR `family_size (m)`, full `family_members`, and the reasoned structural
-    `excluded` contrasts (MF-1, P1-1).
+    `excluded` contrasts.
   - `recall_information` — `recall@k → k/median(|R|)`; a cutoff below `0.2` is logged low-information
-    (P2-3; WANDS `recall@10 ≈ 0.068` warns).
-  - `cost_latency` (P1-3) — **present only under `eval:run --profile`** (§5.6). A per-system entry:
-    `retrieval` (`batch_amortized: true`, `total_ms`, `per_query_ms`, `n_batches` — SF-3, never
+    (WANDS `recall@10 ≈ 0.068` warns).
+  - `cost_latency` — **present only under `eval:run --profile`** (§5.6). A per-system entry:
+    `retrieval` (`batch_amortized: true`, `total_ms`, `per_query_ms`, `n_batches` — never
     per-query p50/p95), `embed_api` (`n_calls`/`n_docs`/`n_tokens` for query embedding), and — for a
     reranked system — `rerank` (`per_query: true`, `n`, `total_ms`, `p50_ms`, `p95_ms`) + `rerank_api`
     (`n_calls`/`n_docs`/`n_tokens`). The connector call/doc/token counts are the PRIMARY cost figure;
@@ -1133,7 +1133,7 @@ indexer:
   provider: elasticsearch
   index: wands_bench
   # BM25 k1/b + analyzer are INDEX-TIME (baked at eval:index) and belong here, resolved from the index
-  # into the manifest (P1-2). Absent -> ES defaults, set explicitly so they read back.
+  # into the manifest. Absent -> ES defaults, set explicitly so they read back.
   settings: { url: ${ES_URL}, bm25: { k1: 1.2, b: 0.75 }, analysis: { analyzer: standard } }
 pipelines:
   baseline:                      # the reference every variant is compared against
@@ -1158,7 +1158,7 @@ pipelines:
       rerank_window_size: 100
 stats:
   test: permutation              # mean-δ sign-flip permutation (methodology.md §8.2 default); wilcoxon selectable
-                                 # wilcoxon_zero_method/wilcoxon_correction are REJECTED at load unless test: wilcoxon (P2-2)
+                                 # wilcoxon_zero_method/wilcoxon_correction are REJECTED at load unless test: wilcoxon
   correction: bh                 # Benjamini-Hochberg FDR (methodology.md §8.3, default); by = Benjamini-Yekutieli
   alpha: 0.05                    # BOTH the raw per-test threshold AND the FDR target level q
   bootstrap_B: 10000             # CI resamples AND permutation count; p-resolution floor 1/(B+1) (methodology.md §8.2)
@@ -1171,10 +1171,10 @@ stats:
     - { a: bm25_rerank,        b: bm25,               family: true }
     - { a: semantic_co_rerank, b: semantic_co,        family: true }
     - { a: hybrid_co_rerank,   b: hybrid_co_k60,      family: true }
-    - { a: semantic_co_rerank, b: bm25_rerank,        family: true }   # embeddings-with-rerank (P1-1)
-    - { a: hybrid_co_rerank,   b: semantic_co_rerank, family: true }   # fusion-with-rerank (P1-1)
-  fdr_metrics: [ndcg@10]         # the ONLY metric in the BH family (methodology.md §8.3, P1-1): 8×1 = 8 tests
-metrics:                         # ONE relevance policy over ALL SIX metrics (methodology.md §7, P0-2)
+    - { a: semantic_co_rerank, b: bm25_rerank,        family: true }   # embeddings-with-rerank
+    - { a: hybrid_co_rerank,   b: semantic_co_rerank, family: true }   # fusion-with-rerank
+  fdr_metrics: [ndcg@10]         # the ONLY metric in the BH family (methodology.md §8.3): 8×1 = 8 tests
+metrics:                         # ONE relevance policy over ALL SIX metrics (methodology.md §7)
   unjudged: condensed            # condensed (Sakai, default) | irrelevant (trec_eval)
   relevance_threshold: 0.5       # binary-relevance cut for precision/recall + R + qrels digest
 cutoff: 10                       # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
@@ -1243,7 +1243,7 @@ benchmark/
     ranking.py         #   fuse_rrf_local + rerank_local (pure windowed ranking primitives)
     logging_setup.py   #   console + file logging (logs/run_{timestamp}.log); use instead of print()
     cache.py           #   OPTIONAL disk cache (§5.5): DiskCache + CachingEmbedder/RerankClient/Searcher
-    profiling.py       #   OPTIONAL stage-latency Decorators (§5.6, P1-3): TimingSearcher/TimingReranker
+    profiling.py       #   OPTIONAL stage-latency Decorators (§5.6): TimingSearcher/TimingReranker
   providers/           # (f) concrete adapters, depend ONLY on common
     inference.py       #   OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib HTTP)
     elasticsearch.py   #   LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter, build_searchers/build_rerankers
@@ -1393,7 +1393,7 @@ rerank. No code change unless the provider is new — then add one `RerankClient
   (§5.4), so throughput is bounded by the provider's rate limits and each call costs money. The
   connector's `RateLimiter` (`settings.rate_limit.requests_per_minute`) + retry/backoff on 429 handle
   request spacing; sizing a run (batch sizes, RPM, budget) is an operational concern, not correctness.
-- Cost & latency per system: **shipped** as the opt-in `eval:run --profile` diagnostic (§5.6, P1-3) —
+- Cost & latency per system: **shipped** as the opt-in `eval:run --profile` diagnostic (§5.6) —
   connector call/doc/token counts (primary) + batch-amortized retrieval / per-query rerank p50/p95
   latency (indicative). A clean unthrottled latency read (uncontaminated by `requests_per_minute`)
   remains a separate operational pass.

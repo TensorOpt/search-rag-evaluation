@@ -50,7 +50,7 @@ def _writer_with(client: MagicMock) -> es.ESIndexWriter:
     writer.client = client
     writer.bulk_chunk_size = es._BULK_CHUNK_SIZE
     writer.embed_batch_size = es._EMBED_BATCH_SIZE
-    # P1-2: BM25/analysis defaults (bypassing __init__ here) so ensure_index/create_mapping work.
+    # BM25/analysis defaults (bypassing __init__ here) so ensure_index/create_mapping work.
     writer.bm25_k1 = es._DEFAULT_BM25_K1
     writer.bm25_b = es._DEFAULT_BM25_B
     writer.analyzer = es._DEFAULT_ANALYZER
@@ -125,7 +125,7 @@ def test_ensure_index_creates_with_backend_mapping() -> None:
 
 
 def test_bm25_similarity_written_to_index() -> None:
-    # P1-2: ensure_index bakes the explicit tuned BM25 similarity (k1/b) into the index settings so
+    # ensure_index bakes the explicit tuned BM25 similarity (k1/b) into the index settings so
     # the baseline is recorded, not ES defaults applied silently.
     client = _fake_client()
     client.indices.exists.return_value = False
@@ -138,7 +138,7 @@ def test_bm25_similarity_written_to_index() -> None:
 
 
 def test_resolved_index_profile_reads_back_from_es() -> None:
-    # P1-2: resolved_index_profile reads the BM25 params + analyzer BACK from _mapping/_settings
+    # resolved_index_profile reads the BM25 params + analyzer BACK from _mapping/_settings
     # (never assumed). k1/b arrive as strings from ES settings -> coerced to float.
     client = _fake_client()
     client.indices.get_mapping.return_value = {
@@ -783,7 +783,7 @@ def test_writer_create_mapping_dense_vector_and_roles() -> None:
     mapping = writer.create_mapping(schema, sem_fields, vector_dims)
 
     props = mapping.backend_mapping["properties"]
-    # search_text is a text field carrying the EXPLICIT tuned BM25 similarity + analyzer (P1-2) so the
+    # search_text is a text field carrying the EXPLICIT tuned BM25 similarity + analyzer so the
     # resolved profile reads back from _mapping — NO copy_to, NO semantic_text (§5.2).
     assert props["search_text"] == {
         "type": "text",

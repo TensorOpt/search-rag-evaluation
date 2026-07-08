@@ -62,7 +62,7 @@ _RERANKER_PROVIDERS = ("cohere", "voyage")
 #: ``${VAR}`` env placeholder (§10). Whole-value only — secrets are always their own scalar.
 _ENV_PLACEHOLDER = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
-#: Config keys whose values are secrets (P0-1). Any key CONTAINING one of these substrings
+#: Config keys whose values are secrets. Any key CONTAINING one of these substrings
 #: (case-insensitive) must be supplied as a ``${VAR}`` placeholder at load (never a literal), and is
 #: redacted to its ``${VAR}`` name in the run manifest (io_csv ``_redact_secrets``). One definition,
 #: shared with ``io_csv`` so the reject-at-load rule and the redact-at-write rule use the same key set.
@@ -217,14 +217,14 @@ class CacheCfg:
 
 @dataclass(frozen=True)
 class MetricsCfg:
-    """The ONE relevance policy governing ALL six metrics (docs/methodology.md §7, P0-2).
+    """The ONE relevance policy governing ALL six metrics (docs/methodology.md §7).
 
     ``unjudged`` selects how an unjudged (MISSING) returned doc is treated, UNIFORMLY across every
     metric: ``"condensed"`` (Sakai deletion — MISSING dropped from the eval list, the shipped
     default) or ``"irrelevant"`` (trec_eval — MISSING scored as gain ``0.0`` on the raw list,
     ``precision@k`` denom ``k``). ``relevance_threshold`` is the binary-relevance cut applied to
     EVERY binary metric (``precision@k``/``recall@k``) and to ``QrelIndex.relevant_count``/the qrels
-    digest (N-3). Both keys default (condensed / 0.5) when the ``metrics`` block is absent.
+    digest. Both keys default (condensed / 0.5) when the ``metrics`` block is absent.
     """
 
     unjudged: str = "condensed"
@@ -256,11 +256,11 @@ class ResolvedConfig:
     timestamp: str
     seed: int
     cache: CacheCfg = CacheCfg()
-    #: P0-2: the single relevance policy (unjudged handling + threshold) over ALL six metrics.
+    #: the single relevance policy (unjudged handling + threshold) over ALL six metrics.
     #: Defaulted (condensed / 0.5) so the ``metrics`` config block is optional and existing keyword
     #: constructors keep working; ``resolve_config`` always sets it from the resolved config.
     metrics: MetricsCfg = MetricsCfg()
-    #: P0-1: resolved-secret-value -> ``"${VAR}"`` placeholder name, recorded at load. Popped by
+    #: resolved-secret-value -> ``"${VAR}"`` placeholder name, recorded at load. Popped by
     #: ``io_csv.write_run_config`` BEFORE serialization (never written) and used to reconstruct the
     #: placeholder name for each redacted secret. Defaulted so existing keyword constructors keep
     #: working; empty when the config had no secrets.
@@ -347,11 +347,11 @@ class ConfigError(ValueError):
 def _substitute_env(
     value: Any, *, key: str | None = None, refs: dict[str, str] | None = None
 ) -> Any:
-    """Recursively replace whole-value ``${VAR}`` scalars with ``os.environ[VAR]`` (§10, P0-1).
+    """Recursively replace whole-value ``${VAR}`` scalars with ``os.environ[VAR]`` (§10).
 
     A missing environment variable for a referenced placeholder is a clear error — secrets must be
     supplied at run time, never defaulted silently. ``key`` is the mapping key the scalar sits under
-    (threaded on recursion) so the loader can enforce the P0-1 secret rule: a scalar under a
+    (threaded on recursion) so the loader can enforce the secret rule: a scalar under a
     secret-named key (``_SECRET_KEY_RE``) MUST be a ``${VAR}`` placeholder, never a literal — else
     :class:`ConfigError` (fail-fast). While substituting, the ``${VAR}`` origin of each secret is
     recorded into ``refs`` (resolved value -> ``"${VAR}"``) so the manifest writer can emit the
@@ -415,7 +415,7 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
     indexer = _require(cfg, "indexer", "config")
     services = _resolve_services(_require(cfg, "services", "config"))
     baseline, variants = _resolve_pipelines(_require(cfg, "pipelines", "config"), services)
-    # Resolve pipelines BEFORE stats so contrast/fdr validation (M2) sees the known system ids.
+    # Resolve pipelines BEFORE stats so contrast/fdr validation sees the known system ids.
     stats = _resolve_stats(
         _require(cfg, "stats", "config"),
         baseline_id=baseline.id,
@@ -447,12 +447,12 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
     )
 
 
-#: Valid ``metrics.unjudged`` policies (§7, P0-2). Exhaustive — anything else is a ConfigError.
+#: Valid ``metrics.unjudged`` policies (§7). Exhaustive — anything else is a ConfigError.
 _UNJUDGED_POLICIES = ("condensed", "irrelevant")
 
 
 def _resolve_metrics(raw: Any) -> MetricsCfg:
-    """Build :class:`MetricsCfg` from the §10 ``metrics`` block (P0-2). Absent -> condensed / 0.5.
+    """Build :class:`MetricsCfg` from the §10 ``metrics`` block. Absent -> condensed / 0.5.
 
     ``unjudged`` is validated against :data:`_UNJUDGED_POLICIES` (exhaustive, fail-fast);
     ``relevance_threshold`` is parsed as a float. One policy governs every metric.
@@ -696,8 +696,8 @@ def _resolve_stats(
     """Build :class:`StatsCfg` from the §10 ``stats`` block. ``ci_level`` is parsed, not a gate.
 
     ``contrasts`` (optional) is a list of ``{a, b, family}`` system-pair entries; when absent it is
-    synthesized as every-variant-vs-baseline, all ``family: true`` (§10, Fix 3). ``fdr_metrics``
-    (optional) restricts the FDR family (Fix 7). Both are validated at build time (M2, fail fast):
+    synthesized as every-variant-vs-baseline, all ``family: true`` (§10). ``fdr_metrics``
+    (optional) restricts the FDR family. Both are validated at build time (fail fast):
     every contrast id must be a known system (``{baseline_id} ∪ variant_ids``) and every
     ``fdr_metrics`` entry must be a canonical metric, else :class:`ConfigError`.
     """
@@ -705,8 +705,8 @@ def _resolve_stats(
     contrasts = _resolve_contrasts(raw.get("contrasts"), baseline_id, variant_ids, system_ids)
     fdr_metrics = _resolve_fdr_metrics(raw.get("fdr_metrics"))
     test = str(raw.get("test", "permutation"))
-    # P2-2: fail fast on a wilcoxon-only key the selected test does not consume, so the manifest
-    # never implies a test that was not run (MF-3). The keys stay valid under `test: wilcoxon`.
+    # fail fast on a wilcoxon-only key the selected test does not consume, so the manifest
+    # never implies a test that was not run. The keys stay valid under `test: wilcoxon`.
     if test != "wilcoxon":
         for key in ("wilcoxon_zero_method", "wilcoxon_correction"):
             if key in raw:
@@ -734,7 +734,7 @@ def _resolve_contrasts(
     variant_ids: Sequence[str],
     system_ids: set[str],
 ) -> tuple[Contrast, ...]:
-    """Parse (or synthesize) ``stats.contrasts`` (§10, Fix 3), validating every id (M2)."""
+    """Parse (or synthesize) ``stats.contrasts`` (§10), validating every id."""
     if raw is None:
         # Absent -> reproduce the old all-vs-baseline behavior (every variant vs the baseline).
         return tuple(Contrast(a=vid, b=baseline_id, family=True) for vid in variant_ids)
@@ -757,7 +757,7 @@ def _resolve_contrasts(
 
 
 def _resolve_fdr_metrics(raw: Any) -> tuple[str, ...]:
-    """Parse ``stats.fdr_metrics`` (§10, Fix 7), validating each against CANONICAL_METRICS (M2)."""
+    """Parse ``stats.fdr_metrics`` (§10), validating each against CANONICAL_METRICS."""
     if raw is None:
         return DEFAULT_FDR_METRICS
     if not isinstance(raw, list):

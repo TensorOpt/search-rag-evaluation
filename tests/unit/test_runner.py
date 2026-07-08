@@ -122,7 +122,7 @@ class FakeIndexWriter(IndexWriter):
         return self.doc_count_value
 
     def resolved_index_profile(self) -> Mapping[str, Any]:
-        # Canned BM25/analysis profile (no ES) — the runner records it under diagnostics.index (P1-2).
+        # Canned BM25/analysis profile (no ES) — the runner records it under diagnostics.index.
         return {
             "bm25": {"similarity": "bm25_tuned", "k1": 1.2, "b": 0.75},
             "analysis": {"analyzer": "standard", "tokenizer": "standard", "filters": ["lowercase"]},
@@ -156,7 +156,7 @@ class FakeEmbedder(Embedder):
     def __init__(self, name: str, dim: int = 3) -> None:
         self.id = name
         self._dim = dim
-        # P1-3 cost counters (mirrors inference._Connector) so the runner's profiler can read them.
+        # cost counters (mirrors inference._Connector) so the runner's profiler can read them.
         self.n_calls = 0
         self.n_docs = 0
         self.n_tokens = 0
@@ -182,7 +182,7 @@ class FakeEmbedder(Embedder):
 class FakeRerankClient(RerankClient):
     """A fake rerank connector: canned descending scores aligned to input (no network).
 
-    Counts calls/docs (P1-3) like ``inference._Connector`` so the profiler can attribute per-system
+    Counts calls/docs like ``inference._Connector`` so the profiler can attribute per-system
     rerank cost when the runner runs with ``profile=True``.
     """
 
@@ -253,7 +253,7 @@ def _config(
 ) -> ResolvedConfig:
     baseline = PipelineCfg(id="bm25", retrievers=("bm25",), fuser=None, reranker=None, rerank_window_size=None)
     # Build ResolvedConfig directly (bypassing resolve_config), so synthesize the default every-
-    # variant-vs-baseline contrasts here the way resolve_config would (§10, Fix 3).
+    # variant-vs-baseline contrasts here the way resolve_config would (§10).
     contrasts = tuple(Contrast(a=v.id, b="bm25", family=True) for v in variants)
     return ResolvedConfig(
         dataset={"name": "fake"},
@@ -444,7 +444,7 @@ def test_run_fails_if_index_incomplete(patched_factories: FakeIndexWriter, tmp_p
 
 
 def test_recall_low_information_warning_fires(caplog: pytest.LogCaptureFixture) -> None:
-    # P2-3: on a WANDS-like median |R| ≈ 146, recall@10 (10/146 = 0.068 < 0.2) is flagged
+    # on a WANDS-like median |R| ≈ 146, recall@10 (10/146 = 0.068 < 0.2) is flagged
     # low-information; recall@50 (0.34) and recall@100 (0.68) are not.
     from benchmark.runner import _recall_information
 
@@ -461,7 +461,7 @@ def test_recall_low_information_warning_fires(caplog: pytest.LogCaptureFixture) 
 def test_profile_emits_cost_latency_table_and_manifest_block(
     patched_factories: FakeIndexWriter, tmp_path: Path
 ) -> None:
-    # P1-3: --profile emits a per-system cost_latency_{ts}.csv (one row per system, batch-amortized
+    # --profile emits a per-system cost_latency_{ts}.csv (one row per system, batch-amortized
     # retrieval + per-query rerank p50/p95) AND a diagnostics.cost_latency manifest block.
     import json
 
@@ -489,7 +489,7 @@ def test_profile_emits_cost_latency_table_and_manifest_block(
     payload = json.loads((tmp_path / f"run_config_{ts}.json").read_text(encoding="utf-8"))
     cost_latency = payload["diagnostics"]["cost_latency"]
     assert set(cost_latency) == {"bm25", "semantic_e5", "bm25_rerank"}
-    # Retrieval is batch-amortized for every system (labeled, not per-query p50/p95, SF-3).
+    # Retrieval is batch-amortized for every system (labeled, not per-query p50/p95).
     assert cost_latency["bm25"]["retrieval"]["batch_amortized"] is True
     # Only the reranked system carries a per-query rerank block; its n == the query count (2).
     assert "rerank" not in cost_latency["bm25"]
@@ -516,7 +516,7 @@ def test_no_profile_keeps_manifest_free_of_cost_latency(
 
 
 def test_profiler_attributes_per_pipeline_deltas() -> None:
-    # P1-3 attribution: the profiler reads the timing samples + connector-counter deltas a pipeline's
+    # Attribution: the profiler reads the timing samples + connector-counter deltas a pipeline's
     # components accumulate during its pass, keyed by pipeline id. Drive the timers/counters directly
     # (no live search) to prove the delta math for a vector+rerank pipeline.
     from benchmark.common.profiling import TimingReranker, TimingSearcher
@@ -567,7 +567,7 @@ def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     import scripts.run as run_script
 
     # A minimal config file on disk; --dry-run must not touch ES or write artifacts.
-    monkeypatch.setenv("DRY_KEY", "x")  # P0-1: secrets must be ${VAR} placeholders, not literals
+    monkeypatch.setenv("DRY_KEY", "x")  # secrets must be ${VAR} placeholders, not literals
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(_DRY_RUN_CONFIG_YAML, encoding="utf-8")
 

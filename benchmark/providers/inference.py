@@ -191,11 +191,11 @@ class _Connector:
         self.url = str(settings.get("base_url", self.default_url))
         self.timeout = float(settings.get("timeout", _DEFAULT_TIMEOUT))
         self.max_retries = int(settings.get("max_retries", _DEFAULT_MAX_RETRIES))
-        # P1-3 cost counters (the PRIMARY, rate-limit-independent cost figure): provider requests made
+        # cost counters (the PRIMARY, rate-limit-independent cost figure): provider requests made
         # (``n_calls``), documents embedded/scored (``n_docs``), and billed tokens where the provider
         # reports them (``n_tokens``). Always on — plain int adds, they never touch the cache or a
         # metric, so a run stays byte-identical (§9.1). Surfaced through :meth:`counters`; the runner
-        # snapshots per-pipeline deltas for the per-system cost/latency table (P1-3).
+        # snapshots per-pipeline deltas for the per-system cost/latency table.
         self.n_calls = 0
         self.n_docs = 0
         self.n_tokens = 0
@@ -212,7 +212,7 @@ class _Connector:
         )
 
     def _post_counted(self, payload: Mapping[str, Any], *, n_docs: int) -> dict[str, Any]:
-        """:meth:`_post` + record the P1-3 cost counters for the one provider request (§3.4, P1-3).
+        """:meth:`_post` + record the cost counters for the one provider request (§3.4).
 
         One request = one call; ``n_docs`` is the documents embedded/scored in it; tokens are added
         only when the provider reports them (:meth:`_usage_tokens`, ``None`` otherwise). Counting sits
@@ -228,7 +228,7 @@ class _Connector:
         return response
 
     def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
-        """Billed tokens the provider reports for one response, or ``None`` (§3.4, P1-3).
+        """Billed tokens the provider reports for one response, or ``None`` (§3.4).
 
         Default ``None`` (no token accounting). Embedders whose provider returns a usage block override
         this to parse it; rerankers keep the default (Cohere/Voyage rerank bill in search-units, not
@@ -237,7 +237,7 @@ class _Connector:
         return None
 
     def counters(self) -> dict[str, int]:
-        """The accumulated P1-3 cost counters: ``{n_calls, n_docs, n_tokens}`` (§3.4, P1-3)."""
+        """The accumulated cost counters: ``{n_calls, n_docs, n_tokens}`` (§3.4)."""
         return {"n_calls": self.n_calls, "n_docs": self.n_docs, "n_tokens": self.n_tokens}
 
 
@@ -323,7 +323,7 @@ class OpenAIEmbedder(_BaseEmbedder):
         return [item["embedding"] for item in ordered]
 
     def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
-        tokens = (response.get("usage") or {}).get("total_tokens")  # OpenAI usage block (P1-3)
+        tokens = (response.get("usage") or {}).get("total_tokens")  # OpenAI usage block
         return int(tokens) if tokens is not None else None
 
 
@@ -344,7 +344,7 @@ class CohereEmbedder(_BaseEmbedder):
         return response["embeddings"]["float"]
 
     def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
-        # Cohere v2 embed reports billed input tokens under meta.billed_units (P1-3).
+        # Cohere v2 embed reports billed input tokens under meta.billed_units.
         billed = (response.get("meta") or {}).get("billed_units") or {}
         tokens = billed.get("input_tokens")
         return int(tokens) if tokens is not None else None
@@ -367,7 +367,7 @@ class VoyageEmbedder(_BaseEmbedder):
         return [item["embedding"] for item in ordered]
 
     def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
-        tokens = (response.get("usage") or {}).get("total_tokens")  # Voyage usage block (P1-3)
+        tokens = (response.get("usage") or {}).get("total_tokens")  # Voyage usage block
         return int(tokens) if tokens is not None else None
 
 
@@ -398,7 +398,7 @@ class _BaseReranker(_Connector, RerankClient):
                 "documents": list(documents),
                 self._top_param: len(documents),
             },
-            n_docs=len(documents),  # P1-3: documents scored this rerank call (per query)
+            n_docs=len(documents),  # documents scored this rerank call (per query)
         )
         scores: list[float | None] = [None] * len(documents)
         for item in response[self._results_key]:

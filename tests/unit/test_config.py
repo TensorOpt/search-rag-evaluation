@@ -119,7 +119,7 @@ def test_missing_required_key_raises() -> None:
 
 
 def test_literal_secret_rejected_at_load() -> None:
-    # P0-1: a secret-named key (api_key) with a LITERAL value (not a ${VAR} placeholder) must fail
+    # a secret-named key (api_key) with a LITERAL value (not a ${VAR} placeholder) must fail
     # fast at load — secrets are always env placeholders, never in the file.
     raw = _parsed()
     raw["services"][0]["embedder"]["settings"]["api_key"] = "sk-literal-not-a-placeholder"
@@ -128,7 +128,7 @@ def test_literal_secret_rejected_at_load() -> None:
 
 
 def test_secret_env_refs_records_placeholder() -> None:
-    # P0-1: resolving a ${VAR} secret records resolved-value -> "${VAR}" so the manifest writer can
+    # resolving a ${VAR} secret records resolved-value -> "${VAR}" so the manifest writer can
     # emit the placeholder name (never the value).
     resolved = resolve_config(_parsed())
     assert resolved.secret_env_refs["co-test"] == "${COHERE_KEY}"
@@ -144,7 +144,7 @@ def test_stats_block_parsed() -> None:
 
 
 def test_metrics_block_defaults_to_condensed_half() -> None:
-    # P0-2: absent `metrics` block -> condensed / 0.5 (the shipped default policy).
+    # absent `metrics` block -> condensed / 0.5 (the shipped default policy).
     resolved = resolve_config(_parsed())
     assert resolved.metrics.unjudged == "condensed"
     assert resolved.metrics.relevance_threshold == pytest.approx(0.5)
@@ -166,14 +166,14 @@ def test_unjudged_policy_rejects_unknown_value() -> None:
 
 
 def test_stats_test_defaults_to_permutation() -> None:
-    # Fix 2: when `stats.test` is absent, the default is the mean-δ permutation test.
+    # when `stats.test` is absent, the default is the mean-δ permutation test.
     raw = _parsed()
     del raw["stats"]["test"]
     assert resolve_config(raw).stats.test == "permutation"
 
 
 def test_wilcoxon_keys_rejected_when_test_not_wilcoxon() -> None:
-    # P2-2 (MF-3): a wilcoxon-only key under a non-wilcoxon test is an unconsumed key -> fail fast.
+    # a wilcoxon-only key under a non-wilcoxon test is an unconsumed key -> fail fast.
     raw = _parsed()
     raw["stats"]["test"] = "permutation"
     raw["stats"]["wilcoxon_zero_method"] = "wilcox"
@@ -188,7 +188,7 @@ def test_wilcoxon_keys_allowed_when_test_is_wilcoxon() -> None:
     assert resolve_config(raw).stats.wilcoxon_zero_method == "pratt"
 
 
-# --- stats.contrasts / stats.fdr_metrics (§8.1/§8.3, Fix 3/6/7) --------------------------------
+# --- stats.contrasts / stats.fdr_metrics (§8.1/§8.3) --------------------------------
 
 
 def test_contrasts_default_is_every_variant_vs_baseline() -> None:
@@ -219,7 +219,7 @@ def test_contrasts_parsed_from_config() -> None:
 
 
 def test_fdr_metrics_defaults_to_ndcg_only() -> None:
-    # P1-1: the FDR family is ndcg@10 only; recall@50/@100 are descriptive.
+    # the FDR family is ndcg@10 only; recall@50/@100 are descriptive.
     assert resolve_config(_parsed()).stats.fdr_metrics == ("ndcg@10",)
 
 
@@ -230,7 +230,7 @@ def test_fdr_metrics_parsed_from_config() -> None:
 
 
 def test_unknown_contrast_id_raises() -> None:
-    # M2 fail-fast: a contrast referencing an unknown system id must raise at build time.
+    # fail-fast: a contrast referencing an unknown system id must raise at build time.
     raw = _parsed()
     raw["stats"]["contrasts"] = [{"a": "nope", "b": "baseline", "family": True}]
     with pytest.raises(ConfigError, match="unknown system"):
@@ -238,7 +238,7 @@ def test_unknown_contrast_id_raises() -> None:
 
 
 def test_eight_contrasts_declared(repo_root: Path) -> None:
-    # P1-1: config.yaml declares all EIGHT contrasts a priori, family=ndcg@10 only.
+    # config.yaml declares all EIGHT contrasts a priori, family=ndcg@10 only.
     cfg = load_config(repo_root / "config.yaml")
     assert len(cfg.stats.contrasts) == 8
     assert cfg.stats.fdr_metrics == ("ndcg@10",)
@@ -248,7 +248,7 @@ def test_eight_contrasts_declared(repo_root: Path) -> None:
 
 
 def test_unknown_fdr_metric_raises() -> None:
-    # M2 fail-fast: an fdr_metrics entry that is not a canonical metric must raise at build time.
+    # fail-fast: an fdr_metrics entry that is not a canonical metric must raise at build time.
     raw = _parsed()
     raw["stats"]["fdr_metrics"] = ["ndcg@5"]
     with pytest.raises(ConfigError, match="not a canonical metric"):

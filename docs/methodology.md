@@ -65,8 +65,8 @@ entry:
 | `hybrid_co_rerank` vs `hybrid_co_k60` | Rerank effect isolated on hybrid. |
 
 The `hybrid_co_k60 vs semantic_co` verdict is stated at the fixed `rank_constant = 60`; its robustness
-to that choice is a one-shot diagnostic — `eval:sweep --axis=rrf_k` over `{20,60,100}` (P3-1,
-architecture.md §5.6) — not an `eval:run` claim.
+to that choice is a one-shot diagnostic — `eval:sweep --axis=rrf_k` over `{20,60,100}`
+(architecture.md §5.6) — not an `eval:run` claim.
 
 ### 1.3 Scope (in / out)
 - **In:** offline ranking quality on a static qrel set; provider-backed embedding + rerank
@@ -75,7 +75,7 @@ architecture.md §5.6) — not an `eval:run` claim.
 - **Out:** online A/B testing, latency/throughput SLAs, query rewriting, learning-to-rank training,
   click models. (Cost & latency *may* be recorded as a secondary observation via the opt-in
   `eval:run --profile` diagnostic — connector call/doc/token counts as the primary cost figure, stage
-  latency as indicative, P1-3/architecture.md §5.6 — but are **not** a success criterion.)
+  latency as indicative, architecture.md §5.6 — but are **not** a success criterion.)
 
 ### 1.4 Success criteria
 1. **Correctness:** all three CSV artifact types are produced with the exact schemas in
@@ -196,7 +196,7 @@ then **slices** it. Let `g_1..g_m` be the point slice `eval_list[:10]` (`m = len
 > `irrelevant` policy is implemented and selectable for a general (trec_eval-style) audience or a
 > densely-judged dataset; the WANDS instantiation ships `condensed`.
 
-> **Relevance-handling provenance (P0-3).** The recall semantics silently flipped once between runs
+> **Relevance-handling provenance.** The recall semantics silently flipped once between runs
 > (a metric-semantics + retrieval-depth change bundled into one commit, unrecorded). That is now
 > closed: the resolved `metrics.unjudged`/`metrics.relevance_threshold` ride in the manifest, and a
 > **`dataset.qrels_digest`** — SHA-256 over the sorted `(query_id, doc_id, gain)` triples plus the
@@ -262,7 +262,7 @@ The comparator handles two degenerate cases uniformly, before any bootstrap/test
 | **All-zero deltas** | ≥1 paired query but every `δ_q == 0` | `value_a == value_b`, `delta = 0.0`, `delta_ci_lo = delta_ci_high = 0.0`, `p_value = 1.0`, `significant_raw = false`, `in_family = false`, `p_value_adjusted` = **empty**, `significant` = **empty**, `n_common` populated, note `note=all_zero_delta` (§8.2) |
 
 Both degenerate rows emit **empty** `p_value_adjusted` **and** empty `significant`, matching the
-load-bearing M3 rule **`in_family == false ⟺ p_value_adjusted and significant are BOTH empty`**
+load-bearing rule **`in_family == false ⟺ p_value_adjusted and significant are BOTH empty`**
 (§8.3): FDR-adjusted values exist ONLY for family rows. `p_value=1.0` and `significant_raw=false` are
 still populated, and the note is recorded per affected `(contrast, metric)` row. In both cases the
 comparator never calls scipy/the bootstrap, so `mean of empty set` and a bootstrap over zero indices
@@ -317,12 +317,12 @@ difference**.
   rejections* — with **Benjamini-Hochberg (BH)** at FDR level `q = α = 0.05` by default, applied to
   the **raw** p-values of the family rows only. The default `fdr_metrics = {ndcg@10}` — the single
   headline **ranking-quality** claim. With **8** declared family contrasts × **1** headline metric the
-  family is **8** BH tests (P1-1). `recall@50`/`recall@100` (and `avg_relevance`/`recall@10`/
+  family is **8** BH tests. `recall@50`/`recall@100` (and `avg_relevance`/`recall@10`/
   `precision@10`) are **descriptive** — reported with a raw p + CI, outside the family. `recall@100`
   was previously a second family metric; it is degenerate for reranker-only contrasts (a reranker
   permutes the top-100 set without changing its membership) and produced a **duplicate** family
   member, so it was removed from the family.
-- **Structural applicability of `recall@k` (MF-1) — reasoned exclusion, not a data-dependent drop.**
+- **Structural applicability of `recall@k` — reasoned exclusion, not a data-dependent drop.**
   `recall@k` is **not identified** for a contrast between two systems differing **only by a reranker**
   when **`rerank_window_size == k`** (top-k-set identity: the reranked and base top-k document SETS
   are equal, so recall is invariant under reranking). Such a row is emitted **structurally decided** —
@@ -334,7 +334,7 @@ difference**.
   comparator. **Family membership is structural, not data-dependent** (the old `delta == 0` exclusion
   could silently admit a non-degenerate contrast). The manifest records `stats.family_size (m)`, the
   full `family_members`, and the reasoned `excluded` contrasts (§9.1).
-- **Three row kinds, one consistency rule (M3):** **`in_family == false ⟺ p_value_adjusted and
+- **Three row kinds, one consistency rule:** **`in_family == false ⟺ p_value_adjusted and
   significant are BOTH empty`.** FDR-adjusted values exist ONLY for family rows.
   - **family** (`contrast.family AND metric ∈ fdr_metrics AND non-degenerate`): `in_family=true`,
     `p_value_adjusted` = BH/BY q-value, `significant` = FDR decision.
