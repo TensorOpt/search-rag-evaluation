@@ -642,8 +642,8 @@ named `bm25_tuned` similarity + the analyzer, so the resolved chain is present i
 `_settings` and reads back verbatim. `IndexWriter.resolved_index_profile()` (every backend implements
 it — no `getattr` probing) reads `k1`/`b` + the analysis chain **back from the live index** (never
 assumed); the runner records the result under `diagnostics.index`. The STANDARD run keeps ES defaults
-(no tuning, decision 3); a `k1×b` sweep as a one-shot `eval:sweep` diagnostic is **planned, not yet
-shipped** (§13).
+(no tuning, decision 3); a `k1×b` sweep is shipped as the one-shot `eval:sweep --axis=bm25_k1_b`
+diagnostic (§5.6), which reindexes a scratch index per cell.
 
 Each `dense_vector` field is `index: true` with `similarity: cosine` (cosine suits the normalized
 embeddings these providers emit); its `dims` is that embedder's output dimensionality (probed once, or
@@ -808,6 +808,69 @@ re-runs repeat identical work, this preserves computation **within a run and acr
 > key unsound and must run with `CachingRerankClient` gated off (§13).
 
 The store, key derivation, and Decorator internals live in `benchmark/common/cache.py`.
+
+### 5.6 Cost & latency profiling and parameter sweeps (optional cross-cutting layers)
+
+Two more **opt-in, diagnostic** layers ride on the SAME engine — the runner/evaluator/comparator — and
+never touch the frozen artifacts or a standard run's numbers.
+
+**Cost & latency profiling (P1-3).** Two facets, both off unless requested.
+
+- **Connector cost counters — the PRIMARY, rate-limit-independent cost figure.** Every provider
+  connector (`inference._Connector`) counts, per run, `n_calls` (provider requests), `n_docs`
+  (documents embedded / rerank-scored), and `n_tokens` (billed tokens where the provider's usage block
+  reports them — OpenAI/Voyage `usage.total_tokens`, Cohere `meta.billed_units.input_tokens`; rerank
+  reports search-units not tokens, so `n_tokens` stays 0 for rerank). Counting is a plain int add — it
+  never touches the cache or a metric, so a run stays byte-identical (§9.1). The caching Decorators
+  delegate `counters()` to their inner connector, so a **cache hit is correctly NOT counted** (it costs
+  the provider nothing).
+- **Stage latency via timing Decorators — indicative.** `--profile` wraps the shared leaf
+  `Searcher`s / `Reranker`s in `TimingSearcher` / `TimingReranker` (`benchmark/common/profiling.py`,
+  same Decorator seam as caching, §5.5) — applied in the **composition layer** (the runner), no
+  domain-engine change, DRY one-path intact. **Retrieval is BATCH-AMORTIZED:** `bulk_search` issues one
+  `_msearch` for the whole query set (§5.3), so a sample is a batch total reported as a total /
+  per-query average, **never** as retrieval p50/p95 (SF-3). **Rerank IS per-query** (the cost driver),
+  so its per-query samples yield the meaningful **p50/p95**. Wall-clock is contaminated by the
+  connector `RateLimiter` (`requests_per_minute`), so latency is labelled **indicative** and the API
+  call/doc/token counts are primary (a clean latency read is a separate unthrottled pass). Client-side
+  RRF **fusion is not separately timed** — it runs between the timed leaves and the timed rerank, makes
+  no API call, and is sub-millisecond, so it is folded into retrieval rather than reported as its own
+  stage. **Profile a COLD-cache run for a full cost/latency read:** with a warm cache (§5.5) the counters
+  read ~0 marginal API calls and the timers measure cache reads, not provider work — the figures are the
+  *marginal* cost of this run, by design.
+- **Emit.** The runner attributes per-pipeline **deltas** (timers + counters snapshotted around each
+  pipeline's scoring pass — robust to shared components + caching) into a per-system table:
+  `cost_latency_{ts}.csv` alongside the metrics AND a `diagnostics.cost_latency` manifest block. Both
+  are **diagnostic, NON-frozen** and appear ONLY under `--profile` (the §9.1 reproducibility guard: a
+  standard run's manifest/artifacts are unchanged).
+
+**Parameter sweeps — `eval:sweep` (P1-2 / P2-1 / P3-1).** ONE flag-driven script
+(`scripts/sweep.py`), NOT three bespoke ones:
+
+```
+eval:sweep --axis {rerank_window | rrf_k | bm25_k1_b} --config config.yaml [--out results/sweep]
+```
+
+Each axis **rewrites the relevant resolved value per grid cell** and re-runs the pipelines through the
+**existing** `ExperimentRunner` scoring path + `Evaluator` + `Comparator` — **no forked metric/stats
+code** (the sweep script is a composition/entry layer that reuses the runner's `_build_search_context`
++ `_score_pipelines`, so `test_import_graph.py` stays intact — no engine module names it). Exhaustive
+on `--axis` (an unknown axis raises a clear `ConfigError`). Output is a tidy, **diagnostic, NON-frozen**
+`sweep_{axis}_{ts}.csv` (`axis_value, system, metric, value, ci_lo, ci_high, n_common`) under `--out`;
+it never touches `result`/`metrics`/`comparison`/`run_config` and is **not** part of `eval:run`.
+
+- **`rerank_window` (P2-1):** `rerank_window_size ∈ {10,25,50,100}` at `top_k=100` for each rerank
+  variant; per window, `ndcg@10` + `recall@50` with the **paired bootstrap CI of Δ vs the unreranked
+  base** (from the Comparator). No reindex — only rerank re-runs over cached retrieval.
+- **`rrf_k` (P3-1):** `rank_constant ∈ {20,60,100}` for each pure hybrid (fuser, no reranker);
+  `ndcg@10`/`precision@10`/`recall@100` per k on the finite subset. No reindex — only fusion re-runs.
+- **`bm25_k1_b` (P1-2):** `k1 ∈ {0.9,1.2,1.5,2.0} × b ∈ {0.3,0.5,0.75,0.9}` (16 cells); `ndcg@10` per
+  cell. BM25 `k1`/`b` are index-time (§5.2), so this **reindexes a scratch index per cell** (reuses
+  `ExperimentRunner.build_index`), runs the baseline only, then tears the scratch index down.
+
+Sweeps re-run retrieval/eval, so a real sweep needs a live index + provider keys (the user runs those);
+the axis orchestration is unit-testable **offline** with the in-memory fake factories
+(`tests/unit/test_runner.py::patch_runner_factories`).
 
 ---
 
@@ -1020,8 +1083,14 @@ methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_fam
     `excluded` contrasts (MF-1, P1-1).
   - `recall_information` — `recall@k → k/median(|R|)`; a cutoff below `0.2` is logged low-information
     (P2-3; WANDS `recall@10 ≈ 0.068` warns).
-  - `cost_latency` (P1-3) — per-system connector call/doc counts + opt-in stage latency under
-    `--profile`. **Planned, not yet shipped.**
+  - `cost_latency` (P1-3) — **present only under `eval:run --profile`** (§5.6). A per-system entry:
+    `retrieval` (`batch_amortized: true`, `total_ms`, `per_query_ms`, `n_batches` — SF-3, never
+    per-query p50/p95), `embed_api` (`n_calls`/`n_docs`/`n_tokens` for query embedding), and — for a
+    reranked system — `rerank` (`per_query: true`, `n`, `total_ms`, `p50_ms`, `p95_ms`) + `rerank_api`
+    (`n_calls`/`n_docs`/`n_tokens`). The connector call/doc/token counts are the PRIMARY cost figure;
+    latency is indicative (rate-limit contaminated). The same table is written to
+    `cost_latency_{ts}.csv` alongside the metrics. Diagnostic + NON-frozen: absent (block and CSV) on a
+    standard run, so the manifest stays byte-identical (reproducibility guard).
 - **Seeds:** one master seed feeds the bootstrap and any permutation test; recorded in config. Given
   the seed, stats are deterministic. There is no data-dependent pipeline selection, so the set of runs
   depends only on the config file.
@@ -1174,6 +1243,7 @@ benchmark/
     ranking.py         #   fuse_rrf_local + rerank_local (pure windowed ranking primitives)
     logging_setup.py   #   console + file logging (logs/run_{timestamp}.log); use instead of print()
     cache.py           #   OPTIONAL disk cache (§5.5): DiskCache + CachingEmbedder/RerankClient/Searcher
+    profiling.py       #   OPTIONAL stage-latency Decorators (§5.6, P1-3): TimingSearcher/TimingReranker
   providers/           # (f) concrete adapters, depend ONLY on common
     inference.py       #   OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib HTTP)
     elasticsearch.py   #   LexicalSearcher, VectorSearch, ESReranker, ESIndexWriter, build_searchers/build_rerankers
@@ -1214,7 +1284,10 @@ god-object; the ES pieces are ordinary provider classes.
 import time; `config` imports `search` (composers) + `evaluation.stats` (`StatsCfg`) only. The lazy
 factories resolve dotted targets at call time. This is success criterion methodology.md §1.4(3). The
 degenerate-paired-set handling (methodology.md §8.1) lives entirely in `evaluation/stats.py` and is
-dataset-agnostic (operates on paired delta arrays only).
+dataset-agnostic (operates on paired delta arrays only). The `--profile` timing Decorators live in
+`common/profiling.py` (the bottom layer, like caching/logging), so `runner` importing them adds no
+forbidden edge; `eval:sweep` (`scripts/sweep.py`) is an **entry point / composition layer** — it reuses
+the runner's scoring path rather than being an engine module, so the import rule holds unchanged.
 
 ---
 
@@ -1283,13 +1356,16 @@ rerank. No code change unless the provider is new — then add one `RerankClient
 ---
 
 ## 13. Open Questions / Deferred
-- **Optional sweep / expansion helper (deliberately omitted):** pipelines are **fully explicit** named
-  config entries (§10) — chosen for legibility, so the config is readable at a glance and the runner is
-  a flat loop with no data-dependent selection. A convenience helper that *generates* many pipelines
-  from axes (e.g. embedding_models × RRF-k) could be added later as pure config sugar that emits
-  explicit `PipelineCfg`s before the run; it is intentionally not shipped. If added, any data-dependent
-  auto-selection (e.g. "best k per model" on the eval set) would reintroduce selection-on-the-eval-set
-  bias and must be treated as exploratory.
+- **Optional pipeline-expansion helper for `eval:run` (deliberately omitted):** the `eval:run`
+  pipelines are **fully explicit** named config entries (§10) — chosen for legibility, so the config is
+  readable at a glance and the runner is a flat loop with no data-dependent selection. A convenience
+  helper that *generates* many `eval:run` pipelines from axes (e.g. embedding_models × RRF-k) could be
+  added later as pure config sugar that emits explicit `PipelineCfg`s before the run; it is
+  intentionally not shipped. If added, any data-dependent auto-selection (e.g. "best k per model" on the
+  eval set) would reintroduce selection-on-the-eval-set bias and must be treated as exploratory. **This
+  is distinct from the shipped `eval:sweep` diagnostic (§5.6):** `eval:sweep` does NOT expand the
+  `eval:run` pipeline set — it re-runs the runner per grid cell as a one-shot diagnostic into a
+  separate NON-frozen sweep CSV, so `eval:run` stays a flat, selection-free loop.
 - **Matching FDR-adjusted interval regime:** BH-FDR is the default decision (methodology.md §8.3), with
   an unadjusted descriptive CI (methodology.md §8.2) that may disagree with the flag. What remains
   **deferred** is a **matching FDR-adjusted confidence-interval regime** (or a max-statistic
@@ -1316,9 +1392,11 @@ rerank. No code change unless the provider is new — then add one `RerankClient
 - **Provider rate limits & cost (operational):** embeddings and reranking hit an external provider
   (§5.4), so throughput is bounded by the provider's rate limits and each call costs money. The
   connector's `RateLimiter` (`settings.rate_limit.requests_per_minute`) + retry/backoff on 429 handle
-  request spacing; sizing a run (batch sizes, RPM, budget) and a cost/latency-per-provider table are
-  operational concerns, not correctness.
-- Latency/cost per inference endpoint as a secondary table (out of scope for v1 success criteria).
+  request spacing; sizing a run (batch sizes, RPM, budget) is an operational concern, not correctness.
+- Cost & latency per system: **shipped** as the opt-in `eval:run --profile` diagnostic (§5.6, P1-3) —
+  connector call/doc/token counts (primary) + batch-amortized retrieval / per-query rerank p50/p95
+  latency (indicative). A clean unthrottled latency read (uncontaminated by `requests_per_minute`)
+  remains a separate operational pass.
 - Pooling-depth / missing-judgement sensitivity analysis (current default: **missing judgements are
   skipped via condensed-list evaluation**, methodology.md §7 — NOT scored as gain 0).
 - **Missing-judgement ratio → LLM-as-a-judge backfill.** After the first full-pass run, inspect the

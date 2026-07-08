@@ -191,6 +191,14 @@ class _Connector:
         self.url = str(settings.get("base_url", self.default_url))
         self.timeout = float(settings.get("timeout", _DEFAULT_TIMEOUT))
         self.max_retries = int(settings.get("max_retries", _DEFAULT_MAX_RETRIES))
+        # P1-3 cost counters (the PRIMARY, rate-limit-independent cost figure): provider requests made
+        # (``n_calls``), documents embedded/scored (``n_docs``), and billed tokens where the provider
+        # reports them (``n_tokens``). Always on — plain int adds, they never touch the cache or a
+        # metric, so a run stays byte-identical (§9.1). Surfaced through :meth:`counters`; the runner
+        # snapshots per-pipeline deltas for the per-system cost/latency table (P1-3).
+        self.n_calls = 0
+        self.n_docs = 0
+        self.n_tokens = 0
 
     def _post(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return _post_json(
@@ -202,6 +210,35 @@ class _Connector:
             timeout=self.timeout,
             max_retries=self.max_retries,
         )
+
+    def _post_counted(self, payload: Mapping[str, Any], *, n_docs: int) -> dict[str, Any]:
+        """:meth:`_post` + record the P1-3 cost counters for the one provider request (§3.4, P1-3).
+
+        One request = one call; ``n_docs`` is the documents embedded/scored in it; tokens are added
+        only when the provider reports them (:meth:`_usage_tokens`, ``None`` otherwise). Counting sits
+        HERE (not in :meth:`_post`) because only the caller knows ``n_docs``, and only the response
+        carries the usage block.
+        """
+        response = self._post(payload)
+        self.n_calls += 1
+        self.n_docs += n_docs
+        tokens = self._usage_tokens(response)
+        if tokens is not None:
+            self.n_tokens += tokens
+        return response
+
+    def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
+        """Billed tokens the provider reports for one response, or ``None`` (§3.4, P1-3).
+
+        Default ``None`` (no token accounting). Embedders whose provider returns a usage block override
+        this to parse it; rerankers keep the default (Cohere/Voyage rerank bill in search-units, not
+        tokens, so ``n_tokens`` stays 0 for rerank).
+        """
+        return None
+
+    def counters(self) -> dict[str, int]:
+        """The accumulated P1-3 cost counters: ``{n_calls, n_docs, n_tokens}`` (§3.4, P1-3)."""
+        return {"n_calls": self.n_calls, "n_docs": self.n_docs, "n_tokens": self.n_tokens}
 
 
 def _require_setting(settings: Mapping[str, Any], key: str, provider: str, name: str) -> str:
@@ -281,9 +318,13 @@ class OpenAIEmbedder(_BaseEmbedder):
         payload: dict[str, Any] = {"model": self.model, "input": list(texts), "encoding_format": "float"}
         if self._dims is not None:
             payload["dimensions"] = self._dims
-        response = self._post(payload)
+        response = self._post_counted(payload, n_docs=len(texts))
         ordered = sorted(response["data"], key=lambda item: item["index"])
         return [item["embedding"] for item in ordered]
+
+    def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
+        tokens = (response.get("usage") or {}).get("total_tokens")  # OpenAI usage block (P1-3)
+        return int(tokens) if tokens is not None else None
 
 
 class CohereEmbedder(_BaseEmbedder):
@@ -299,8 +340,14 @@ class CohereEmbedder(_BaseEmbedder):
             "input_type": "search_query" if is_query else "search_document",
             "embedding_types": ["float"],
         }
-        response = self._post(payload)
+        response = self._post_counted(payload, n_docs=len(texts))
         return response["embeddings"]["float"]
+
+    def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
+        # Cohere v2 embed reports billed input tokens under meta.billed_units (P1-3).
+        billed = (response.get("meta") or {}).get("billed_units") or {}
+        tokens = billed.get("input_tokens")
+        return int(tokens) if tokens is not None else None
 
 
 class VoyageEmbedder(_BaseEmbedder):
@@ -315,9 +362,13 @@ class VoyageEmbedder(_BaseEmbedder):
             "input": list(texts),
             "input_type": "query" if is_query else "document",
         }
-        response = self._post(payload)
+        response = self._post_counted(payload, n_docs=len(texts))
         ordered = sorted(response["data"], key=lambda item: item["index"])
         return [item["embedding"] for item in ordered]
+
+    def _usage_tokens(self, response: Mapping[str, Any]) -> int | None:
+        tokens = (response.get("usage") or {}).get("total_tokens")  # Voyage usage block (P1-3)
+        return int(tokens) if tokens is not None else None
 
 
 # --- rerankers ---------------------------------------------------------------------------------
@@ -340,13 +391,14 @@ class _BaseReranker(_Connector, RerankClient):
     def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]:
         if not documents:
             return []
-        response = self._post(
+        response = self._post_counted(
             {
                 "model": self.model,
                 "query": query,
                 "documents": list(documents),
                 self._top_param: len(documents),
-            }
+            },
+            n_docs=len(documents),  # P1-3: documents scored this rerank call (per query)
         )
         scores: list[float | None] = [None] * len(documents)
         for item in response[self._results_key]:

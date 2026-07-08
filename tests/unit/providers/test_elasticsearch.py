@@ -174,6 +174,59 @@ def test_resolved_index_profile_reads_back_from_es() -> None:
     )
 
 
+def test_resolved_index_profile_deep_merges_index_settings() -> None:
+    # SF: the k1×b sweep writes BM25 params under settings.index.similarity, while a custom analyzer's
+    # tokenizer/filters live under defaults.index.analysis. A shallow {**defaults, **settings} merge
+    # would drop the analysis sub-dict wholesale; the deep per-sub-key merge keeps BOTH.
+    client = _fake_client()
+    client.indices.get_mapping.return_value = {
+        "wands_bench": {
+            "mappings": {
+                "properties": {
+                    "search_text": {
+                        "type": "text",
+                        "similarity": "bm25_tuned",
+                        "analyzer": "wands_analyzer",
+                    }
+                }
+            }
+        }
+    }
+    client.indices.get_settings.return_value = {
+        "wands_bench": {
+            # settings.index carries ONLY the tuned similarity (what the k1×b sweep sets)...
+            "settings": {
+                "index": {"similarity": {"bm25_tuned": {"type": "BM25", "k1": "2.0", "b": "0.9"}}}
+            },
+            # ...defaults.index carries ONLY the analysis chain — it must NOT be dropped by the merge.
+            "defaults": {
+                "index": {
+                    "analysis": {
+                        "analyzer": {
+                            "wands_analyzer": {
+                                "tokenizer": "standard",
+                                "filter": ["lowercase", "stop"],
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+    writer = _writer_with(client)
+
+    profile = writer.resolved_index_profile()
+
+    # BM25 params come from settings.index; the analyzer's tokenizer/filters from defaults.index — the
+    # deep merge preserves both (the shallow merge dropped analysis once similarity was present).
+    assert profile["bm25"] == {"similarity": "bm25_tuned", "k1": 2.0, "b": 0.9}
+    assert profile["analysis"] == {
+        "analyzer": "wands_analyzer",
+        "tokenizer": "standard",
+        "filters": ["lowercase", "stop"],
+    }
+
+
 def test_ensure_index_idempotent_when_index_exists() -> None:
     client = _fake_client()
     client.indices.exists.return_value = True

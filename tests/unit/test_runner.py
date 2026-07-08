@@ -156,22 +156,47 @@ class FakeEmbedder(Embedder):
     def __init__(self, name: str, dim: int = 3) -> None:
         self.id = name
         self._dim = dim
+        # P1-3 cost counters (mirrors inference._Connector) so the runner's profiler can read them.
+        self.n_calls = 0
+        self.n_docs = 0
+        self.n_tokens = 0
 
     @property
     def dim(self) -> int:
         return self._dim
 
+    def counters(self) -> dict[str, int]:
+        return {"n_calls": self.n_calls, "n_docs": self.n_docs, "n_tokens": self.n_tokens}
+
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        self.n_calls += 1
+        self.n_docs += len(texts)
         return [[float(i)] * self._dim for i, _ in enumerate(texts)]
 
     def embed_queries(self, texts: Sequence[str]) -> list[list[float]]:
+        self.n_calls += 1
+        self.n_docs += len(texts)
         return [[0.0] * self._dim for _ in texts]
 
 
 class FakeRerankClient(RerankClient):
-    """A fake rerank connector: canned descending scores aligned to input (no network)."""
+    """A fake rerank connector: canned descending scores aligned to input (no network).
+
+    Counts calls/docs (P1-3) like ``inference._Connector`` so the profiler can attribute per-system
+    rerank cost when the runner runs with ``profile=True``.
+    """
+
+    def __init__(self) -> None:
+        self.n_calls = 0
+        self.n_docs = 0
+        self.n_tokens = 0
+
+    def counters(self) -> dict[str, int]:
+        return {"n_calls": self.n_calls, "n_docs": self.n_docs, "n_tokens": self.n_tokens}
 
     def rerank_scores(self, query: str, documents: Sequence[str]) -> list[float]:
+        self.n_calls += 1
+        self.n_docs += len(documents)
         return [float(len(documents) - i) for i in range(len(documents))]
 
 
@@ -431,6 +456,111 @@ def test_recall_low_information_warning_fires(caplog: pytest.LogCaptureFixture) 
     assert info["recall@50"] >= 0.2
     assert "recall@10 is low-information" in caplog.text
     assert "recall@50 is low-information" not in caplog.text
+
+
+def test_profile_emits_cost_latency_table_and_manifest_block(
+    patched_factories: FakeIndexWriter, tmp_path: Path
+) -> None:
+    # P1-3: --profile emits a per-system cost_latency_{ts}.csv (one row per system, batch-amortized
+    # retrieval + per-query rerank p50/p95) AND a diagnostics.cost_latency manifest block.
+    import json
+
+    from benchmark.runner import ExperimentRunner
+
+    ts = "20260702T060000Z"
+    variants = [
+        PipelineCfg("semantic_e5", ("semantic_e5",), None, None, None),
+        PipelineCfg("bm25_rerank", ("bm25",), None, "rr", 100),  # the only rerank system here
+    ]
+    cfg = _config(variants=variants, timestamp=ts)
+
+    ExperimentRunner().run(cfg, output_dir=str(tmp_path), profile=True)
+
+    cost_file = tmp_path / f"cost_latency_{ts}.csv"
+    assert cost_file.exists()
+    lines = cost_file.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == (
+        "system,retrieval_total_ms,retrieval_per_query_ms,rerank_p50_ms,rerank_p95_ms,"
+        "rerank_n_queries,embed_calls,embed_docs,embed_tokens,rerank_calls,rerank_docs,rerank_tokens"
+    )
+    # One row per system (baseline first), no per-variant files.
+    assert [line.split(",")[0] for line in lines[1:]] == ["bm25", "semantic_e5", "bm25_rerank"]
+
+    payload = json.loads((tmp_path / f"run_config_{ts}.json").read_text(encoding="utf-8"))
+    cost_latency = payload["diagnostics"]["cost_latency"]
+    assert set(cost_latency) == {"bm25", "semantic_e5", "bm25_rerank"}
+    # Retrieval is batch-amortized for every system (labeled, not per-query p50/p95, SF-3).
+    assert cost_latency["bm25"]["retrieval"]["batch_amortized"] is True
+    # Only the reranked system carries a per-query rerank block; its n == the query count (2).
+    assert "rerank" not in cost_latency["bm25"]
+    assert cost_latency["bm25_rerank"]["rerank"]["per_query"] is True
+    assert cost_latency["bm25_rerank"]["rerank"]["n"] == len(_QUERIES)
+
+
+def test_no_profile_keeps_manifest_free_of_cost_latency(
+    patched_factories: FakeIndexWriter, tmp_path: Path
+) -> None:
+    # Reproducibility guard (§9.1): without --profile there is NO cost_latency (block or CSV), so a
+    # standard run's artifacts are unchanged.
+    import json
+
+    from benchmark.runner import ExperimentRunner
+
+    ts = "20260702T061500Z"
+    cfg = _config(variants=[PipelineCfg("bm25_rerank", ("bm25",), None, "rr", 100)], timestamp=ts)
+    ExperimentRunner().run(cfg, output_dir=str(tmp_path))
+
+    assert list(tmp_path.glob("cost_latency_*.csv")) == []
+    payload = json.loads((tmp_path / f"run_config_{ts}.json").read_text(encoding="utf-8"))
+    assert "cost_latency" not in payload["diagnostics"]
+
+
+def test_profiler_attributes_per_pipeline_deltas() -> None:
+    # P1-3 attribution: the profiler reads the timing samples + connector-counter deltas a pipeline's
+    # components accumulate during its pass, keyed by pipeline id. Drive the timers/counters directly
+    # (no live search) to prove the delta math for a vector+rerank pipeline.
+    from benchmark.common.profiling import TimingReranker, TimingSearcher
+    from benchmark.runner import _Profiler, _SearchContext
+
+    embedder = FakeEmbedder("e5")
+    rerank_client = FakeRerankClient()
+    sem_timer = TimingSearcher(FakeSearcher(_VECTOR_DOCS))
+    rer_timer = TimingReranker(FakeReranker())
+    ctx = _SearchContext(
+        dataset=FakeDataset(),
+        writer=None,
+        mapping=None,
+        embedders={"e5": embedder},
+        rerank_clients={"rr": rerank_client},
+        searchers={"semantic_e5": sem_timer},
+        rerankers={"rr": rer_timer},
+        queries=list(_QUERIES),
+        query_texts=[q.text for q in _QUERIES],
+        qrels_list=[],
+        qrel_index=None,  # unused by the profiler
+        evaluator=None,  # unused by the profiler
+        index_profile={},
+    )
+    profiler = _Profiler(_config(variants=[]), ctx)
+    pcfg = PipelineCfg("semantic_e5_rerank", ("semantic_e5",), None, "rr", 100)
+
+    before = profiler.snapshot(pcfg)
+    # Simulate one batched retrieval (one leaf sample), two per-query rerank calls, and the provider
+    # work each would have triggered: one query-embed batch (2 docs), two rerank calls (2 docs each).
+    sem_timer.samples.append(0.040)  # 40 ms retrieval batch
+    embedder.embed_queries([q.text for q in _QUERIES])
+    rer_timer.samples.extend([0.010, 0.030])  # per-query rerank 10 ms, 30 ms
+    for query in _QUERIES:
+        rerank_client.rerank_scores(query.text, ["a", "b"])
+    profiler.record(pcfg, before)
+
+    entry = profiler.cost_latency["semantic_e5_rerank"]
+    assert entry["retrieval"]["total_ms"] == pytest.approx(40.0)
+    assert entry["retrieval"]["per_query_ms"] == pytest.approx(20.0)  # 40 ms / 2 queries
+    assert entry["embed_api"] == {"n_calls": 1, "n_docs": 2, "n_tokens": 0}
+    assert entry["rerank"]["n"] == 2
+    assert entry["rerank"]["p50_ms"] == pytest.approx(20.0)  # median of 10, 30 ms
+    assert entry["rerank_api"] == {"n_calls": 2, "n_docs": 4, "n_tokens": 0}
 
 
 def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

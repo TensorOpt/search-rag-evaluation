@@ -254,7 +254,14 @@ class ESIndexWriter(IndexWriter):
         analyzer_name = field_spec.get("analyzer", _DEFAULT_ANALYZER)
 
         raw = self.client.indices.get_settings(index=self.index, include_defaults=True)[self.index]
-        index_settings = {**raw.get("defaults", {}), **raw.get("settings", {})}.get("index", {})
+        # Merge defaults.index and settings.index at the SUB-KEY level. A shallow {**defaults, **settings} lets
+        # settings.index overwrite defaults.index WHOLESALE, so once the k1×b sweep sets
+        # settings.index.similarity, a custom analyzer reported under defaults.index.analysis is
+        # dropped. Merge at the sub-key level so BM25 params (settings) AND the analysis chain
+        # (defaults) both survive (SF).
+        defaults_index = raw.get("defaults", {}).get("index", {})
+        settings_index = raw.get("settings", {}).get("index", {})
+        index_settings = {**defaults_index, **settings_index}
         sim_def = index_settings.get("similarity", {}).get(similarity_name, {})
         analysis = index_settings.get("analysis", {})
         analyzer_def = analysis.get("analyzer", {}).get(analyzer_name, {})

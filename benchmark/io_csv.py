@@ -253,6 +253,68 @@ def write_run_config(
     return path
 
 
+#: Per-system cost+latency table header (P1-3). Diagnostic, NON-frozen (no golden) — it rides
+#: alongside the frozen metrics table only under ``--profile``. Latency cells are ms; API cells are
+#: counts (the PRIMARY cost figure). Retrieval is batch-amortized (total + per-query average, SF-3),
+#: rerank is per-query (p50/p95); rerank cells are EMPTY for a system with no reranker.
+_COST_LATENCY_HEADER: tuple[str, ...] = (
+    "system",
+    "retrieval_total_ms",
+    "retrieval_per_query_ms",
+    "rerank_p50_ms",
+    "rerank_p95_ms",
+    "rerank_n_queries",
+    "embed_calls",
+    "embed_docs",
+    "embed_tokens",
+    "rerank_calls",
+    "rerank_docs",
+    "rerank_tokens",
+)
+
+
+def write_cost_latency_csv(
+    cost_latency: Mapping[str, Mapping[str, Any]],
+    timestamp: str,
+    *,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+) -> Path:
+    """Write ``cost_latency_{ts}.csv`` — the per-system P1-3 cost+latency table (§9.1, diagnostic).
+
+    One row per system (baseline first, insertion order). ``retrieval_*`` are batch-amortized wall-clock
+    (one ``_msearch`` per query set, SF-3); ``rerank_p50/p95_ms`` are per-query rerank latency (the cost
+    driver) and are EMPTY for a system with no reranker. ``*_calls``/``*_docs``/``*_tokens`` are the
+    connector counters (the PRIMARY, rate-limit-independent cost figure). NON-frozen (no golden): it is
+    emitted only under ``eval:run --profile`` and never affects the frozen metric/comparison artifacts.
+    """
+    path = _artifact_path(output_dir, f"cost_latency_{timestamp}.csv")
+    handle, writer = _open_csv_writer(path)
+    with handle:
+        writer.writerow(_COST_LATENCY_HEADER)
+        for system, entry in cost_latency.items():
+            retrieval = entry.get("retrieval", {})
+            embed_api = entry.get("embed_api", {})
+            rerank = entry.get("rerank")  # None when the system has no reranker
+            rerank_api = entry.get("rerank_api", {})
+            writer.writerow(
+                [
+                    system,
+                    _float_cell(retrieval.get("total_ms")),
+                    _float_cell(retrieval.get("per_query_ms")),
+                    _float_cell(rerank.get("p50_ms")) if rerank else "",
+                    _float_cell(rerank.get("p95_ms")) if rerank else "",
+                    rerank.get("n") if rerank else "",
+                    embed_api.get("n_calls", 0),
+                    embed_api.get("n_docs", 0),
+                    embed_api.get("n_tokens", 0),
+                    rerank_api.get("n_calls", "") if rerank else "",
+                    rerank_api.get("n_docs", "") if rerank else "",
+                    rerank_api.get("n_tokens", "") if rerank else "",
+                ]
+            )
+    return path
+
+
 def _redact_secrets(obj: Any, refs: Mapping[str, str]) -> None:
     """Walk ``obj`` in place, redacting every secret-named key to its ``${VAR}`` name (P0-1).
 

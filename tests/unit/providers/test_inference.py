@@ -333,3 +333,57 @@ def test_connector_requires_api_key_and_model_id() -> None:
         OpenAIEmbedder("oai", {"model_id": "m"})
     with pytest.raises(ValueError, match="requires settings.model_id"):
         CohereReranker("co", {"api_key": "k"})
+
+
+# --- P1-3 cost counters -----------------------------------------------------------------------
+
+
+def test_embedder_counts_calls_docs_and_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P1-3: batch_size 2 over 3 docs -> TWO provider requests; n_docs = 3; tokens summed from usage.
+    _install(monkeypatch, [
+        {"data": [{"index": 0, "embedding": [0.0]}, {"index": 1, "embedding": [1.0]}],
+         "usage": {"total_tokens": 12}},
+        {"data": [{"index": 0, "embedding": [2.0]}], "usage": {"total_tokens": 5}},
+    ])
+    embedder = OpenAIEmbedder("oai", {"api_key": "k", "model_id": "m", "batch_size": 2})
+
+    assert embedder.counters() == {"n_calls": 0, "n_docs": 0, "n_tokens": 0}  # nothing yet
+    embedder.embed_documents(["a", "b", "c"])
+    assert embedder.counters() == {"n_calls": 2, "n_docs": 3, "n_tokens": 17}
+
+
+def test_cohere_embed_counts_tokens_from_billed_units(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, [
+        {"embeddings": {"float": [[1.0]]}, "meta": {"billed_units": {"input_tokens": 7}}},
+    ])
+    embedder = CohereEmbedder("co", {"api_key": "k", "model_id": "embed-english-v3.0"})
+    embedder.embed_queries(["q"])
+    assert embedder.counters() == {"n_calls": 1, "n_docs": 1, "n_tokens": 7}
+
+
+def test_embedder_counts_docs_when_provider_omits_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No usage block reported -> n_tokens stays 0, calls/docs still counted (tokens are best-effort).
+    _install(monkeypatch, [{"data": [{"index": 0, "embedding": [0.0]}]}])
+    embedder = OpenAIEmbedder("oai", {"api_key": "k", "model_id": "m"})
+    embedder.embed_documents(["a"])
+    assert embedder.counters() == {"n_calls": 1, "n_docs": 1, "n_tokens": 0}
+
+
+def test_reranker_counts_calls_and_docs_scored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # P1-3: rerank calls (one per query) + documents scored are the PRIMARY rerank cost figure.
+    _install(monkeypatch, [
+        {"results": [{"index": i, "relevance_score": 1.0 / (i + 1)} for i in range(3)]},
+        {"results": [{"index": i, "relevance_score": 1.0 / (i + 1)} for i in range(2)]},
+    ])
+    reranker = CohereReranker("co", {"api_key": "k", "model_id": "rerank-v3.5"})
+    reranker.rerank_scores("q1", ["d0", "d1", "d2"])
+    reranker.rerank_scores("q2", ["d0", "d1"])
+    # two queries -> 2 calls, 5 docs scored; rerank reports no tokens -> n_tokens 0.
+    assert reranker.counters() == {"n_calls": 2, "n_docs": 5, "n_tokens": 0}
+
+
+def test_reranker_empty_documents_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, [])
+    reranker = CohereReranker("co", {"api_key": "k", "model_id": "m"})
+    reranker.rerank_scores("q", [])
+    assert reranker.counters() == {"n_calls": 0, "n_docs": 0, "n_tokens": 0}  # no round trip, no count

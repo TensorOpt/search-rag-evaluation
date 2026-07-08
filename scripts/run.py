@@ -29,6 +29,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="print the pipeline list (baseline first) and exit without running or writing anything",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="measure per-system cost + stage latency (P1-3): emit a cost_latency_{ts}.csv and a "
+        "diagnostics.cost_latency manifest block. Off by default (a standard run stays byte-identical). "
+        "Profile a COLD-cache run for a full read — a warm cache reports ~0 marginal API cost",
+    )
     return parser.parse_args(argv)
 
 
@@ -46,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        ExperimentRunner().run(cfg, output_dir=args.output_dir)
+        ExperimentRunner().run(cfg, output_dir=args.output_dir, profile=args.profile)
     except IndexNotReadyError as exc:
         # The index isn't built/complete — a config/workflow error, not a crash. Clear message, exit 1.
         log.error("%s", exc)

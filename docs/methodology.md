@@ -32,8 +32,10 @@ concrete instantiation is:
 ### 1.2 Variants under test (as research questions)
 Each variant is scored **against the BM25 baseline**. These are the six *conceptual* retrieval
 shapes; they are realized as **explicit named pipelines** the user writes in the config
-(architecture.md §10) — there is **no matrix expansion and no sweep**. A user who wants two embedding
-models or two RRF `k` values writes two named pipelines by hand.
+(architecture.md §10) — `eval:run` does **no matrix expansion and no sweep**. A user who wants two
+embedding models or two RRF `k` values writes two named pipelines by hand. (A separate one-shot
+**diagnostic**, `eval:sweep`, does re-run the runner over a parameter grid — rerank-window / RRF-`k` /
+BM25 `k1`×`b` — into a non-frozen sweep CSV; it is not part of `eval:run` (architecture.md §5.6).)
 
 | # | Strategy | One-line description |
 |---|----------|----------------------|
@@ -62,12 +64,18 @@ entry:
 | `semantic_co_rerank` vs `semantic_co` | Rerank effect isolated on dense. |
 | `hybrid_co_rerank` vs `hybrid_co_k60` | Rerank effect isolated on hybrid. |
 
+The `hybrid_co_k60 vs semantic_co` verdict is stated at the fixed `rank_constant = 60`; its robustness
+to that choice is a one-shot diagnostic — `eval:sweep --axis=rrf_k` over `{20,60,100}` (P3-1,
+architecture.md §5.6) — not an `eval:run` claim.
+
 ### 1.3 Scope (in / out)
 - **In:** offline ranking quality on a static qrel set; provider-backed embedding + rerank
   connectors; explicit config-driven named pipelines; statistical comparison vs baseline;
   reproducible artifacts.
 - **Out:** online A/B testing, latency/throughput SLAs, query rewriting, learning-to-rank training,
-  click models. (Latency *may* be logged as a secondary observation but is not a success criterion.)
+  click models. (Cost & latency *may* be recorded as a secondary observation via the opt-in
+  `eval:run --profile` diagnostic — connector call/doc/token counts as the primary cost figure, stage
+  latency as indicative, P1-3/architecture.md §5.6 — but are **not** a success criterion.)
 
 ### 1.4 Success criteria
 1. **Correctness:** all three CSV artifact types are produced with the exact schemas in

@@ -34,6 +34,8 @@ wait-for-es = "python -m scripts.wait_for_es"
 fetch-data = "python -m scripts.fetch_data"
 index = "python -m scripts.index {args}"
 run = "python -m scripts.run {args}"
+# eval:sweep — one-shot diagnostic parameter sweeps (P1-2/P2-1/P3-1), reusing the runner. NON-frozen.
+sweep = "python -m scripts.sweep {args}"
 
 # ---------------------------------------------------------------------------
 # dev environment — lint / type-check / test (plan §5).
