@@ -76,7 +76,9 @@ entry:
 2. **Reproducibility:** a single config + captured seed reproduces identical metrics and statistics
    (modulo backend nondeterminism, pinned per architecture.md §9.1). Pipelines are fully explicit in
    the config, so the set of runs is exactly what the file declares — there is no expansion or
-   data-dependent selection to reproduce.
+   data-dependent selection to reproduce. The reproducibility surface now also includes the resolved
+   **`metrics` policy** (`unjudged`/`relevance_threshold`, §7) and the **`dataset.qrels_digest`**
+   (architecture.md §9.1): two runs whose policy, threshold, or digest differ are **not comparable**.
 3. **Generality:** swapping WANDS→another dataset, or ES→another backend, requires only a new adapter
    + config — **no edits to pipeline, evaluator, or stats code** (verified by architecture.md §11/§12
    checklists). Edge cases that only a different dataset can trigger (e.g. all-zero or empty paired
@@ -125,101 +127,87 @@ flowchart LR
 ## 7. Metrics
 
 The three **point/quality** metrics are per query at cutoff **k=10**, then aggregated (mean across
-queries) for reporting; **recall** is standard/coverage at cutoffs `{10, 50, 100}`. The per-query
-`Metrics` are retained for the §8 statistics. Let the query's ranked returned list be `d_1..d_n`
-(position 1 = top). For each returned doc, `gain(d)` is the **qrel gain if a judgement exists** (a
-float graded per dataset — WANDS: `{0, 0.5, 1}` for Irrelevant/Partial/Exact) or **`MISSING`
-(`NaN`) if no qrel entry exists** for that `(query, doc)` pair.
+queries) for reporting; **recall** is at cutoffs `{10, 50, 100}`. The per-query `Metrics` are retained
+for the §8 statistics. Let the query's ranked returned list be `d_1..d_n` (position 1 = top). For each
+returned doc, `gain(d)` is the **qrel gain if a judgement exists** (a float graded per dataset —
+WANDS: `{0, 0.5, 1}` for Irrelevant/Partial/Exact) or **`MISSING` (`NaN`) if no qrel entry exists**
+for that `(query, doc)` pair.
 
-**Condensed-list evaluation (Sakai).** A `MISSING` judgement is **not** irrelevant — it is
-**skipped**. Form the **condensed list**: the ranked returned docs with the `MISSING` ones dropped,
-judged docs kept in original rank order. The point/quality metrics are computed over the **condensed
-top-10** = the first `min(10, #judged-in-list)` **judged** docs. Because missing docs are dropped,
-the condensed top-10 **may reach past original rank 10** to fill up to 10 judged docs. Let
-`g_1..g_m` be the condensed-top-10 gains in condensed rank order, `m = n_scored`, all judged.
+**ONE unjudged policy governs ALL SIX metrics uniformly (no per-metric carve-out).** How a `MISSING`
+(unjudged) returned doc is handled is a single config choice, `metrics.unjudged`, applied identically
+to `avg_relevance`, `ndcg@10`, `precision@10`, and all three `recall@k`. The **binary-relevance cut**
+`metrics.relevance_threshold` (default `0.5`; WANDS: `Partial`/`Exact` relevant) is likewise applied
+to every binary metric AND to the recall denominator `R` and the qrels digest (§9.1). The two
+policies:
 
-> **CRUCIAL — judged-irrelevant vs missing:** a **judged-irrelevant** doc (`gain == 0.0`, present in
-> qrels) is **KEPT** in the condensed list — it counts toward `n_scored`, contributes `2^0 − 1 = 0`
-> to DCG, and is not relevant. Only a doc with **no qrel entry** is `MISSING` and skipped. "Labeled
-> irrelevant" (gain 0.0) and "no judgement" are distinct.
+- **`condensed`** (Sakai deletion, **the shipped default**). A `MISSING` judgement is **not**
+  irrelevant — it is **dropped**. The **eval list** is the ranked returned docs with `MISSING` ones
+  removed, judged docs kept in rank order. A **judged-irrelevant** doc (`gain == 0.0`, present in
+  qrels) is **KEPT** — it contributes `2^0 − 1 = 0` to DCG and is not relevant. `precision@k` denom is
+  `n_scored`; **recall reverts to the condensed list** (over judged docs).
+- **`irrelevant`** (trec_eval). The eval list is the **raw retrieved positions** with each `MISSING`
+  doc scored `gain 0.0` in place (kept, not dropped). `precision@k` denom is `k`; recall is standard
+  (position) recall.
 
-Two per-query counts are recorded:
-- **`n_scored`** = size of the condensed top-10 (the judged docs the metrics were computed over,
-  `<= 10`) — "total number this was calculated from".
-- **`n_missing`** = number of `MISSING` docs skipped while scanning the ranked list to collect that
-  condensed top-10 (count of `NaN`-gain docs in the scanned prefix: from rank 1 up to and including
-  the 10th judged doc, or the whole returned list if fewer than 10 judged docs exist) — "number
-  where the judgement was missing".
+The Evaluator builds **one full eval list** from the policy, scanned to a depth of
+`max(recall cutoffs) = 100` (judged docs under `condensed`, positions under `irrelevant`); each metric
+then **slices** it. Let `g_1..g_m` be the point slice `eval_list[:10]` (`m = len(eval_list[:10])`):
 
-- **avg_relevance** (per query): mean graded gain over the condensed top-10:
-  `avg_relevance = (1/m) · Σ_{i=1..m} g_i`. **`NaN` if `m == 0`.**
-
-- **ndcg@10** (graded gains):
-  `DCG@10 = Σ_{i=1..m} (2^{g_i} − 1) / log2(i+1)` using **condensed positions** `1..m`.
-  Let `g_(1) >= g_(2) >= …` be this query's **judged** gains sorted descending (the ideal ordering,
-  over **all** the query's qrels — unaffected by skipping). Then
-  `IDCG@10 = Σ_{i=1..min(10, #judged)} (2^{g_(i)} − 1) / log2(i+1)`.
-  IDCG is explicitly **truncated to the top 10** of the ideal ordering (not summed over all judged
-  gains), so queries with more than 10 relevant docs are not deflated.
+- **avg_relevance** = `(1/m) · Σ_{i=1..m} g_i`. **`NaN` if `m == 0`.**
+- **ndcg@10**: `DCG@10 = Σ_{i=1..m} (2^{g_i} − 1) / log2(i+1)` over positions `1..m`. `IDCG@10` = DCG
+  of this query's **judged** gains sorted descending, **truncated to the top 10** (over all the
+  query's qrels, judged-only in both policies), so queries with > 10 relevant docs are not deflated.
   `nDCG@10 = DCG@10 / IDCG@10`, defined `0` if `IDCG@10 = 0`. **`NaN` if `m == 0`.**
+- **precision@10** = `|{g_i >= t}| / m` (`t` = threshold). `m = n_scored` under `condensed` (documented
+  explicitly), `m = min(10, n_results)` under `irrelevant`. **`NaN` if `m == 0`.**
+- **recall@k** (`k ∈ {10, 50, 100}`) = `|{g_i >= t in eval_list[:k]}| / R`, where
+  `R = #relevant judged docs for that query` over all of `label.csv` under the threshold. `recall@k`
+  slices the **same** eval list at each `k`, so it follows the policy (condensed under `condensed`,
+  standard under `irrelevant`). `recall@k = NaN` **iff `R == 0`**; otherwise defined (`0` for an
+  empty/failed result set — recall **penalizes retrieval failures**). A query returning fewer than
+  `k` docs caps at `recall@min(k, n_returned)` (expected).
 
-- **Binary relevance threshold:** a doc is **relevant** iff `gain >= 0.5` (`Partial` or `Exact`).
-  With WANDS grades `{0, 0.5, 1}`, `0.5` keeps "Partial or Exact" relevant.
+**Two DIAGNOSTIC counts are recorded (always condensed semantics at cutoff depth, in BOTH policies):**
+- **`n_scored`** = size of the condensed top-10 (`<= 10` judged docs) — "total this was calculated
+  from" (the point denom under `condensed`).
+- **`n_missing`** = `MISSING` docs skipped while scanning to the 10th judged doc (rank 1 up to and
+  including it, or the whole list if fewer than 10 judged) — "number where the judgement was missing".
 
-- **precision@10:** `|relevant ∩ condensed-top-10| / m` — the **denominator is `m = n_scored`,
-  NOT 10**. **`NaN` if `m == 0`.**
+**`n_relevant`** = `|R|` (the relevant-set size under the threshold) is also recorded per query
+(architecture.md §9); a `recall@k` whose `k/median(|R|)` falls below `0.2` is flagged
+**low-information** (logged + recorded under `diagnostics.recall_information`) — on WANDS
+`recall@10` (median `|R| ≈ 146`) is such a metric and should not be put in front of an audience.
 
-**Recall is STANDARD, at cutoffs `{10, 50, 100}` — a different semantics from the three condensed
-metrics above.** Recall is a **coverage** metric over the **actual retrieved positions**, not the
-condensed list:
+> **Why `condensed`, not `irrelevant` (the shipped choice).** WANDS is a **pooled** qrel set with a
+> high missing-at-depth ratio (mean `n_missing` over the retrieved 100 ≈ 5.65–8.49). Under
+> `irrelevant`, those many unjudged docs are scored gain `0`, which **systematically penalizes
+> whichever system surfaces more unjudged docs** — the classic pooled-dataset bias the condensed rule
+> exists to avoid, and it makes the semantic/hybrid wins *conservative* rather than optimistic.
+> Condensation costs only that recall reverts to the condensed list — largely cosmetic here, since
+> `recall@10` is uninformative on WANDS (above) and the headline FDR metric is `ndcg@10` (§8.3). The
+> `irrelevant` policy is implemented and selectable for a general (trec_eval-style) audience or a
+> densely-judged dataset; the WANDS instantiation ships `condensed`.
 
-- **recall@k** (`k ∈ {10, 50, 100}`): `|relevant ∩ actual top-k retrieved (positions 1..k)| / R`,
-  where `R = #relevant judged docs for that query` over all of `label.csv` (relevant iff
-  `gain >= 0.5`; `R` uses qrels directly). `recall@k = NaN` **iff `R == 0`**; otherwise it is always
-  defined (numerator `0..R`), so an empty/failed result set scores `0` — recall **penalizes
-  retrieval failures**. A query returning fewer than `k` docs caps at `recall@min(k, n_returned)`
-  (expected). `recall@100` is the coverage story at the normalized depth (architecture.md §5.3);
-  `recall@10` keeps a comparable headline; `recall@50` shows the curve between.
+> **Relevance-handling provenance (P0-3).** The recall semantics silently flipped once between runs
+> (a metric-semantics + retrieval-depth change bundled into one commit, unrecorded). That is now
+> closed: the resolved `metrics.unjudged`/`metrics.relevance_threshold` ride in the manifest, and a
+> **`dataset.qrels_digest`** — SHA-256 over the sorted `(query_id, doc_id, gain)` triples plus the
+> threshold — fingerprints the loaded, gain-mapped qrels (with the human-readable `gain_mapping`
+> alongside). **Two runs with differing digests, policies, or thresholds are not comparable**, and the
+> report must say so.
 
-  *Standard vs condensed, and why standard is invariant-safe.* Condensed recall would count hits
-  among the first `k` **judged** docs — which may reach far past retrieved position `k`, so it stops
-  measuring "did the top-k contain the relevant docs" (the coverage question) once MISSING docs
-  occupy top-k slots. Standard recall looks at the true positions. It does **not** violate the
-  MISSING invariant: the invariant forbids *scoring a MISSING doc as irrelevant* (gain 0) in a
-  metric; standard recall never does that — its denominator is `R` (fixed, from qrels) and a MISSING
-  doc in a top-k slot is simply not a relevant hit (contributes 0 to the numerator, is neither
-  counted relevant nor penalized in any denominator). The condensed rule exists to stop unjudged
-  docs from deflating **precision/nDCG**; recall's denominator is immune, so recall is the one metric
-  where actual-position (standard) semantics is both correct for coverage and invariant-safe. **All
-  three recall columns share this one definition** (including `recall@10`).
+> **`irrelevant`-policy DROP behaviour.** Under `condensed`, `avg_relevance`/`ndcg@10`/`precision@10`
+> are `NaN` (dropped) when `m == 0`, i.e. an empty result OR a non-empty **all-MISSING** top-k (a
+> pooling gap) — scoring an all-MISSING top-k `0` would treat MISSING as irrelevant, violating the
+> policy. Under `irrelevant` the §7 DROP no longer applies to a non-empty all-MISSING top-k (it
+> scores it, poorly, as trec_eval does); only a **truly empty** retrieval yields `NaN`.
 
-**Per-query NaN summary (each metric independent):** `avg_relevance`/`ndcg@10`/`precision@10` are
-`NaN` when `n_scored == 0`; every `recall@k` is `NaN` when `R == 0`. **Any** of the six metrics may
-be `NaN` for a given query. A `NaN` metric excludes that query from that metric's aggregation and
-deltas (§8.1). On disk any `NaN` metric cell is written as an **empty field** (architecture.md §9) —
-the comparator never re-parses the CSV; it excludes by the in-memory `NaN` (§8.1), so the empty-vs-NaN
-distinction is a pure serialization choice with no decision impact. The per-query `n_scored` and
-`n_missing` are recorded (architecture.md §9).
-
-> **Missing-judgement policy:** WANDS qrels are pooled. A **missing** judgement (no qrel entry) is
-> **NOT treated as irrelevant** — for the condensed metrics (`avg_relevance`/`ndcg@10`/`precision@10`)
-> it is **skipped** via **condensed-list evaluation** (Sakai): only **judged-irrelevant** docs
-> (`gain == 0.0`, actually labeled) count as a `0`. Standard recall never scores a MISSING doc as
-> irrelevant either (its denominator is `R`, from qrels). Per-query `n_scored` and `n_missing` are
-> recorded in the metrics CSV (architecture.md §9) so the missing-judgement ratio can be inspected
-> and revisited (architecture.md §13).
-
-> **Drop vs score-0 for `n_scored == 0` (DROP + retrieval-failure count).** A query with
-> `n_scored == 0` makes `avg_relevance`/`ndcg@10`/`precision@10` `NaN`, so it is **excluded**
-> ("dropped") from those metrics' aggregation and deltas, not scored `0`. Two distinct causes exist:
-> (a) an **empty result** (the system retrieved nothing — WANDS query 383 under bm25/bm25_rerank),
-> and (b) a **non-empty but all-MISSING top-k** (a pooling gap). DROP is kept because scoring an
-> all-MISSING top-k as `0` would treat MISSING as irrelevant — a direct violation of the
-> condensed-list invariant. Two things make DROP safe: (1) **standard recall already penalizes the
-> failure** (it scores an empty/failed retrieval `0`, not `NaN`, when `R > 0`), so coverage is
-> honestly accounted while the ranking-quality metrics abstain where they cannot measure; and (2) a
-> per-system **retrieval-failure count** (`#queries with n_results == 0`) is reported in
-> `run_config_{ts}.json` (architecture.md §9.1) so nothing failing is invisible.
+**Per-query NaN summary:** `avg_relevance`/`ndcg@10`/`precision@10` are `NaN` when `m == 0`; every
+`recall@k` is `NaN` when `R == 0`. A `NaN` metric excludes that query from that metric's aggregation
+and deltas (§8.1). On disk a `NaN` metric cell is an **empty field** (architecture.md §9); the
+comparator excludes by the in-memory `NaN`, not by re-parsing the CSV. A per-system
+**retrieval-failure count** (`#queries with n_results == 0`) is reported in `run_config_{ts}.json`
+(architecture.md §9.1) so nothing failing is invisible.
 
 ---
 
@@ -319,17 +307,31 @@ difference**.
   contrast's `family` flag, §8.1) AND `metric ∈ fdr_metrics` AND the row is non-degenerate**. Control
   the **False Discovery Rate (FDR)** — the expected proportion of false discoveries *among the
   rejections* — with **Benjamini-Hochberg (BH)** at FDR level `q = α = 0.05` by default, applied to
-  the **raw** p-values of the family rows only. The default `fdr_metrics = {ndcg@10, recall@100}` —
-  the two headline claims (**ranking quality** + **coverage**), nearly orthogonal, so adding
-  `recall@100` does not inflate the family the way the near-collinear `avg_relevance` + `precision@10`
-  (both ≈ fraction-relevant in a shallow window, moving together) would. With 6 family contrasts × 2
-  headline metrics the family is **12** BH tests — small, information-dense, no collinear padding.
+  the **raw** p-values of the family rows only. The default `fdr_metrics = {ndcg@10}` — the single
+  headline **ranking-quality** claim. With **8** declared family contrasts × **1** headline metric the
+  family is **8** BH tests (P1-1). `recall@50`/`recall@100` (and `avg_relevance`/`recall@10`/
+  `precision@10`) are **descriptive** — reported with a raw p + CI, outside the family. `recall@100`
+  was previously a second family metric; it is degenerate for reranker-only contrasts (a reranker
+  permutes the top-100 set without changing its membership) and produced a **duplicate** family
+  member, so it was removed from the family.
+- **Structural applicability of `recall@k` (MF-1) — reasoned exclusion, not a data-dependent drop.**
+  `recall@k` is **not identified** for a contrast between two systems differing **only by a reranker**
+  when **`rerank_window_size == k`** (top-k-set identity: the reranked and base top-k document SETS
+  are equal, so recall is invariant under reranking). Such a row is emitted **structurally decided** —
+  `in_family=false`, empty adjusted/significant, a **reason string** `note` (never a silent `NaN`),
+  no test/bootstrap call — regardless of the observed delta. At the shipped `W = 100` only
+  `recall@100` is excluded for the three rerank-only contrasts; `recall@10`/`recall@50` ARE identified
+  (reranking moves docs across those boundaries). The rule is computed in the **runner** from
+  `cfg.pipelines()` (so `evaluation/stats.py` names no adapter/pipeline, §11) and passed to the
+  comparator. **Family membership is structural, not data-dependent** (the old `delta == 0` exclusion
+  could silently admit a non-degenerate contrast). The manifest records `stats.family_size (m)`, the
+  full `family_members`, and the reasoned `excluded` contrasts (§9.1).
 - **Three row kinds, one consistency rule (M3):** **`in_family == false ⟺ p_value_adjusted and
   significant are BOTH empty`.** FDR-adjusted values exist ONLY for family rows.
   - **family** (`contrast.family AND metric ∈ fdr_metrics AND non-degenerate`): `in_family=true`,
     `p_value_adjusted` = BH/BY q-value, `significant` = FDR decision.
   - **descriptive** (a real test not in the family — a non-`family` contrast, or a non-headline metric
-    like `avg_relevance`/`recall@10`/`recall@50`/`precision@10`): `in_family=false`,
+    like `avg_relevance`/`recall@10`/`recall@50`/`recall@100`/`precision@10`): `in_family=false`,
     `p_value_adjusted` and `significant` **empty**; `delta` + bootstrap CI + raw
     `p_value`/`significant_raw` are still populated — context, not a decision.
   - **degenerate** (`empty_paired_set` / `all_zero_delta`, §8.1): `in_family=false`,

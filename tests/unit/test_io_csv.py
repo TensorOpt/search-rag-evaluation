@@ -92,16 +92,22 @@ def _metrics_by_variant() -> dict[str, dict[str, Metrics]]:
     """
     return {
         "bm25": {
-            "q_full": Metrics(0.75, 0.9, 0.5, 0.6, 0.7, 1.0, n_results=6, n_scored=4, n_missing=2),
+            "q_full": Metrics(
+                0.75, 0.9, 0.5, 0.6, 0.7, 1.0, n_results=6, n_scored=4, n_missing=2, n_relevant=8
+            ),
             "q_noscore": Metrics(
-                math.nan, math.nan, 0.0, 0.0, 0.0, math.nan, n_results=3, n_scored=0, n_missing=3
+                math.nan, math.nan, 0.0, 0.0, 0.0, math.nan,
+                n_results=3, n_scored=0, n_missing=3, n_relevant=5,
             ),
             "q_norel": Metrics(
-                0.0, 0.0, math.nan, math.nan, math.nan, 0.0, n_results=2, n_scored=2, n_missing=0
+                0.0, 0.0, math.nan, math.nan, math.nan, 0.0,
+                n_results=2, n_scored=2, n_missing=0, n_relevant=0,
             ),
         },
         "semantic_e5": {
-            "q_full": Metrics(0.8, 0.95, 1.0, 1.0, 1.0, 0.5, n_results=4, n_scored=3, n_missing=1),
+            "q_full": Metrics(
+                0.8, 0.95, 1.0, 1.0, 1.0, 0.5, n_results=4, n_scored=3, n_missing=1, n_relevant=4
+            ),
         },
     }
 
@@ -117,15 +123,41 @@ def test_metrics_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
 def test_metrics_header_ends_with_counts(tmp_path: Path) -> None:
     """The metrics header leads with variant and ends with the two int count columns (§9)."""
     path = write_metrics_csv(
-        {"bm25": {"q1": Metrics(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, n_results=2, n_scored=1, n_missing=0)}},
+        {
+            "bm25": {
+                "q1": Metrics(
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                    n_results=2, n_scored=1, n_missing=0, n_relevant=1,
+                )
+            }
+        },
         TIMESTAMP,
         output_dir=tmp_path,
     )
     header = path.read_text(encoding="utf-8").splitlines()[0]
     assert header == (
         "variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,"
-        "n_results,n_scored,n_missing"
+        "n_results,n_scored,n_missing,n_relevant"
     )
+
+
+def test_metrics_csv_has_n_relevant(tmp_path: Path) -> None:
+    """P2-3: the metrics CSV carries |R| as a trailing n_relevant int column."""
+    path = write_metrics_csv(
+        {
+            "bm25": {
+                "q1": Metrics(
+                    0.5, 0.5, 0.1, 0.2, 0.3, 0.9,
+                    n_results=100, n_scored=10, n_missing=3, n_relevant=146,
+                )
+            }
+        },
+        TIMESTAMP,
+        output_dir=tmp_path,
+    )
+    header, row = path.read_text(encoding="utf-8").splitlines()
+    assert header.endswith(",n_relevant")
+    assert row.split(",")[-1] == "146"  # |R| is the last cell
 
 
 def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None:
@@ -135,7 +167,7 @@ def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None
             "bm25": {
                 "q0": Metrics(
                     math.nan, math.nan, math.nan, math.nan, math.nan, math.nan,
-                    n_results=0, n_scored=0, n_missing=0,
+                    n_results=0, n_scored=0, n_missing=0, n_relevant=0,
                 )
             }
         },
@@ -143,8 +175,8 @@ def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None
         output_dir=tmp_path,
     )
     row = path.read_text(encoding="utf-8").splitlines()[1]
-    # variant + query_id + six empty metric cells + three int counts.
-    assert row == "bm25,q0,,,,,,,0,0,0"
+    # variant + query_id + six empty metric cells + four int counts.
+    assert row == "bm25,q0,,,,,,,0,0,0,0"
 
 
 # --- comparison CSV ---------------------------------------------------------------------------
@@ -343,15 +375,38 @@ def test_run_config_round_trips_and_has_section_9_1_fields(tmp_path: Path) -> No
     assert stats["bootstrap_B"] == 10000
     assert stats["ci_level"] == 0.95
     assert stats["test"] == "permutation"  # Fix 2: mean-δ permutation is the default
-    assert stats["wilcoxon_zero_method"] == "wilcox"
-    assert stats["wilcoxon_correction"] is True
+    # P2-2 (MF-3): wilcoxon_* params are omitted from the manifest when the test isn't wilcoxon.
+    assert "wilcoxon_zero_method" not in stats
+    assert "wilcoxon_correction" not in stats
     assert stats["seed"] == 1234
-    assert stats["fdr_metrics"] == ["ndcg@10", "recall@100"]  # StatsCfg default (Fix 7)
+    assert stats["fdr_metrics"] == ["ndcg@10"]  # StatsCfg default (P1-1: ndcg@10 only)
     assert stats["contrasts"] == []  # StatsCfg default (no contrasts synthesized outside resolve)
 
     # Diagnostics key is always present (null when the writer is called without diagnostics).
     assert "diagnostics" in loaded
     assert loaded["diagnostics"] is None
+
+
+def test_run_config_redacts_secrets(
+    tmp_path: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-1 / verification test 6: no substring of a secret appears in the manifest; ${VAR} emitted."""
+    from benchmark.config import load_config
+
+    secret = "sk-cohere-SECRET-value-do-not-leak"
+    monkeypatch.setenv("COHERE_KEY", secret)
+    monkeypatch.setenv("ES_URL", "http://localhost:9200")
+    cfg = load_config(repo_root / "config.yaml")
+    path = write_run_config(cfg, output_dir=tmp_path)
+    text = path.read_text(encoding="utf-8")
+
+    assert secret not in text  # NO substring of the live secret anywhere in the manifest
+    assert "${COHERE_KEY}" in text  # the placeholder name is emitted instead
+    loaded = json.loads(text)
+    assert loaded["services"]["embedders"]["cohere"]["settings"]["api_key"] == "${COHERE_KEY}"
+    assert loaded["services"]["rerankers"]["co-rr"]["settings"]["api_key"] == "${COHERE_KEY}"
+    # secret_env_refs is popped before serialization — it never rides in the manifest.
+    assert "secret_env_refs" not in loaded
 
 
 def test_run_config_from_full_config_yaml(tmp_path: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:

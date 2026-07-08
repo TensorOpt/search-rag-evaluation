@@ -5,7 +5,7 @@ UTC timestamp ``YYYYMMDDTHHMMSSZ`` (§9). The three CSVs are ONE file per run (a
 comparisons), each carrying a leading identity column:
 
 - :func:`write_results_csv`  -> ``result_{ts}.csv``   : ``variant,query_id,product_id,score,position``
-- :func:`write_metrics_csv`  -> ``metrics_{ts}.csv``  : ``variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing``
+- :func:`write_metrics_csv`  -> ``metrics_{ts}.csv``  : ``variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing,n_relevant``
 - :func:`write_comparison_csv` -> ``comparison_{ts}.csv`` : the 14-column §9 header
 - :func:`write_run_config`   -> ``run_config_{ts}.json`` : the fully-resolved config + diagnostics (§9.1)
 
@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from benchmark.common.models import RankedResult
-from benchmark.config import ResolvedConfig
+from benchmark.config import _SECRET_KEY_RE, ResolvedConfig
 from benchmark.evaluation.metrics import Metrics
 from benchmark.evaluation.stats import ComparisonResult
 
@@ -70,6 +70,7 @@ _METRICS_HEADER: tuple[str, ...] = (
     "n_results",
     "n_scored",
     "n_missing",
+    "n_relevant",
 )
 _COMPARISON_HEADER: tuple[str, ...] = (
     "system_a",
@@ -167,7 +168,7 @@ def write_metrics_csv(
                 metric_values = m.as_dict()
                 row: list[Any] = [variant_id, query_id]
                 row.extend(_float_cell(metric_values[name]) for name in _METRIC_COLUMNS)
-                row.extend([m.n_results, m.n_scored, m.n_missing])
+                row.extend([m.n_results, m.n_scored, m.n_missing, m.n_relevant])
                 writer.writerow(row)
     return path
 
@@ -232,12 +233,45 @@ def write_run_config(
     """
     path = _artifact_path(output_dir, f"run_config_{cfg.timestamp}.json")
     payload = dataclasses.asdict(cfg)
+    # P0-1: pop the secret placeholder map (never serialized), then redact every secret-named key to
+    # its ``${VAR}`` placeholder (``${REDACTED}`` backstop if the lookup misses). Redaction is by key
+    # name and unconditional, so a secret value can never pass through even if a ref is absent.
+    refs = payload.pop("secret_env_refs", {})
+    _redact_secrets(payload, refs)
+    # P2-2 (MF-3): omit the wilcoxon-only params from the serialized stats block when the test isn't
+    # wilcoxon, so a permutation-run manifest never implies Wilcoxon was used. The StatsCfg fields
+    # stay (Wilcoxon selectable); config load already rejects the keys under a non-wilcoxon test.
+    stats_block = payload.get("stats")
+    if isinstance(stats_block, dict) and stats_block.get("test") != "wilcoxon":
+        stats_block.pop("wilcoxon_zero_method", None)
+        stats_block.pop("wilcoxon_correction", None)
     payload["diagnostics"] = diagnostics
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
     return path
+
+
+def _redact_secrets(obj: Any, refs: Mapping[str, str]) -> None:
+    """Walk ``obj`` in place, redacting every secret-named key to its ``${VAR}`` name (P0-1).
+
+    For any mapping key matching ``_SECRET_KEY_RE`` (``api_key``/``token``/``secret``/``password``/
+    ``credential``, case-insensitive), the value is replaced by ``refs[value]`` (the ``${VAR}``
+    placeholder recorded at load) or the ``"${REDACTED}"`` backstop when the lookup misses. Because
+    the load-time rule (config ``_substitute_env``) forces every secret to be a ``${VAR}``
+    placeholder, the exact name is emitted in practice; the backstop makes the redaction airtight
+    regardless. Non-secret keys are recursed into but never altered.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                _redact_secrets(v, refs)
+            elif isinstance(k, str) and _SECRET_KEY_RE.search(k) is not None:
+                obj[k] = refs.get(v, "${REDACTED}") if isinstance(v, str) else "${REDACTED}"
+    elif isinstance(obj, list):
+        for item in obj:
+            _redact_secrets(item, refs)
 
 
 def _artifact_path(output_dir: str | Path, filename: str) -> Path:

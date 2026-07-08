@@ -13,7 +13,7 @@ import math
 import pytest
 
 from benchmark.common.models import Qrel, RankedResult, ScoredDoc
-from benchmark.evaluation.metrics import Evaluator, Metrics, QrelIndex
+from benchmark.evaluation.metrics import Evaluator, Metrics, QrelIndex, qrels_digest
 
 
 def _rr(query_id: str, doc_ids: list[str]) -> RankedResult:
@@ -58,7 +58,7 @@ def test_metrics_as_dict_exact_canonical_keys():
     m = Metrics(
         avg_relevance=0.1, ndcg_at_10=0.2, recall_at_10=0.3, recall_at_50=0.35,
         recall_at_100=0.45, precision_at_10=0.4,
-        n_results=7, n_scored=5, n_missing=2,
+        n_results=7, n_scored=5, n_missing=2, n_relevant=3,
     )
     d = m.as_dict()
     assert set(d.keys()) == {
@@ -137,10 +137,9 @@ def test_condensed_reaches_past_rank_ten():
     #   n_scored = 10, n_missing = 2 (the two missing docs in the scanned prefix, ranks 1-2).
     #   All 10 condensed gains are 1.0 -> a perfect top-10. R = 10 judged relevant.
     #   IDCG@10 = Σ_{i=1..10} 1/log2(i+1); DCG over condensed == IDCG -> nDCG == 1.0.
-    # STANDARD recall@10 (Fix 4) is over the ACTUAL top-10 positions, NOT the condensed list:
-    #   result.docs[:10] = [m1, m2, p0..p7]; relevant hits among them = p0..p7 = 8 -> recall@10 =
-    #   8/10 = 0.8 (the two MISSING docs occupy top-10 slots and are not hits). recall@50/@100 see
-    #   all 12 docs -> all 10 relevant -> 1.0.
+    # Under the CONDENSED policy (P0-2) recall slices the SAME condensed eval list (MISSING dropped):
+    #   the condensed list is [p0..p9] (all 10 judged), so recall@10 = 10/R = 10/10 = 1.0. The two
+    #   MISSING docs are dropped, NOT scored — recall@50/@100 are likewise 1.0.
     judged = [Qrel("q1", f"p{i}", 1.0) for i in range(10)]
     qrels = QrelIndex(judged)
     returned = ["m1", "m2"] + [f"p{i}" for i in range(10)]  # 2 missing, then 10 judged
@@ -148,11 +147,12 @@ def test_condensed_reaches_past_rank_ten():
 
     assert m.n_scored == 10
     assert m.n_missing == 2  # only the two missing docs seen before the 10th judged doc
+    assert m.n_relevant == 10  # R = |relevant judged| under the resolved threshold
     assert m.avg_relevance == pytest.approx(1.0, abs=1e-12)
     assert math.isclose(m.ndcg_at_10, 1.0, abs_tol=1e-12)
     assert m.precision_at_10 == pytest.approx(1.0, abs=1e-12)  # 10/10, denom = n_scored
-    assert m.recall_at_10 == pytest.approx(8.0 / 10.0, abs=1e-12)  # standard: 8 hits in top-10 / R=10
-    assert m.recall_at_50 == pytest.approx(1.0, abs=1e-12)  # all 10 relevant in top-50 / R=10
+    assert m.recall_at_10 == pytest.approx(1.0, abs=1e-12)  # condensed: 10 relevant judged / R=10
+    assert m.recall_at_50 == pytest.approx(1.0, abs=1e-12)
     assert m.recall_at_100 == pytest.approx(1.0, abs=1e-12)
 
 
@@ -317,6 +317,95 @@ def test_score_run_keyed_by_query_id():
     out = Evaluator(qrels).score_run([_rr("q1", ["p1"]), _rr("q2", ["p2"])])
     assert set(out.keys()) == {"q1", "q2"}
     assert all(isinstance(v, Metrics) for v in out.values())
+
+
+# --- P0-2: one uniform policy over all metrics -----------------------------------------------
+
+
+@pytest.mark.parametrize("unjudged", ["condensed", "irrelevant"])
+def test_relevant_count_coherence_under_both_policies(unjudged: str):
+    # Verification test 3: at cutoff 10, precision@10 and recall@10 slice the SAME eval list, so
+    # round(precision@10 * denom) == round(recall@10 * R) (the shared relevant-count in the top-10),
+    # under BOTH policies. Ranking mixes relevant, judged-irrelevant, and MISSING docs.
+    qrels = QrelIndex(
+        [
+            Qrel("q1", "p_a", 1.0),   # relevant
+            Qrel("q1", "p_b", 0.0),   # judged-irrelevant
+            Qrel("q1", "p_c", 0.5),   # relevant
+            Qrel("q1", "p_d", 1.0),   # relevant, not returned
+        ]
+    )
+    returned = ["p_a", "p_miss", "p_b", "p_c"]  # a MISSING (unjudged) doc among the judged ones
+    ev = Evaluator(qrels, cutoff=10, unjudged=unjudged, relevance_threshold=0.5)
+    m = ev.score_run([_rr("q1", returned)])["q1"]
+
+    # denom for precision: n_scored under condensed, min(cutoff, n_results) under irrelevant.
+    denom = m.n_scored if unjudged == "condensed" else min(10, m.n_results)
+    r = m.n_relevant
+    assert round(m.precision_at_10 * denom) == round(m.recall_at_10 * r)
+
+
+def test_unjudged_policy_irrelevant_scores_unjudged_as_zero():
+    # Under `irrelevant`, a MISSING doc is scored gain 0.0 in place (not dropped): it lands in the
+    # top-cutoff and pushes precision's denominator to k. Two returned docs: one relevant judged,
+    # one MISSING. condensed -> precision 1/1 = 1.0 (MISSING dropped). irrelevant -> precision
+    # 1/2 = 0.5 (MISSING kept, denom = n_results here since < cutoff).
+    qrels = QrelIndex([Qrel("q1", "p_rel", 1.0)])
+    returned = ["p_rel", "p_miss"]
+
+    condensed = Evaluator(qrels, unjudged="condensed").score_run([_rr("q1", returned)])["q1"]
+    irrelevant = Evaluator(qrels, unjudged="irrelevant").score_run([_rr("q1", returned)])["q1"]
+
+    assert condensed.precision_at_10 == pytest.approx(1.0, abs=1e-12)
+    assert irrelevant.precision_at_10 == pytest.approx(0.5, abs=1e-12)
+    # avg_relevance drops too: (1.0)/1 vs (1.0 + 0.0)/2.
+    assert condensed.avg_relevance == pytest.approx(1.0, abs=1e-12)
+    assert irrelevant.avg_relevance == pytest.approx(0.5, abs=1e-12)
+    # n_scored/n_missing diagnostics are condensed in BOTH policies (unchanged).
+    assert condensed.n_scored == irrelevant.n_scored == 1
+    assert condensed.n_missing == irrelevant.n_missing == 1
+
+
+def test_unjudged_policy_rejects_unknown_value():
+    with pytest.raises(ValueError, match="unknown unjudged policy"):
+        Evaluator(QrelIndex([]), unjudged="bogus")
+
+
+def test_relevance_threshold_injected_into_qrelindex():
+    # A threshold of 1.0 makes only Exact (1.0) count toward R; Partial (0.5) no longer relevant.
+    idx = QrelIndex([Qrel("q1", "p1", 1.0), Qrel("q1", "p2", 0.5)], relevance_threshold=1.0)
+    assert idx.relevant_count("q1") == 1
+
+
+# --- P0-3: qrels digest ------------------------------------------------------------------------
+
+
+def test_qrels_digest_stable_and_sensitive():
+    base = [Qrel("q1", "p1", 1.0), Qrel("q1", "p2", 0.5), Qrel("q2", "p3", 0.0)]
+    d = qrels_digest(base, relevance_threshold=0.5)
+    # Stable: identical triples + threshold + order-independence -> identical digest.
+    assert qrels_digest(list(reversed(base)), relevance_threshold=0.5) == d
+    # Sensitive: flip a grade / add a triple / change the threshold -> different digest.
+    flipped = [Qrel("q1", "p1", 0.5), Qrel("q1", "p2", 0.5), Qrel("q2", "p3", 0.0)]
+    assert qrels_digest(flipped, relevance_threshold=0.5) != d
+    assert qrels_digest(base + [Qrel("q3", "p9", 1.0)], relevance_threshold=0.5) != d
+    assert qrels_digest(base, relevance_threshold=0.6) != d
+
+
+def test_recall_cutoffs_independent_of_cutoff():
+    # P2-2: `cutoff` governs ONLY the point metrics; RECALL_CUTOFFS are independent and untruncated
+    # by it. Two evaluators with different cutoffs produce the SAME recall@k.
+    judged = [Qrel("q1", f"p{i}", 1.0) for i in range(60)]
+    qrels = QrelIndex(judged)
+    returned = [f"p{i}" for i in range(60)]
+    m2 = Evaluator(qrels, cutoff=2).score_run([_rr("q1", returned)])["q1"]
+    m10 = Evaluator(qrels, cutoff=10).score_run([_rr("q1", returned)])["q1"]
+    assert m2.recall_at_10 == m10.recall_at_10
+    assert m2.recall_at_50 == m10.recall_at_50
+    assert m2.recall_at_100 == m10.recall_at_100
+    # recall@k slices at k, NOT at cutoff -> distinct values for distinct k.
+    assert m10.recall_at_10 == pytest.approx(10.0 / 60.0)
+    assert m10.recall_at_50 == pytest.approx(50.0 / 60.0)
 
 
 def test_custom_cutoff_condensed_denominator():

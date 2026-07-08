@@ -32,7 +32,7 @@ import importlib
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -61,6 +61,12 @@ _RERANKER_PROVIDERS = ("cohere", "voyage")
 
 #: ``${VAR}`` env placeholder (§10). Whole-value only — secrets are always their own scalar.
 _ENV_PLACEHOLDER = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+#: Config keys whose values are secrets (P0-1). Any key CONTAINING one of these substrings
+#: (case-insensitive) must be supplied as a ``${VAR}`` placeholder at load (never a literal), and is
+#: redacted to its ``${VAR}`` name in the run manifest (io_csv ``_redact_secrets``). One definition,
+#: shared with ``io_csv`` so the reject-at-load rule and the redact-at-write rule use the same key set.
+_SECRET_KEY_RE = re.compile(r"(api_key|token|secret|password|credential)", re.IGNORECASE)
 
 #: Adapter dispatch: dataset.name / indexer.provider -> dotted "module:attr" target. Resolved
 #: LAZILY (Phase 11) so this phase imports no adapter and stays offline (§11).
@@ -210,6 +216,22 @@ class CacheCfg:
 
 
 @dataclass(frozen=True)
+class MetricsCfg:
+    """The ONE relevance policy governing ALL six metrics (docs/methodology.md §7, P0-2).
+
+    ``unjudged`` selects how an unjudged (MISSING) returned doc is treated, UNIFORMLY across every
+    metric: ``"condensed"`` (Sakai deletion — MISSING dropped from the eval list, the shipped
+    default) or ``"irrelevant"`` (trec_eval — MISSING scored as gain ``0.0`` on the raw list,
+    ``precision@k`` denom ``k``). ``relevance_threshold`` is the binary-relevance cut applied to
+    EVERY binary metric (``precision@k``/``recall@k``) and to ``QrelIndex.relevant_count``/the qrels
+    digest (N-3). Both keys default (condensed / 0.5) when the ``metrics`` block is absent.
+    """
+
+    unjudged: str = "condensed"
+    relevance_threshold: float = 0.5
+
+
+@dataclass(frozen=True)
 class ResolvedConfig:
     """The fully-resolved run configuration (§10, §9.1 run metadata).
 
@@ -234,6 +256,15 @@ class ResolvedConfig:
     timestamp: str
     seed: int
     cache: CacheCfg = CacheCfg()
+    #: P0-2: the single relevance policy (unjudged handling + threshold) over ALL six metrics.
+    #: Defaulted (condensed / 0.5) so the ``metrics`` config block is optional and existing keyword
+    #: constructors keep working; ``resolve_config`` always sets it from the resolved config.
+    metrics: MetricsCfg = MetricsCfg()
+    #: P0-1: resolved-secret-value -> ``"${VAR}"`` placeholder name, recorded at load. Popped by
+    #: ``io_csv.write_run_config`` BEFORE serialization (never written) and used to reconstruct the
+    #: placeholder name for each redacted secret. Defaulted so existing keyword constructors keep
+    #: working; empty when the config had no secrets.
+    secret_env_refs: Mapping[str, str] = field(default_factory=dict)
 
     def pipelines(self) -> list[PipelineCfg]:
         """The run's pipelines, baseline first (§6)."""
@@ -313,24 +344,40 @@ class ConfigError(ValueError):
     or a pipeline that violates the §10 field rules)."""
 
 
-def _substitute_env(value: Any) -> Any:
-    """Recursively replace whole-value ``${VAR}`` scalars with ``os.environ[VAR]`` (§10).
+def _substitute_env(
+    value: Any, *, key: str | None = None, refs: dict[str, str] | None = None
+) -> Any:
+    """Recursively replace whole-value ``${VAR}`` scalars with ``os.environ[VAR]`` (§10, P0-1).
 
     A missing environment variable for a referenced placeholder is a clear error — secrets must be
-    supplied at run time, never defaulted silently.
+    supplied at run time, never defaulted silently. ``key`` is the mapping key the scalar sits under
+    (threaded on recursion) so the loader can enforce the P0-1 secret rule: a scalar under a
+    secret-named key (``_SECRET_KEY_RE``) MUST be a ``${VAR}`` placeholder, never a literal — else
+    :class:`ConfigError` (fail-fast). While substituting, the ``${VAR}`` origin of each secret is
+    recorded into ``refs`` (resolved value -> ``"${VAR}"``) so the manifest writer can emit the
+    placeholder name, never the value.
     """
     if isinstance(value, str):
+        is_secret = key is not None and _SECRET_KEY_RE.search(key) is not None
         match = _ENV_PLACEHOLDER.match(value)
         if match is None:
+            if is_secret:
+                raise ConfigError(
+                    f"secret key {key!r} must be provided as a ${{VAR}} placeholder, "
+                    "not a literal value"
+                )
             return value
         var = match.group(1)
         if var not in os.environ:
             raise ConfigError(f"environment variable {var!r} referenced as ${{{var}}} is not set")
-        return os.environ[var]
+        resolved = os.environ[var]
+        if is_secret and refs is not None:
+            refs[resolved] = value  # value == "${VAR}"; resolved value -> its placeholder name
+        return resolved
     if isinstance(value, Mapping):
-        return {k: _substitute_env(v) for k, v in value.items()}
+        return {k: _substitute_env(v, key=k, refs=refs) for k, v in value.items()}
     if isinstance(value, list):
-        return [_substitute_env(v) for v in value]
+        return [_substitute_env(v, key=key, refs=refs) for v in value]
     return value
 
 
@@ -361,7 +408,8 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
     """
     from datetime import datetime, timezone
 
-    cfg = _substitute_env(dict(raw))
+    secret_env_refs: dict[str, str] = {}
+    cfg = _substitute_env(dict(raw), refs=secret_env_refs)
 
     dataset = _require(cfg, "dataset", "config")
     indexer = _require(cfg, "indexer", "config")
@@ -379,6 +427,7 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
         enabled=bool(raw_cache.get("enabled", False)),
         dir=str(raw_cache.get("dir", ".cache")),
     )
+    metrics = _resolve_metrics(cfg.get("metrics"))
 
     return ResolvedConfig(
         dataset=dataset,
@@ -393,6 +442,33 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
         timestamp=timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         seed=int(stats.seed),
         cache=cache,
+        metrics=metrics,
+        secret_env_refs=secret_env_refs,
+    )
+
+
+#: Valid ``metrics.unjudged`` policies (§7, P0-2). Exhaustive — anything else is a ConfigError.
+_UNJUDGED_POLICIES = ("condensed", "irrelevant")
+
+
+def _resolve_metrics(raw: Any) -> MetricsCfg:
+    """Build :class:`MetricsCfg` from the §10 ``metrics`` block (P0-2). Absent -> condensed / 0.5.
+
+    ``unjudged`` is validated against :data:`_UNJUDGED_POLICIES` (exhaustive, fail-fast);
+    ``relevance_threshold`` is parsed as a float. One policy governs every metric.
+    """
+    block = raw or {}
+    if not isinstance(block, Mapping):
+        raise ConfigError("'metrics' must be a mapping of {unjudged, relevance_threshold}")
+    unjudged = str(block.get("unjudged", "condensed"))
+    if unjudged not in _UNJUDGED_POLICIES:
+        raise ConfigError(
+            f"metrics.unjudged {unjudged!r} is not a valid policy; "
+            f"expected one of {list(_UNJUDGED_POLICIES)}"
+        )
+    return MetricsCfg(
+        unjudged=unjudged,
+        relevance_threshold=float(block.get("relevance_threshold", 0.5)),
     )
 
 
@@ -628,12 +704,22 @@ def _resolve_stats(
     system_ids = {baseline_id, *variant_ids}
     contrasts = _resolve_contrasts(raw.get("contrasts"), baseline_id, variant_ids, system_ids)
     fdr_metrics = _resolve_fdr_metrics(raw.get("fdr_metrics"))
+    test = str(raw.get("test", "permutation"))
+    # P2-2: fail fast on a wilcoxon-only key the selected test does not consume, so the manifest
+    # never implies a test that was not run (MF-3). The keys stay valid under `test: wilcoxon`.
+    if test != "wilcoxon":
+        for key in ("wilcoxon_zero_method", "wilcoxon_correction"):
+            if key in raw:
+                raise ConfigError(
+                    f"stats.{key} is set but stats.test={test!r} does not consume it; "
+                    "remove it or set stats.test: wilcoxon"
+                )
     return StatsCfg(
         bootstrap_B=int(raw.get("bootstrap_B", 10000)),
         ci_level=float(raw.get("ci_level", 0.95)),
         alpha=float(raw.get("alpha", 0.05)),
         correction=str(raw.get("correction", "bh")),
-        test=str(raw.get("test", "permutation")),
+        test=test,
         wilcoxon_zero_method=str(raw.get("wilcoxon_zero_method", "wilcox")),
         wilcoxon_correction=bool(raw.get("wilcoxon_correction", True)),
         seed=int(_require(raw, "seed", "stats")),

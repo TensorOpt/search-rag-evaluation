@@ -118,6 +118,23 @@ def test_missing_required_key_raises() -> None:
         resolve_config(raw)
 
 
+def test_literal_secret_rejected_at_load() -> None:
+    # P0-1: a secret-named key (api_key) with a LITERAL value (not a ${VAR} placeholder) must fail
+    # fast at load — secrets are always env placeholders, never in the file.
+    raw = _parsed()
+    raw["services"][0]["embedder"]["settings"]["api_key"] = "sk-literal-not-a-placeholder"
+    with pytest.raises(ConfigError, match="must be provided as a"):
+        resolve_config(raw)
+
+
+def test_secret_env_refs_records_placeholder() -> None:
+    # P0-1: resolving a ${VAR} secret records resolved-value -> "${VAR}" so the manifest writer can
+    # emit the placeholder name (never the value).
+    resolved = resolve_config(_parsed())
+    assert resolved.secret_env_refs["co-test"] == "${COHERE_KEY}"
+    assert resolved.secret_env_refs["vo-test"] == "${VOYAGE_KEY}"
+
+
 def test_stats_block_parsed() -> None:
     resolved = resolve_config(_parsed())
     assert resolved.stats.ci_level == pytest.approx(0.95)  # parsed, never a gate (§8.2)
@@ -126,11 +143,49 @@ def test_stats_block_parsed() -> None:
     assert resolved.stats.seed == 1234
 
 
+def test_metrics_block_defaults_to_condensed_half() -> None:
+    # P0-2: absent `metrics` block -> condensed / 0.5 (the shipped default policy).
+    resolved = resolve_config(_parsed())
+    assert resolved.metrics.unjudged == "condensed"
+    assert resolved.metrics.relevance_threshold == pytest.approx(0.5)
+
+
+def test_metrics_block_parsed() -> None:
+    raw = _parsed()
+    raw["metrics"] = {"unjudged": "irrelevant", "relevance_threshold": 1.0}
+    resolved = resolve_config(raw)
+    assert resolved.metrics.unjudged == "irrelevant"
+    assert resolved.metrics.relevance_threshold == pytest.approx(1.0)
+
+
+def test_unjudged_policy_rejects_unknown_value() -> None:
+    raw = _parsed()
+    raw["metrics"] = {"unjudged": "bogus"}
+    with pytest.raises(ConfigError, match="not a valid policy"):
+        resolve_config(raw)
+
+
 def test_stats_test_defaults_to_permutation() -> None:
     # Fix 2: when `stats.test` is absent, the default is the mean-δ permutation test.
     raw = _parsed()
     del raw["stats"]["test"]
     assert resolve_config(raw).stats.test == "permutation"
+
+
+def test_wilcoxon_keys_rejected_when_test_not_wilcoxon() -> None:
+    # P2-2 (MF-3): a wilcoxon-only key under a non-wilcoxon test is an unconsumed key -> fail fast.
+    raw = _parsed()
+    raw["stats"]["test"] = "permutation"
+    raw["stats"]["wilcoxon_zero_method"] = "wilcox"
+    with pytest.raises(ConfigError, match="does not consume it"):
+        resolve_config(raw)
+
+
+def test_wilcoxon_keys_allowed_when_test_is_wilcoxon() -> None:
+    raw = _parsed()
+    raw["stats"]["test"] = "wilcoxon"
+    raw["stats"]["wilcoxon_zero_method"] = "pratt"
+    assert resolve_config(raw).stats.wilcoxon_zero_method == "pratt"
 
 
 # --- stats.contrasts / stats.fdr_metrics (§8.1/§8.3, Fix 3/6/7) --------------------------------
@@ -163,8 +218,9 @@ def test_contrasts_parsed_from_config() -> None:
     )
 
 
-def test_fdr_metrics_defaults_to_headline_pair() -> None:
-    assert resolve_config(_parsed()).stats.fdr_metrics == ("ndcg@10", "recall@100")
+def test_fdr_metrics_defaults_to_ndcg_only() -> None:
+    # P1-1: the FDR family is ndcg@10 only; recall@50/@100 are descriptive.
+    assert resolve_config(_parsed()).stats.fdr_metrics == ("ndcg@10",)
 
 
 def test_fdr_metrics_parsed_from_config() -> None:
@@ -179,6 +235,16 @@ def test_unknown_contrast_id_raises() -> None:
     raw["stats"]["contrasts"] = [{"a": "nope", "b": "baseline", "family": True}]
     with pytest.raises(ConfigError, match="unknown system"):
         resolve_config(raw)
+
+
+def test_eight_contrasts_declared(repo_root: Path) -> None:
+    # P1-1: config.yaml declares all EIGHT contrasts a priori, family=ndcg@10 only.
+    cfg = load_config(repo_root / "config.yaml")
+    assert len(cfg.stats.contrasts) == 8
+    assert cfg.stats.fdr_metrics == ("ndcg@10",)
+    pairs = {(c.a, c.b) for c in cfg.stats.contrasts}
+    assert ("semantic_co_rerank", "bm25_rerank") in pairs  # embeddings-with-rerank contrast
+    assert ("hybrid_co_rerank", "semantic_co_rerank") in pairs  # fusion-with-rerank contrast
 
 
 def test_unknown_fdr_metric_raises() -> None:

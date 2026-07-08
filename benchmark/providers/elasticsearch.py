@@ -69,6 +69,16 @@ _KNN_NUM_CANDIDATES = 100
 #: Log an ingest progress line every this many successfully-indexed docs.
 _BULK_PROGRESS_EVERY = 10_000
 
+#: Name of the named BM25 similarity the ``search_text`` field carries (§5, P1-2). Set EXPLICITLY on
+#: the field + defined in index settings so the resolved ``k1``/``b`` read back from ``_settings``.
+_BM25_SIMILARITY = "bm25_tuned"
+
+#: ES BM25 defaults (``k1``/``b``) — the STANDARD run keeps these (no tuning, decision 3); recorded
+#: resolved from the index either way. The default analyzer is the built-in ``standard``.
+_DEFAULT_BM25_K1 = 1.2
+_DEFAULT_BM25_B = 0.75
+_DEFAULT_ANALYZER = "standard"
+
 
 def _make_client(indexer_cfg: Mapping[str, Any]) -> Elasticsearch:
     """Build an :class:`Elasticsearch` client from ``indexer.settings.url`` (§10).
@@ -154,6 +164,14 @@ class ESIndexWriter(IndexWriter):
         settings = indexer_cfg["settings"]
         self.bulk_chunk_size: int = int(settings.get("bulk_chunk_size", _BULK_CHUNK_SIZE))
         self.embed_batch_size: int = int(settings.get("embed_batch_size", _EMBED_BATCH_SIZE))
+        # P1-2: explicit BM25 similarity (k1/b) + analyzer, baked into the index at build so the
+        # baseline is recorded, not ES defaults applied silently. Absent -> the ES defaults, set
+        # EXPLICITLY so they read back from _settings/_mapping (SF-2).
+        bm25 = settings.get("bm25") or {}
+        self.bm25_k1: float = float(bm25.get("k1", _DEFAULT_BM25_K1))
+        self.bm25_b: float = float(bm25.get("b", _DEFAULT_BM25_B))
+        analysis = settings.get("analysis") or {}
+        self.analyzer: str = str(analysis.get("analyzer", _DEFAULT_ANALYZER))
 
     def sem_field_name(self, embedder_id: str) -> str:
         """The backend-safe ``dense_vector`` field name for ``embedder_id`` (§5.2)."""
@@ -171,7 +189,9 @@ class ESIndexWriter(IndexWriter):
         field name -> the embedder's output dim. Produces the same ``{"properties": {...}}`` body the
         former free ``_schema_to_mapping`` built, wrapped in an ``IndexMapping`` naming this index.
         """
-        backend_mapping = _schema_to_mapping(schema, vector_dims)
+        backend_mapping = _schema_to_mapping(
+            schema, vector_dims, similarity=_BM25_SIMILARITY, analyzer=self.analyzer
+        )
         return IndexMapping(
             index_name=self.index,
             search_text_field=schema.search_text_field,
@@ -179,13 +199,30 @@ class ESIndexWriter(IndexWriter):
             backend_mapping=backend_mapping,
         )
 
+    def _index_settings(self) -> dict[str, Any]:
+        """Index settings baking the explicit BM25 similarity (k1/b) into the index (§5, P1-2).
+
+        The tuned similarity is referenced by name on the ``search_text`` field (``_schema_to_mapping``)
+        and defined here, so its ``k1``/``b`` read back from ``_settings``. The analyzer is the
+        built-in referenced on the field (no custom ``analysis`` block needed for a built-in).
+        """
+        return {
+            "similarity": {
+                _BM25_SIMILARITY: {"type": "BM25", "k1": self.bm25_k1, "b": self.bm25_b}
+            }
+        }
+
     def ensure_index(self, mapping: IndexMapping) -> None:
-        """Create ``mapping.index_name`` with the §5.2 mappings body; skip if it exists (idempotent)."""
+        """Create ``mapping.index_name`` with the §5.2 mappings + BM25 settings; idempotent skip."""
         if self.client.indices.exists(index=mapping.index_name):
             logger.info("index %r already exists; skipping create", mapping.index_name)
             return
         logger.info("creating index %r", mapping.index_name)
-        self.client.indices.create(index=mapping.index_name, mappings=mapping.backend_mapping)
+        self.client.indices.create(
+            index=mapping.index_name,
+            mappings=mapping.backend_mapping,
+            settings=self._index_settings(),
+        )
 
     def doc_count(self) -> int | None:
         """Number of docs currently in the index, or ``None`` if the index does not exist (§6).
@@ -197,6 +234,42 @@ class ESIndexWriter(IndexWriter):
         if not self.client.indices.exists(index=self.index):
             return None
         return int(self.client.count(index=self.index)["count"])
+
+    def resolved_index_profile(self) -> dict[str, Any]:
+        """The BM25 similarity + analysis chain RESOLVED FROM the live index (§5, P1-2).
+
+        Reads ``_mapping`` (the ``search_text`` field's ``similarity``/``analyzer`` names) and
+        ``_settings?include_defaults=true`` (the named similarity's ``k1``/``b`` — falling back to the
+        ES BM25 defaults when the field uses the built-in ``BM25`` similarity; and any custom analyzer
+        definition). Never assumed — read back so the manifest records what the index actually scores
+        with. The single ``text`` field is ``search_text`` (our schema has exactly one).
+        """
+        mapping = self.client.indices.get_mapping(index=self.index)[self.index]["mappings"]
+        props = mapping.get("properties", {})
+        text_field = next(
+            (name for name, spec in props.items() if spec.get("type") == "text"), None
+        )
+        field_spec = props.get(text_field, {}) if text_field is not None else {}
+        similarity_name = field_spec.get("similarity", "BM25")
+        analyzer_name = field_spec.get("analyzer", _DEFAULT_ANALYZER)
+
+        raw = self.client.indices.get_settings(index=self.index, include_defaults=True)[self.index]
+        index_settings = {**raw.get("defaults", {}), **raw.get("settings", {})}.get("index", {})
+        sim_def = index_settings.get("similarity", {}).get(similarity_name, {})
+        analysis = index_settings.get("analysis", {})
+        analyzer_def = analysis.get("analyzer", {}).get(analyzer_name, {})
+        return {
+            "bm25": {
+                "similarity": similarity_name,
+                "k1": float(sim_def.get("k1", _DEFAULT_BM25_K1)),
+                "b": float(sim_def.get("b", _DEFAULT_BM25_B)),
+            },
+            "analysis": {
+                "analyzer": analyzer_name,
+                "tokenizer": analyzer_def.get("tokenizer"),
+                "filters": list(analyzer_def.get("filter", [])),
+            },
+        }
 
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None:
         """Stream ``docs`` into ``mapping.index_name`` (``_id = doc.doc_id``) in chunks, then refresh (§3.5).
@@ -419,11 +492,17 @@ def _sem_field_name(embedder_id: str) -> str:
 
 
 def _schema_to_mapping(
-    schema: FieldSchema, vector_field_dims: Mapping[str, int]
+    schema: FieldSchema,
+    vector_field_dims: Mapping[str, int],
+    *,
+    similarity: str = _BM25_SIMILARITY,
+    analyzer: str = _DEFAULT_ANALYZER,
 ) -> dict[str, Any]:
     """Translate a ``FieldSchema`` into the ES ``{"properties": {...}}`` mapping body (§5.2).
 
-    The canonical ``search_text`` field is a plain ``text`` field (BM25 target). Each embedder gets
+    The canonical ``search_text`` field is a ``text`` field (BM25 target) carrying an EXPLICIT
+    ``similarity`` (the tuned BM25, defined in index settings) and ``analyzer`` (P1-2) so the resolved
+    scoring profile reads back verbatim from ``_mapping``. Each embedder gets
     one ``dense_vector`` field (``dims`` = the embedder's output dim, ``index: true``,
     ``similarity: cosine`` — cosine suits the normalized embeddings these providers emit). NUMERIC
     roles map to ``float`` (a superset of integer that never loses precision), STORED roles to a
@@ -431,7 +510,13 @@ def _schema_to_mapping(
     SEMANTIC_SOURCE role fields are the source columns concatenated INTO ``search_text`` (§5.1), so
     they need no own mapping. Branching is exhaustive over ``FieldRole``.
     """
-    properties: dict[str, Any] = {schema.search_text_field: {"type": "text"}}
+    properties: dict[str, Any] = {
+        schema.search_text_field: {
+            "type": "text",
+            "similarity": similarity,
+            "analyzer": analyzer,
+        }
+    }
     for field_name, dims in vector_field_dims.items():
         properties[field_name] = {
             "type": "dense_vector",

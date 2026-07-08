@@ -63,9 +63,11 @@ CANONICAL_METRICS: tuple[str, ...] = (
     "precision@10",
 )
 
-#: Default FDR headline metrics (§8.3, Fix 7): ranking quality + coverage, nearly orthogonal, no
-#: collinear inflation. Only these enter the BH/BY family (subject to each contrast's ``family`` flag).
-DEFAULT_FDR_METRICS: tuple[str, ...] = ("ndcg@10", "recall@100")
+#: Default FDR headline metric (§8.3, P1-1): the single ranking-quality claim. Only this enters the
+#: BH/BY family (subject to each contrast's ``family`` flag); recall@50/recall@100 are descriptive.
+#: ``recall@100`` is degenerate for rerank-only contrasts (W==k) and produced a duplicate family
+#: member, so the family is ONE metric — 8 contrasts × 1 metric = 8 BH tests (P1-1, N-6).
+DEFAULT_FDR_METRICS: tuple[str, ...] = ("ndcg@10",)
 
 #: Absolute tolerance for treating a computed float as zero (never use `== 0.0` on floats).
 ZERO_ABS_TOL = 1e-6
@@ -167,6 +169,8 @@ class Comparator:
         self,
         systems: Mapping[str, Mapping[str, Mapping[str, float]]],
         contrasts: Sequence[Contrast],
+        *,
+        structural_exclusions: Mapping[tuple[str, str, str], str] | None = None,
     ) -> list[ComparisonResult]:
         """Score every contrast, per canonical metric, with family-restricted FDR (§8).
 
@@ -177,8 +181,16 @@ class Comparator:
         is computed once; each system then has one mean per metric. The FDR correction (BH/BY) is
         applied only over the family rows (``contrast.family AND metric ∈ fdr_metrics AND
         non-degenerate``, Fix 7).
+
+        ``structural_exclusions`` maps ``(system_a, system_b, metric) -> reason`` for contrasts a
+        metric is **not identified** for by pipeline STRUCTURE (MF-1: a reranker-only contrast on
+        ``recall@k`` with ``rerank_window_size == k`` — top-k-set identity). Such a row is emitted
+        **structurally decided** (not by observing ``delta == 0``): ``in_family=False``, empty
+        adjusted/significant, ``note=<reason>``, and NO test/bootstrap call. The runner computes the
+        map from ``cfg.pipelines()`` (stats.py stays adapter-free, §11); the comparator only reads it.
         """
         cfg = self._cfg
+        exclusions = structural_exclusions or {}
         rows: list[ComparisonResult] = []
         # (index into rows, raw p-value) for each FDR-family row.
         family: list[tuple[int, float]] = []
@@ -197,6 +209,39 @@ class Comparator:
                 n_common = len(common_qids)
                 a_arr, b_arr = _paired_values(map_a, map_b, metric, common_qids)
                 deltas = a_arr - b_arr
+
+                reason = exclusions.get((contrast.a, contrast.b, metric))
+                if reason is not None:
+                    # Structurally not identified (MF-1): emit a reasoned row, no test/bootstrap.
+                    # Take precedence over the data-dependent degenerate notes below — the exclusion
+                    # is a structural fact, not an observed delta==0. Means are reported for context.
+                    value_a = float(np.mean(a_arr)) if a_arr.size else None
+                    value_b = float(np.mean(b_arr)) if b_arr.size else None
+                    delta = (
+                        value_a - value_b
+                        if value_a is not None and value_b is not None
+                        else None
+                    )
+                    rows.append(
+                        ComparisonResult(
+                            system_a=contrast.a,
+                            system_b=contrast.b,
+                            metric=metric,
+                            value_a=value_a,
+                            value_b=value_b,
+                            delta=delta,
+                            delta_ci_lo=None,
+                            delta_ci_high=None,
+                            p_value=1.0,
+                            significant_raw=False,
+                            in_family=False,
+                            p_value_adjusted=None,
+                            significant=None,
+                            n_common=n_common,
+                            note=reason,
+                        )
+                    )
+                    continue
 
                 if deltas.size == 0:
                     # Empty paired set (§8.1 table): no scipy/bootstrap call; never in the family.

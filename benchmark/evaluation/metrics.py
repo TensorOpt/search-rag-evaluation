@@ -1,74 +1,76 @@
-"""Evaluator, Metrics, and QrelIndex over graded relevance (docs/methodology.md §7). Phase 2.
+"""Evaluator, Metrics, QrelIndex, qrels_digest over graded relevance (docs/methodology.md §7). Phase 2.
 
 Per-query metrics computed once and returned in memory keyed by ``query_id`` so §8 statistics
 reuse them without re-parsing CSV. The point/quality metrics (``avg_relevance``/``ndcg@10``/
 ``precision@10``) are cut at ``cutoff`` (=10); recall is reported at cutoffs ``{10, 50, 100}``.
 
-**Two different semantics live here on purpose.**
+**ONE uniform relevance policy governs ALL SIX metrics (§7, P0-2).** A returned doc with a qrel
+entry uses its float gain (``0.0``/``0.5``/``1.0``); a returned doc with NO qrel entry is MISSING
+(``math.nan``). ``metrics.unjudged`` (injected as ``unjudged``) selects how MISSING is handled,
+UNIFORMLY across every metric — there is no per-metric carve-out:
 
-*Condensed-list evaluation (§7, Sakai) — ``avg_relevance`` / ``ndcg@10`` / ``precision@10``.* A
-returned doc that has a qrel entry uses its float gain (``0.0``/``0.5``/``1.0``); a returned doc
-with NO qrel entry has gain ``math.nan`` (MISSING). A MISSING judgement is NOT "irrelevant": it is
-*skipped*. The CONDENSED list is the query's ranked returned docs with the MISSING ones dropped,
-judged docs kept in original rank order. These three metrics are computed over the **condensed
-top-10** — the first ``min(10, #judged-in-list)`` judged docs — which MAY reach past original rank
-10 to fill up to 10 judged docs. A JUDGED-irrelevant doc (gain ``0.0``, present in qrels) is KEPT
-in the condensed list: it counts toward ``n_scored`` and contributes ``2^0-1 = 0`` to DCG; only
-docs with no qrel entry are skipped. The condensed rule exists to stop unjudged docs from deflating
-precision/nDCG.
+- ``"condensed"`` (Sakai deletion, the shipped default): the eval list is the query's ranked
+  returned docs with the MISSING ones DROPPED, judged docs kept in original rank order. A
+  JUDGED-irrelevant doc (gain ``0.0``, present in qrels) is KEPT (it contributes ``2^0-1 = 0`` to
+  DCG and is not a relevant hit); only docs with no qrel entry are dropped. recall reverts to the
+  condensed list under this policy.
+- ``"irrelevant"`` (trec_eval): the eval list is the raw retrieved positions with each MISSING doc
+  scored as gain ``0.0`` in place (kept, not dropped). ``precision@k`` denom is then ``k`` (the
+  raw top-k includes unjudged docs); recall is the standard position recall.
 
-*Standard recall — ``recall@10`` / ``recall@50`` / ``recall@100``.* Recall is a COVERAGE metric over
-the **actual retrieved positions**: ``recall@k = |judged-relevant ∩ result.docs[:k]| / R`` (gain
-``>= 0.5``), where ``R`` = #relevant judged docs for the query over ALL qrels. It does NOT scan a
-condensed list — a MISSING doc occupying a top-k slot simply is not a relevant hit (it contributes
-0 to the numerator), which is invariant-safe: standard recall never scores a MISSING doc AS
-irrelevant, and its denominator ``R`` comes from qrels, immune to the MISSING-skip that protects
-precision/nDCG. Standard recall therefore also PENALIZES a retrieval failure (an empty/failed result
-set scores ``0``, not NaN, when ``R > 0``). ``recall@k = NaN`` iff ``R == 0`` (as before). A query
-returning fewer than ``k`` docs caps at ``recall@min(k, n_returned)`` — expected, not an error.
+The Evaluator builds ONE full eval list from the policy, scanned to ``max(RECALL_CUTOFFS)`` judged
+(condensed) / positions (irrelevant), then each metric SLICES it: the point metrics take
+``eval_list[:cutoff]`` (cutoff=10), recall@k takes ``eval_list[:k]``. Let ``g_1..g_m`` be the point
+slice (``m = len(eval_list[:cutoff])``):
 
-Per query we also record two condensed counts (unchanged, still top-10):
-
-- ``n_scored`` = size of the condensed top-10 (the judged docs the point metrics were computed over,
-  ``<= 10``) — "total number this was calculated from".
-- ``n_missing`` = number of MISSING docs skipped while scanning the ranked list to collect that
-  condensed top-10 (count of NaN-gain docs in the scanned prefix: rank 1 up to and including the
-  10th judged doc, or the whole returned list if fewer than 10 judged docs exist) — "number where
-  the judgement was missing".
-
-The condensed metrics follow §7 over the condensed top-10 gains ``g_1..g_m`` (condensed rank order,
-``m = n_scored``, all judged):
-
-- ``avg_relevance`` = ``(1/m)·Σ_{i=1..m} g_i``; ``math.nan`` if ``m == 0``.
-- ``ndcg@10``: ``DCG = Σ_{i=1..m} (2^{g_i}−1)/log2(i+1)`` using CONDENSED positions ``1..m``;
-  ``IDCG`` = DCG of the query's judged gains sorted descending, truncated to the top-10 (over ALL
-  judged gains for the query, unaffected by skipping); ``nDCG = DCG/IDCG``, ``0.0`` when
+- ``avg_relevance`` = ``(1/m)·Σ g_i``; ``math.nan`` if ``m == 0``.
+- ``ndcg@10``: ``DCG = Σ (2^{g_i}−1)/log2(i+1)`` over positions ``1..m``; ``IDCG`` = DCG of the
+  query's JUDGED gains sorted descending, truncated to the top-10; ``nDCG = DCG/IDCG``, ``0.0`` when
   ``IDCG == 0``; ``math.nan`` if ``m == 0``.
-- ``precision@10`` = ``(#relevant in condensed top-10) / m`` (denominator is ``m = n_scored``, NOT
-  10); relevant iff gain ``>= 0.5``; ``math.nan`` if ``m == 0``.
+- ``precision@10`` = ``(#{g_i >= threshold}) / m``. Under ``condensed`` ``m == n_scored``; under
+  ``irrelevant`` ``m == min(cutoff, n_results)``.
+- ``recall@k`` = ``|{g_i >= threshold in eval_list[:k]}| / R``, ``R`` = #relevant judged docs for
+  the query over ALL qrels; ``math.nan`` iff ``R == 0``, else defined (0 for an empty/failed result).
+
+The binary-relevance ``threshold`` (default 0.5; the runner injects ``metrics.relevance_threshold``)
+is applied to every binary metric AND to ``QrelIndex.relevant_count`` / :func:`qrels_digest` (N-3).
+
+Two per-query DIAGNOSTIC counts are recorded (ALWAYS condensed semantics, cutoff depth, in BOTH
+policies):
+
+- ``n_scored`` = size of the condensed top-cutoff (judged docs, ``<= cutoff``).
+- ``n_missing`` = number of MISSING docs skipped while scanning to the cutoff-th judged doc.
+
+``n_relevant`` = ``|R|`` (P2-3), the relevant-set size under the resolved threshold.
 
 Each metric may independently be ``math.nan``: ``avg_relevance``/``ndcg@10``/``precision@10`` when
-``n_scored == 0``; every ``recall@k`` when ``R == 0``. The comparator excludes NaN queries per metric
+``m == 0``; every ``recall@k`` when ``R == 0``. The comparator excludes NaN queries per metric
 (§8.1). ``math.nan`` is the identical float value to ``np.nan``; this module stays stdlib-only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 from benchmark.common.models import Qrel, RankedResult
 
-#: Evaluation cutoff k for the condensed point/quality metrics (§7).
+#: Evaluation cutoff k for the point/quality metrics (§7).
 DEFAULT_CUTOFF = 10
 
-#: Standard-recall cutoffs (§7, Fix 4). recall@k = |judged-relevant ∩ result.docs[:k]| / R, over
-#: ACTUAL retrieved positions — independent of the condensed cutoff above and of one another.
+#: Recall cutoffs (§7). recall@k slices the SAME policy eval list at each k, so the eval list is
+#: scanned to a depth of ``max(RECALL_CUTOFFS)`` (deep enough for every metric's slice).
 RECALL_CUTOFFS = (10, 50, 100)
 
-#: Binary-relevance threshold: a doc is relevant iff gain >= this (§7, Partial or Exact).
+#: Default binary-relevance threshold: a doc is relevant iff gain >= this (§7, Partial or Exact).
+#: The runner injects the configured ``metrics.relevance_threshold`` into BOTH the Evaluator and the
+#: QrelIndex; this constant is only the standalone default for tests / bare construction.
 RELEVANCE_THRESHOLD = 0.5
+
+#: Default unjudged policy (§7, P0-2): ``"condensed"`` (Sakai) or ``"irrelevant"`` (trec_eval).
+DEFAULT_UNJUDGED = "condensed"
 
 #: Absolute tolerance for treating a computed float as zero (never use `== 0.0` on floats).
 ZERO_ABS_TOL = 1e-6
@@ -89,21 +91,24 @@ class QrelIndex:
     absence of an entry is MISSING.
     """
 
-    def __init__(self, qrels: Iterable[Qrel]) -> None:
+    def __init__(
+        self, qrels: Iterable[Qrel], *, relevance_threshold: float = RELEVANCE_THRESHOLD
+    ) -> None:
         index: dict[str, dict[str, float]] = {}
         for qr in qrels:
             index.setdefault(qr.query_id, {})[qr.doc_id] = qr.gain
         self._index = index
+        # N-3: the injected threshold feeds BOTH R (recall denom) AND the P0-3 digest, so it must not
+        # silently keep 0.5 while the metrics use the config threshold.
+        self._threshold = relevance_threshold
 
     def gain(self, query_id: str, doc_id: str) -> float:
         """Judged gain for ``(query_id, doc_id)``; ``math.nan`` if there is NO qrel entry (§7)."""
         return self._index.get(query_id, {}).get(doc_id, math.nan)
 
     def relevant_count(self, query_id: str) -> int:
-        """R: number of relevant judged docs (gain >= 0.5) for the query over all qrels (§7)."""
-        return sum(
-            1 for g in self._index.get(query_id, {}).values() if g >= RELEVANCE_THRESHOLD
-        )
+        """R: number of relevant judged docs (gain >= threshold) for the query over all qrels (§7)."""
+        return sum(1 for g in self._index.get(query_id, {}).values() if g >= self._threshold)
 
     def sorted_judged_gains(self, query_id: str) -> list[float]:
         """This query's judged gains sorted descending — the ideal ordering (§7, for IDCG)."""
@@ -116,9 +121,10 @@ class Metrics:
 
     The six metric fields are floats and may each independently be ``math.nan`` (see the module
     docstring for the per-metric NaN conditions). ``as_dict()`` exposes only the six metrics under
-    the canonical §9 metric-name keys that the comparator and CSV writers key on; the three counts
-    (``n_results``, ``n_scored``, ``n_missing``) are non-negative ints exposed as fields, not in
-    ``as_dict()``. Field order matches the §9 metrics-CSV column order.
+    the canonical §9 metric-name keys that the comparator and CSV writers key on; the four counts
+    (``n_results``, ``n_scored``, ``n_missing``, ``n_relevant``) are non-negative ints exposed as
+    fields, not in ``as_dict()``. ``n_relevant`` (P2-3) is ``|R|``, the per-query relevant-set size
+    under the resolved threshold. Field order matches the §9 metrics-CSV column order.
     """
 
     avg_relevance: float
@@ -130,6 +136,7 @@ class Metrics:
     n_results: int
     n_scored: int
     n_missing: int
+    n_relevant: int
 
     def as_dict(self) -> Mapping[str, float]:
         """Map the six metrics to the canonical §9 metric-name keys (CSV columns / §8 keys)."""
@@ -146,66 +153,86 @@ class Metrics:
 class Evaluator:
     """Scores runs against qrels, producing per-query ``Metrics`` (§7, §6 step 5)."""
 
-    def __init__(self, qrels: QrelIndex, *, cutoff: int = DEFAULT_CUTOFF) -> None:
+    def __init__(
+        self,
+        qrels: QrelIndex,
+        *,
+        cutoff: int = DEFAULT_CUTOFF,
+        unjudged: str = DEFAULT_UNJUDGED,
+        relevance_threshold: float = RELEVANCE_THRESHOLD,
+    ) -> None:
+        if unjudged not in ("condensed", "irrelevant"):
+            # Exhaustive on the enumerated policy — no silent default for an invalid value.
+            raise ValueError(
+                f"unknown unjudged policy {unjudged!r}; expected 'condensed' or 'irrelevant'"
+            )
         self._qrels = qrels
         self._cutoff = cutoff
+        self._unjudged = unjudged
+        self._threshold = relevance_threshold
 
     def score_run(self, results: Iterable[RankedResult]) -> dict[str, Metrics]:
         """Score each ``RankedResult`` (joined to qrels by ``query_id``), keyed by query_id (§6)."""
         return {rr.query_id: self._score_one(rr) for rr in results}
 
     def _score_one(self, result: RankedResult) -> Metrics:
-        k = self._cutoff
+        cutoff = self._cutoff
         qid = result.query_id
         n_results = len(result.docs)
+        threshold = self._threshold
 
-        # Scan the ranked list, collecting the condensed top-k: keep JUDGED docs (finite gain) in
-        # rank order, SKIP MISSING docs (NaN gain, no qrel entry). Stop once k judged docs are
-        # collected — this may reach past original rank k. n_missing counts the MISSING docs seen
-        # in the scanned prefix (up to and including the k-th judged doc, or the whole list).
-        condensed: list[float] = []
+        gains = [self._qrels.gain(qid, d.doc_id) for d in result.docs]
+
+        # Diagnostic condensed-scan counts (n_scored, n_missing) — ALWAYS condensed semantics at
+        # ``cutoff`` depth, in BOTH policies (§7): keep JUDGED docs, SKIP MISSING, stop at the
+        # cutoff-th judged doc (may reach past rank cutoff). n_missing counts the MISSING docs seen
+        # in that scanned prefix.
+        n_scored = 0
         n_missing = 0
-        for d in result.docs:
-            gain = self._qrels.gain(qid, d.doc_id)
+        for gain in gains:
             if math.isnan(gain):
                 n_missing += 1
             else:
-                condensed.append(gain)
-                if len(condensed) >= k:
+                n_scored += 1
+                if n_scored >= cutoff:
                     break
 
-        n_scored = len(condensed)
+        # ONE full policy eval list (§7, P0-2), scanned to max(RECALL_CUTOFFS) so every metric's
+        # slice is deep enough. condensed = judged docs in rank order (MISSING dropped); irrelevant =
+        # raw positions with MISSING scored as gain 0.0 (kept, not dropped). Each metric then slices.
+        max_depth = max(RECALL_CUTOFFS)
+        if self._unjudged == "condensed":
+            eval_list = [gain for gain in gains if not math.isnan(gain)][:max_depth]
+        else:  # "irrelevant" — validated in __init__; only these two policies exist.
+            eval_list = [0.0 if math.isnan(gain) else gain for gain in gains][:max_depth]
 
-        if n_scored == 0:
+        # Point/quality metrics over eval_list[:cutoff]; m = its length (n_scored under condensed,
+        # min(cutoff, n_results) under irrelevant, §7). NaN iff m == 0 (empty/all-MISSING top-k).
+        point = eval_list[:cutoff]
+        m = len(point)
+        if m == 0:
             avg_relevance = math.nan
             ndcg = math.nan
             precision = math.nan
         else:
-            avg_relevance = sum(condensed) / n_scored
-            # DCG over the condensed positions 1..m; judged-irrelevant (0.0) contributes 0.
-            dcg = _dcg(condensed)
-            # IDCG: DCG of the top-k ideal ordering (ALL judged gains desc, truncated to k, §7);
-            # unaffected by skipping missing docs.
-            idcg = _dcg(self._qrels.sorted_judged_gains(qid)[:k])
+            avg_relevance = sum(point) / m
+            dcg = _dcg(point)  # DCG over positions 1..m; a 0.0 gain contributes 2^0-1 = 0.
+            # IDCG: ideal over ALL judged gains desc, truncated to cutoff (judged-only, both policies).
+            idcg = _dcg(self._qrels.sorted_judged_gains(qid)[:cutoff])
             # isclose (not `!= 0.0`) — never test float equality; IDCG==0 means no positive gains.
             ndcg = 0.0 if math.isclose(idcg, 0.0, abs_tol=ZERO_ABS_TOL) else dcg / idcg
-            hits = sum(1 for gain in condensed if gain >= RELEVANCE_THRESHOLD)
-            precision = hits / n_scored  # denominator = n_scored (§7).
+            hits = sum(1 for gain in point if gain >= threshold)
+            precision = hits / m
 
-        # Standard recall@k over the ACTUAL retrieved positions (§7, Fix 4): fraction of the query's
-        # relevant judged docs (R, from all qrels) that appear in the true top-k. A MISSING doc in a
-        # top-k slot is simply not a relevant hit (gain NaN < 0.5) — never scored AS irrelevant, so
-        # this is invariant-safe. R == 0 -> NaN; else defined for every cutoff (0 for an empty/failed
-        # result set, so recall penalizes retrieval failures).
+        # recall@k slices the SAME policy eval list at each k / R (§7). Under condensed this reverts
+        # recall to the condensed list; under irrelevant it is the standard (position) recall. A
+        # MISSING doc is never a relevant hit in either policy (condensed drops it; irrelevant scores
+        # it 0.0 < threshold). R == 0 -> NaN; else defined for every cutoff (0 for an empty result).
         r = self._qrels.relevant_count(qid)
         recall_by_cutoff: dict[int, float] = {}
         for cutoff_k in RECALL_CUTOFFS:
             if r > 0:
-                hits_k = sum(
-                    1
-                    for d in result.docs[:cutoff_k]
-                    if self._qrels.gain(qid, d.doc_id) >= RELEVANCE_THRESHOLD
-                )
+                hits_k = sum(1 for gain in eval_list[:cutoff_k] if gain >= threshold)
                 recall_by_cutoff[cutoff_k] = hits_k / r
             else:
                 recall_by_cutoff[cutoff_k] = math.nan
@@ -220,4 +247,23 @@ class Evaluator:
             n_results=n_results,
             n_scored=n_scored,
             n_missing=n_missing,
+            n_relevant=r,
         )
+
+
+def qrels_digest(qrels: Iterable[Qrel], *, relevance_threshold: float) -> str:
+    """SHA-256 over the sorted ``(query_id, doc_id, gain)`` triples + the threshold (P0-3).
+
+    A stable fingerprint of the loaded, gain-mapped qrels: two runs with the SAME judgements and
+    threshold get the SAME digest; flipping any grade, adding/removing a triple, or changing the
+    threshold changes it. Because the dataset adapter has already applied its label->gain map when
+    emitting ``Qrel.gain``, hashing the RESOLVED float gains captures the gain mapping without the
+    runner knowing dataset specifics (Generality). Runs with differing digests are not comparable.
+    """
+    hasher = hashlib.sha256()
+    for query_id, doc_id, gain in sorted(
+        (qr.query_id, qr.doc_id, qr.gain) for qr in qrels
+    ):
+        hasher.update(f"{query_id}\t{doc_id}\t{gain!r}\n".encode("utf-8"))
+    hasher.update(repr(relevance_threshold).encode("utf-8"))
+    return hasher.hexdigest()

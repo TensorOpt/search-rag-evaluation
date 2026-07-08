@@ -121,6 +121,13 @@ class FakeIndexWriter(IndexWriter):
     def doc_count(self) -> int | None:
         return self.doc_count_value
 
+    def resolved_index_profile(self) -> Mapping[str, Any]:
+        # Canned BM25/analysis profile (no ES) — the runner records it under diagnostics.index (P1-2).
+        return {
+            "bm25": {"similarity": "bm25_tuned", "k1": 1.2, "b": 0.75},
+            "analysis": {"analyzer": "standard", "tokenizer": "standard", "filters": ["lowercase"]},
+        }
+
     def sem_field_name(self, embedder_id: str) -> str:
         return "sem__" + embedder_id
 
@@ -411,10 +418,26 @@ def test_run_fails_if_index_incomplete(patched_factories: FakeIndexWriter, tmp_p
     assert list(tmp_path.glob("*.csv")) == []
 
 
+def test_recall_low_information_warning_fires(caplog: pytest.LogCaptureFixture) -> None:
+    # P2-3: on a WANDS-like median |R| ≈ 146, recall@10 (10/146 = 0.068 < 0.2) is flagged
+    # low-information; recall@50 (0.34) and recall@100 (0.68) are not.
+    from benchmark.runner import _recall_information
+
+    with caplog.at_level("WARNING"):
+        info = _recall_information([146] * 20)
+
+    assert info["recall@10"] == pytest.approx(10.0 / 146.0)
+    assert info["recall@10"] < 0.2
+    assert info["recall@50"] >= 0.2
+    assert "recall@10 is low-information" in caplog.text
+    assert "recall@50 is low-information" not in caplog.text
+
+
 def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import scripts.run as run_script
 
     # A minimal config file on disk; --dry-run must not touch ES or write artifacts.
+    monkeypatch.setenv("DRY_KEY", "x")  # P0-1: secrets must be ${VAR} placeholders, not literals
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(_DRY_RUN_CONFIG_YAML, encoding="utf-8")
 
@@ -436,7 +459,7 @@ def test_dry_run_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 _DRY_RUN_CONFIG_YAML = """\
 dataset: { name: wands, path: ./dataset/wands }
 services:
-  - embedder: { name: e5, provider: cohere, settings: { api_key: x, model_id: x } }
+  - embedder: { name: e5, provider: cohere, settings: { api_key: "${DRY_KEY}", model_id: x } }
   - searcher: { name: bm25, provider: elasticsearch, kind: lexical }
   - searcher: { name: semantic_e5, provider: elasticsearch, kind: vector, embedder: e5 }
 indexer: { provider: elasticsearch, index: wands_bench, settings: { url: "http://localhost:9200" } }

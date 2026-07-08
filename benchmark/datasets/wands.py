@@ -126,3 +126,7 @@ class WandsDataset(Dataset):
 
     def field_schema(self) -> FieldSchema:
         return _FIELD_SCHEMA
+
+    def gain_mapping(self) -> Mapping[str, float]:
+        """The WANDS label->gain map applied to ``qrels()`` (§7, P0-3): Exact/Partial/Irrelevant."""
+        return dict(WANDS_GAINS)

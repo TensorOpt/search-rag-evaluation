@@ -622,13 +622,28 @@ pure vector store.
 // mapping (the harness embeds the corpus client-side; ES only stores + searches the vectors):
 "mappings": {
   "properties": {
-    "search_text": { "type": "text" },
+    // search_text carries an EXPLICIT tuned BM25 similarity + analyzer (P1-2) so both read back:
+    "search_text": { "type": "text", "similarity": "bm25_tuned", "analyzer": "standard" },
     "sem__cohere": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" },
     "sem__voyage": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" },
     "sem__openai": { "type": "dense_vector", "dims": 1536, "index": true, "similarity": "cosine" }
   }
 }
+// index settings define the named BM25 similarity (P1-2), so k1/b read back from _settings:
+"settings": { "similarity": { "bm25_tuned": { "type": "BM25", "k1": 1.2, "b": 0.75 } } }
 ```
+
+**BM25 baseline is explicit + resolved-from-index (P1-2).** BM25 `k1`/`b` are a per-field
+`similarity` and the analyzer is an index-time setting, so both belong to the **`indexer` block**
+(they bake into the index at `eval:index`): `indexer.settings.bm25: { k1, b }` and optional
+`indexer.settings.analysis: { analyzer }` (absent → the ES defaults `k1=1.2`, `b=0.75`, `standard`
+analyzer, set **explicitly** so they are not applied silently). The `search_text` field carries the
+named `bm25_tuned` similarity + the analyzer, so the resolved chain is present in `_mapping`/
+`_settings` and reads back verbatim. `IndexWriter.resolved_index_profile()` (every backend implements
+it — no `getattr` probing) reads `k1`/`b` + the analysis chain **back from the live index** (never
+assumed); the runner records the result under `diagnostics.index`. The STANDARD run keeps ES defaults
+(no tuning, decision 3); a `k1×b` sweep as a one-shot `eval:sweep` diagnostic is **planned, not yet
+shipped** (§13).
 
 Each `dense_vector` field is `index: true` with `similarity: cosine` (cosine suits the normalized
 embeddings these providers emit); its `dims` is that embedder's output dimensionality (probed once, or
@@ -938,18 +953,20 @@ first, then variants in config order.
 
 **`metrics_{timestamp}.csv`**
 ```
-variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing
+variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing,n_relevant
 ```
 One file for all pipelines (baseline included). One row per (variant, query); `variant` = pipeline id;
-baseline first, then variants in config order. `n_results`, `n_scored` and `n_missing` are
-**non-negative integers, ALWAYS present** (never empty): `n_results` = docs the pipeline returned for
-the query (`<= top_k`); the condensed-list counts of methodology.md §7 (`n_scored` = judged docs
-scored, `n_missing` = missing docs skipped, still condensed-top-10). Any of the **six metric** cells
-(`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`, `recall@100`, `precision@10`) is written as an
-**empty field** (two adjacent commas, no quoting) when its in-memory `Metrics` value is `NaN`
-(methodology.md §7): `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored == 0`, every
-`recall@k` empty when `R == 0`. The three recall columns are **standard** (actual top-k / R,
-methodology.md §7); the other three stay condensed. This empty↔`NaN` mapping is fixed so a reader never
+baseline first, then variants in config order. `n_results`, `n_scored`, `n_missing`, and `n_relevant`
+are **non-negative integers, ALWAYS present** (never empty): `n_results` = docs the pipeline returned
+for the query (`<= top_k`); the condensed-list diagnostic counts of methodology.md §7 (`n_scored` =
+judged docs scored, `n_missing` = missing docs skipped, condensed-top-10); `n_relevant` = `|R|`, the
+relevant-set size under the resolved threshold (P2-3, appended at the end so the existing column order
+is untouched). Any of the **six metric** cells (`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`,
+`recall@100`, `precision@10`) is written as an **empty field** (two adjacent commas, no quoting) when
+its in-memory `Metrics` value is `NaN` (methodology.md §7): `avg_relevance`/`ndcg@10`/`precision@10`
+empty when `m == 0`, every `recall@k` empty when `R == 0`. **All six metrics follow the one
+`metrics.unjudged` policy** (methodology.md §7) — recall is condensed under `condensed`, standard under
+`irrelevant`; there is no per-metric carve-out. This empty↔`NaN` mapping is fixed so a reader never
 guesses; consumers must treat an empty metric cell as "excluded", and the comparator does this from
 the in-memory `NaN`, not by re-parsing this file (methodology.md §8.1).
 
@@ -981,14 +998,30 @@ methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_fam
   **`fdr_metrics`**; bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw
   per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test
   + its zero/tie params, dataset version, ES + endpoint versions, cutoff, uniform retrieval depth
-  (`top_k`), seed) is serialized to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the
-  harness records/emits FDR-adjusted p-values (q-values) per family test in the comparison CSV (§9), so
-  — unlike Holm — the adjusted significance is fully materialized.
-- **Diagnostics block (methodology.md §8.1 common subset + §7 drop policy).**
-  `run_config_{timestamp}.json` carries a top-level `diagnostics` object: `common_subset` (per metric:
-  `n_common` and `n_excluded = n_queries − n_common`) and `retrieval_failures` (per system: `#queries
-  with n_results == 0`). For WANDS the retrieval-failure count is exactly 1 (query 383 under
-  bm25/bm25_rerank), so the DROP policy hides nothing.
+  (`top_k`), seed; and the **`metrics` policy** `unjudged`/`relevance_threshold`, P0-2) is serialized
+  to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits
+  FDR-adjusted p-values (q-values) per family test in the comparison CSV (§9), so — unlike Holm — the
+  adjusted significance is fully materialized.
+- **Secret redaction (P0-1).** Any config key matching `api_key|token|secret|password|credential`
+  (case-insensitive) is serialized as the **`${VAR}` env name it was read from**, never the value
+  (`${REDACTED}` backstop if the lookup misses). Secrets must be supplied as `${VAR}` placeholders at
+  load (a literal secret is rejected with a `ConfigError`), so the manifest is safe to publish.
+- **Diagnostics block (post-load values the frozen `ResolvedConfig` cannot hold).**
+  `run_config_{timestamp}.json` carries a top-level `diagnostics` object:
+  - `common_subset` (per metric: `n_common`, `n_excluded = n_queries − n_common`) and
+    `retrieval_failures` (per system: `#queries with n_results == 0`; for WANDS exactly 1 — query 383
+    under bm25/bm25_rerank — so DROP hides nothing).
+  - `dataset` — `qrels_digest` (SHA-256 over the gain-mapped `(qid, doc, gain)` triples + threshold,
+    P0-3), the human-readable `gain_mapping` (`Dataset.gain_mapping()`), the resolved
+    `relevance_threshold`, and `n_qrels`. Two runs with differing digests are **not comparable**.
+  - `index` — the BM25 similarity (`k1`/`b`) + analysis chain (`analyzer`/`tokenizer`/`filters`)
+    **resolved from the live index** (`resolved_index_profile()`, P1-2).
+  - `stats` — the FDR `family_size (m)`, full `family_members`, and the reasoned structural
+    `excluded` contrasts (MF-1, P1-1).
+  - `recall_information` — `recall@k → k/median(|R|)`; a cutoff below `0.2` is logged low-information
+    (P2-3; WANDS `recall@10 ≈ 0.068` warns).
+  - `cost_latency` (P1-3) — per-system connector call/doc counts + opt-in stage latency under
+    `--profile`. **Planned, not yet shipped.**
 - **Seeds:** one master seed feeds the bootstrap and any permutation test; recorded in config. Given
   the seed, stats are deterministic. There is no data-dependent pipeline selection, so the set of runs
   depends only on the config file.
@@ -1030,7 +1063,9 @@ services:                       # named, typed, reusable building blocks
 indexer:
   provider: elasticsearch
   index: wands_bench
-  settings: { url: ${ES_URL} }
+  # BM25 k1/b + analyzer are INDEX-TIME (baked at eval:index) and belong here, resolved from the index
+  # into the manifest (P1-2). Absent -> ES defaults, set explicitly so they read back.
+  settings: { url: ${ES_URL}, bm25: { k1: 1.2, b: 0.75 }, analysis: { analyzer: standard } }
 pipelines:
   baseline:                      # the reference every variant is compared against
     retriever: bm25
@@ -1054,19 +1089,25 @@ pipelines:
       rerank_window_size: 100
 stats:
   test: permutation              # mean-δ sign-flip permutation (methodology.md §8.2 default); wilcoxon selectable
+                                 # wilcoxon_zero_method/wilcoxon_correction are REJECTED at load unless test: wilcoxon (P2-2)
   correction: bh                 # Benjamini-Hochberg FDR (methodology.md §8.3, default); by = Benjamini-Yekutieli
   alpha: 0.05                    # BOTH the raw per-test threshold AND the FDR target level q
   bootstrap_B: 10000             # CI resamples AND permutation count; p-resolution floor 1/(B+1) (methodology.md §8.2)
   ci_level: 0.95                 # UNADJUSTED per-comparison effect-size CI (methodology.md §8.2); NOT a gate
   seed: 1234
-  contrasts:                     # explicit system_a vs system_b (methodology.md §8.1); absent => every variant vs baseline
-    - { a: semantic_co,        b: bm25,          family: true }
-    - { a: hybrid_co_k60,      b: semantic_co,   family: true }
-    - { a: hybrid_co_rerank,   b: semantic_co,   family: true }
-    - { a: bm25_rerank,        b: bm25,          family: true }
-    - { a: semantic_co_rerank, b: semantic_co,   family: true }
-    - { a: hybrid_co_rerank,   b: hybrid_co_k60, family: true }
-  fdr_metrics: [ndcg@10, recall@100]  # the ONLY metrics that enter the BH family (methodology.md §8.3)
+  contrasts:                     # EIGHT explicit system_a vs system_b (methodology.md §8.1); absent => every variant vs baseline
+    - { a: semantic_co,        b: bm25,               family: true }
+    - { a: hybrid_co_k60,      b: semantic_co,        family: true }
+    - { a: hybrid_co_rerank,   b: semantic_co,        family: true }
+    - { a: bm25_rerank,        b: bm25,               family: true }
+    - { a: semantic_co_rerank, b: semantic_co,        family: true }
+    - { a: hybrid_co_rerank,   b: hybrid_co_k60,      family: true }
+    - { a: semantic_co_rerank, b: bm25_rerank,        family: true }   # embeddings-with-rerank (P1-1)
+    - { a: hybrid_co_rerank,   b: semantic_co_rerank, family: true }   # fusion-with-rerank (P1-1)
+  fdr_metrics: [ndcg@10]         # the ONLY metric in the BH family (methodology.md §8.3, P1-1): 8×1 = 8 tests
+metrics:                         # ONE relevance policy over ALL SIX metrics (methodology.md §7, P0-2)
+  unjudged: condensed            # condensed (Sakai, default) | irrelevant (trec_eval)
+  relevance_threshold: 0.5       # binary-relevance cut for precision/recall + R + qrels digest
 cutoff: 10                       # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
 top_k: 100                       # uniform retrieval depth: fuser.window == rerank_window_size == top_k (§5.3)
 cache:                           # OPTIONAL (§5.5): memoize embeddings/rerank/searcher results to .cache/

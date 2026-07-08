@@ -106,6 +106,9 @@ class _Writer:
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None:
         return None
 
+    def resolved_index_profile(self) -> "dict[str, object]":
+        return {"bm25": {"k1": 1.2, "b": 0.75}, "analysis": {"analyzer": "standard"}}
+
 
 # --- trivial ABC subclasses -------------------------------------------------------------------
 

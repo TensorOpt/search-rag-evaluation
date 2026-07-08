@@ -50,6 +50,10 @@ def _writer_with(client: MagicMock) -> es.ESIndexWriter:
     writer.client = client
     writer.bulk_chunk_size = es._BULK_CHUNK_SIZE
     writer.embed_batch_size = es._EMBED_BATCH_SIZE
+    # P1-2: BM25/analysis defaults (bypassing __init__ here) so ensure_index/create_mapping work.
+    writer.bm25_k1 = es._DEFAULT_BM25_K1
+    writer.bm25_b = es._DEFAULT_BM25_B
+    writer.analyzer = es._DEFAULT_ANALYZER
     return writer
 
 
@@ -118,6 +122,56 @@ def test_ensure_index_creates_with_backend_mapping() -> None:
     kwargs = client.indices.create.call_args.kwargs
     assert kwargs["index"] == "wands_bench"
     assert kwargs["mappings"] == {"properties": {"search_text": {"type": "text"}}}
+
+
+def test_bm25_similarity_written_to_index() -> None:
+    # P1-2: ensure_index bakes the explicit tuned BM25 similarity (k1/b) into the index settings so
+    # the baseline is recorded, not ES defaults applied silently.
+    client = _fake_client()
+    client.indices.exists.return_value = False
+    writer = _writer_with(client)  # default k1=1.2, b=0.75
+
+    writer.ensure_index(_mapping())
+
+    settings = client.indices.create.call_args.kwargs["settings"]
+    assert settings["similarity"]["bm25_tuned"] == {"type": "BM25", "k1": 1.2, "b": 0.75}
+
+
+def test_resolved_index_profile_reads_back_from_es() -> None:
+    # P1-2: resolved_index_profile reads the BM25 params + analyzer BACK from _mapping/_settings
+    # (never assumed). k1/b arrive as strings from ES settings -> coerced to float.
+    client = _fake_client()
+    client.indices.get_mapping.return_value = {
+        "wands_bench": {
+            "mappings": {
+                "properties": {
+                    "search_text": {
+                        "type": "text",
+                        "similarity": "bm25_tuned",
+                        "analyzer": "standard",
+                    },
+                    "sem__e5": {"type": "dense_vector"},
+                }
+            }
+        }
+    }
+    client.indices.get_settings.return_value = {
+        "wands_bench": {
+            "settings": {
+                "index": {"similarity": {"bm25_tuned": {"type": "BM25", "k1": "1.5", "b": "0.3"}}}
+            },
+            "defaults": {"index": {"analysis": {}}},
+        }
+    }
+    writer = _writer_with(client)
+
+    profile = writer.resolved_index_profile()
+
+    assert profile["bm25"] == {"similarity": "bm25_tuned", "k1": 1.5, "b": 0.3}
+    assert profile["analysis"]["analyzer"] == "standard"
+    client.indices.get_settings.assert_called_once_with(
+        index="wands_bench", include_defaults=True
+    )
 
 
 def test_ensure_index_idempotent_when_index_exists() -> None:
@@ -676,8 +730,13 @@ def test_writer_create_mapping_dense_vector_and_roles() -> None:
     mapping = writer.create_mapping(schema, sem_fields, vector_dims)
 
     props = mapping.backend_mapping["properties"]
-    # search_text is a plain text field — NO copy_to, NO semantic_text (§5.2)
-    assert props["search_text"] == {"type": "text"}
+    # search_text is a text field carrying the EXPLICIT tuned BM25 similarity + analyzer (P1-2) so the
+    # resolved profile reads back from _mapping — NO copy_to, NO semantic_text (§5.2).
+    assert props["search_text"] == {
+        "type": "text",
+        "similarity": "bm25_tuned",
+        "analyzer": "standard",
+    }
     # one dense_vector field per embedder (dims from vector_dims, cosine, indexed)
     assert props[sem_field] == {
         "type": "dense_vector",

@@ -24,13 +24,20 @@ runner names no backend, swapping the backend is a config-only edit (the §1.4(3
 
 from __future__ import annotations
 
-from typing import Any
+import statistics
+from typing import Any, Sequence
 
 import benchmark.config as config
 from benchmark.common.logging_setup import get_logger
 from benchmark.common.models import RankedResult
 from benchmark.config import PipelineCfg, ResolvedConfig
-from benchmark.evaluation.metrics import Evaluator, Metrics, QrelIndex
+from benchmark.evaluation.metrics import (
+    RECALL_CUTOFFS,
+    Evaluator,
+    Metrics,
+    QrelIndex,
+    qrels_digest,
+)
 from benchmark.evaluation.stats import Comparator
 from benchmark.indexing import Indexer
 from benchmark.io_csv import (
@@ -42,6 +49,81 @@ from benchmark.io_csv import (
 )
 
 logger = get_logger(__name__)
+
+
+#: recall@k is flagged low-information when k / median(|R|) falls below this (P2-3). On WANDS
+#: (median |R| ≈ 146) recall@10 (0.068) warns; recall@50 (0.34) / recall@100 (0.68) do not.
+_RECALL_LOW_INFO_RATIO = 0.2
+
+
+def _recall_information(relevant_counts: Sequence[int]) -> dict[str, float]:
+    """``recall@k -> k/median(|R|)``, warning where it is below the low-information floor (P2-3).
+
+    ``|R|`` = per-query relevant-set size under the resolved threshold; the median is over queries
+    WITH relevant docs (``R > 0``). A cutoff whose ratio falls below :data:`_RECALL_LOW_INFO_RATIO`
+    is logged as low-information (``recall@k`` is capped near ``k/|R|`` and cannot move). Returns the
+    per-cutoff ratios for the manifest; empty when no query has a relevant doc.
+    """
+    positive = [r for r in relevant_counts if r > 0]
+    if not positive:
+        return {}
+    median_r = statistics.median(positive)
+    info: dict[str, float] = {}
+    for k in RECALL_CUTOFFS:
+        ratio = k / median_r
+        info[f"recall@{k}"] = ratio
+        if ratio < _RECALL_LOW_INFO_RATIO:
+            logger.warning(
+                "recall@%d is low-information on this dataset: k/median(|R|)=%.3f < %.2f "
+                "(median |R|=%.1f) — it cannot move and should not be put in front of an audience",
+                k, ratio, _RECALL_LOW_INFO_RATIO, median_r,
+            )
+    return info
+
+
+def _reranker_only_window(a: PipelineCfg, b: PipelineCfg) -> int | None:
+    """The reranked side's ``rerank_window_size`` iff ``(a, b)`` differ ONLY by a reranker (MF-1).
+
+    Two systems differ only by a reranker when their retrieval graph is identical (same retrievers,
+    same fuser) and exactly one of them applies a reranker. Returns that reranker's window ``W`` (the
+    quantity the ``recall@k`` identification rule ``W == k`` tests), else ``None``. Structural, from
+    config — the runner computes it so ``stats.py`` stays adapter/pipeline-free (§11 import rule).
+    """
+    if a.retrievers != b.retrievers or a.fuser != b.fuser:
+        return None
+    if a.reranker is not None and b.reranker is None:
+        return a.rerank_window_size
+    if b.reranker is not None and a.reranker is None:
+        return b.rerank_window_size
+    return None
+
+
+def _structural_exclusions(cfg: ResolvedConfig) -> dict[tuple[str, str, str], str]:
+    """``(a, b, "recall@k") -> reason`` for every reranker-only contrast where ``W == k`` (MF-1).
+
+    ``recall@k`` is not identified for a contrast between two systems differing only by a reranker
+    when ``rerank_window_size == k`` (top-k-set identity): reranking permutes the top-k set without
+    changing its membership. At the shipped ``W = 100`` only ``recall@100`` is excluded;
+    ``recall@10``/``recall@50`` ARE identified (reranking moves docs across those boundaries).
+    """
+    pipe_by_id = {pcfg.id: pcfg for pcfg in cfg.pipelines()}
+    exclusions: dict[tuple[str, str, str], str] = {}
+    for contrast in cfg.stats.contrasts:
+        a = pipe_by_id.get(contrast.a)
+        b = pipe_by_id.get(contrast.b)
+        if a is None or b is None:
+            continue
+        window = _reranker_only_window(a, b)
+        if window is None:
+            continue
+        for k in RECALL_CUTOFFS:
+            if window == k:
+                metric = f"recall@{k}"
+                exclusions[(contrast.a, contrast.b, metric)] = (
+                    f"{metric} not identified: {contrast.a} vs {contrast.b} differ only by a "
+                    f"reranker with rerank_window_size == {k} (top-k set identity, MF-1)"
+                )
+    return exclusions
 
 
 class IndexNotReadyError(RuntimeError):
@@ -125,6 +207,8 @@ class ExperimentRunner:
                 "index %r ready: %d docs match the dataset; running eval (no re-indexing)",
                 mapping.index_name, indexed,
             )
+            # P1-2: the BM25 similarity + analysis chain, RESOLVED from the live index (never assumed).
+            index_profile = writer.resolved_index_profile()
 
             rerank_clients = config.make_rerankers(cfg.services, cache=cache)  # name -> RerankClient (§3.4/§5.4)
             # Build the FULL configured leaf-searcher + reranker sets ONCE, shared across all pipelines
@@ -138,8 +222,18 @@ class ExperimentRunner:
             )
             queries = list(dataset.queries())  # frozen, shared query set
             query_texts = [q.text for q in queries]
-            qrel_index = QrelIndex(dataset.qrels())
-            evaluator = Evaluator(qrel_index, cutoff=cfg.cutoff)
+            # ONE relevance policy over every metric (§7, P0-2): the configured threshold feeds BOTH
+            # the QrelIndex (R / digest, N-3) AND the Evaluator; the unjudged policy feeds the
+            # Evaluator. qrels are materialized once (reused for the P0-3 digest).
+            threshold = cfg.metrics.relevance_threshold
+            qrels_list = list(dataset.qrels())
+            qrel_index = QrelIndex(qrels_list, relevance_threshold=threshold)
+            evaluator = Evaluator(
+                qrel_index,
+                cutoff=cfg.cutoff,
+                unjudged=cfg.metrics.unjudged,
+                relevance_threshold=threshold,
+            )
 
             # Per-pipeline ranked results + per-query Metrics, keyed by pipeline id. The pipelines are
             # exactly what the config declares — baseline first, then the named variants in config order
@@ -191,7 +285,12 @@ class ExperimentRunner:
                 vid: {query_id: m.as_dict() for query_id, m in metrics.items()}
                 for vid, metrics in per_query.items()
             }
-            rows = Comparator(cfg.stats).compare(systems, cfg.stats.contrasts)  # family FDR inside
+            # Structural (config-derived) recall@k exclusions for reranker-only contrasts (MF-1);
+            # emitted with a reason string, never a silent NaN, and never counted in the FDR family.
+            structural_exclusions = _structural_exclusions(cfg)
+            rows = Comparator(cfg.stats).compare(
+                systems, cfg.stats.contrasts, structural_exclusions=structural_exclusions
+            )  # family FDR inside
             write_comparison_csv(rows, cfg.timestamp, output_dir=output_dir)
 
             # Reproducibility diagnostics (§9.1, Fix 6): per-metric common-subset sizes (all rows of a
@@ -205,9 +304,45 @@ class ExperimentRunner:
                 vid: sum(1 for m in metrics.values() if m.n_results == 0)
                 for vid, metrics in per_query.items()
             }
+            # P0-3: the qrels provenance — digest (over the gain-mapped triples + threshold), the
+            # human-readable gain mapping, the resolved threshold, and n_qrels. Two runs with
+            # differing digests are not comparable (report guidance, §7 provenance note).
+            dataset_diag = {
+                "qrels_digest": qrels_digest(qrels_list, relevance_threshold=threshold),
+                "relevance_threshold": threshold,
+                "gain_mapping": dict(dataset.gain_mapping()),
+                "n_qrels": len(qrels_list),
+            }
+            # P1-1: the FDR family — size m (number of in-family real tests), full membership, and
+            # the structurally-excluded contrasts with their reason strings. Recorded so a reader can
+            # audit the multiple-comparison regime (8 contrasts × 1 metric = 8 tests on WANDS).
+            family_members = [
+                {"a": row.system_a, "b": row.system_b, "metric": row.metric}
+                for row in rows
+                if row.in_family
+            ]
+            excluded = [
+                {"a": row.system_a, "b": row.system_b, "metric": row.metric, "reason": row.note}
+                for row in rows
+                if (row.system_a, row.system_b, row.metric) in structural_exclusions
+            ]
+            stats_diag = {
+                "family_size": len(family_members),
+                "family_members": family_members,
+                "excluded": excluded,
+            }
+            # P2-3: flag recall@k that is structurally uninformative on this dataset (k/median(|R|)
+            # below the floor) and record the ratios. |R| is dataset-level (from qrels), one per query.
+            recall_information = _recall_information(
+                [qrel_index.relevant_count(q.query_id) for q in queries]
+            )
             diagnostics = {
                 "common_subset": common_subset,
                 "retrieval_failures": retrieval_failures,
+                "dataset": dataset_diag,
+                "stats": stats_diag,
+                "index": index_profile,
+                "recall_information": recall_information,
             }
             write_run_config(cfg, diagnostics=diagnostics, output_dir=output_dir)
             logger.info(

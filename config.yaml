@@ -12,6 +12,9 @@ services:                       # named, typed, reusable building blocks
   # Voyage / OpenAI directly — ES runs no inference (§1.1/§3.4). `provider` selects the connector;
   # `model_id`/`api_key`/`rate_limit`/`dims`(optional) live in `settings`. OpenAI has NO reranker.
   - embedder: { name: cohere, provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0, rate_limit: { requests_per_minute: 90 } } }
+  # `top_n` (reranker settings) is the PROVIDER cap: max candidates scored per request. It is DISTINCT
+  # from a pipeline's `rerank_window_size` (how many candidates THAT pipeline sends). Invariant: per
+  # pipeline W <= top_n (asserted at R0). Both are 100 here but mean different things (decision 8).
   - reranker: { name: co-rr,  provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100, rate_limit: { requests_per_minute: 90 } } }
 #  - embedder: { name: voyage, provider: voyage, settings: { api_key: "${VOYAGE_KEY}", model_id: voyage-3.5, rate_limit: { requests_per_minute: 300 } } }
 #  - embedder: { name: openai, provider: openai, settings: { api_key: "${OPENAI_KEY}", model_id: text-embedding-3-small } }
@@ -57,13 +60,18 @@ stats:
   ci_level: 0.95                # UNADJUSTED per-comparison effect-size CI (§8.2); NOT a gate
   seed: 1234
   contrasts:                    # explicit system_a vs system_b pairs (§8.1); absent => every variant vs baseline
-    - { a: semantic_co,        b: bm25,          family: true }   # headline: does dense beat lexical?
-    - { a: hybrid_co_k60,      b: semantic_co,   family: true }   # does RRF-with-bm25 help or hurt dense?
-    - { a: hybrid_co_rerank,   b: semantic_co,   family: true }   # is hybrid+rerank indistinguishable from dense?
-    - { a: bm25_rerank,        b: bm25,          family: true }   # rerank isolation on lexical
-    - { a: semantic_co_rerank, b: semantic_co,   family: true }   # rerank isolation on dense
-    - { a: hybrid_co_rerank,   b: hybrid_co_k60, family: true }   # rerank isolation on hybrid
-  fdr_metrics: [ndcg@10, recall@100]   # the ONLY metrics that enter the BH family (§8.3, Fix 7)
+    - { a: semantic_co,        b: bm25,               family: true }   # headline: does dense beat lexical?
+    - { a: hybrid_co_k60,      b: semantic_co,        family: true }   # does RRF-with-bm25 help or hurt dense?
+    - { a: hybrid_co_rerank,   b: semantic_co,        family: true }   # is hybrid+rerank indistinguishable from dense?
+    - { a: bm25_rerank,        b: bm25,               family: true }   # rerank isolation on lexical
+    - { a: semantic_co_rerank, b: semantic_co,        family: true }   # rerank isolation on dense
+    - { a: hybrid_co_rerank,   b: hybrid_co_k60,      family: true }   # rerank isolation on hybrid
+    - { a: semantic_co_rerank, b: bm25_rerank,        family: true }   # do embeddings add anything once reranking is present?
+    - { a: hybrid_co_rerank,   b: semantic_co_rerank, family: true }   # does fusion add anything once reranking is present?
+  fdr_metrics: [ndcg@10]        # the ONLY metric in the BH family (§8.3, P1-1): 8 contrasts × 1 = 8 tests
+metrics:                        # ONE relevance policy over ALL SIX metrics (§7, P0-2)
+  unjudged: condensed           # condensed (Sakai deletion; recall reverts to condensed) | irrelevant (trec_eval)
+  relevance_threshold: 0.5      # binary-relevance cut for precision/recall + R + qrels digest (N-3)
 cutoff: 10                      # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
 top_k: 100                      # uniform retrieval depth: fuser.window == rerank_window_size == top_k (§5.3)
 cache:                          # persistent inference/result cache (docs/architecture.md §5.5)

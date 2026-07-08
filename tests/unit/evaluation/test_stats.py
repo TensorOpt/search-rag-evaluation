@@ -397,6 +397,79 @@ def test_non_family_contrast_is_descriptive() -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# Structural exclusions + family integrity (P1-1, MF-1) — verification tests 4 & 5.
+# --------------------------------------------------------------------------------------------------
+
+
+def _delta_vector(
+    systems: dict[str, dict[str, dict[str, float]]], row: ComparisonResult
+) -> np.ndarray:
+    """Recompute a comparison row's per-query delta vector from the systems map (tests 4/5)."""
+    qids = sorted(systems[row.system_a])
+    return np.array(
+        [systems[row.system_a][q][row.metric] - systems[row.system_b][q][row.metric] for q in qids]
+    )
+
+
+def test_structural_exclusion_emits_reason_not_nan() -> None:
+    # MF-1: a reranker-only contrast on recall@100 (W==100) is excluded WITH a reason string, never
+    # enters the family, and reports means for context (not a silent NaN) — independent of the delta.
+    # recall@10 (k != W) is NOT excluded: scored as an ordinary real test.
+    base = _baseline({f"q{i}": 0.5 for i in range(10)})
+    var = _variant({f"q{i}": 0.6 for i in range(10)})  # non-zero delta everywhere
+    systems = {"bm25": base, "rerank": var}
+    contrasts = [Contrast("rerank", "bm25", True)]
+    reason = "recall@100 not identified: rerank vs bm25 differ only by a reranker (MF-1)"
+    exclusions = {("rerank", "bm25", "recall@100"): reason}
+    rows = Comparator(
+        replace(StatsCfg(bootstrap_B=100, seed=1), fdr_metrics=("ndcg@10",))
+    ).compare(systems, contrasts, structural_exclusions=exclusions)
+
+    r100 = _row(rows, "rerank", "recall@100")
+    assert r100.note == reason
+    assert r100.in_family is False
+    assert r100.p_value_adjusted is None and r100.significant is None
+    assert r100.delta_ci_lo is None and r100.delta_ci_high is None  # no bootstrap call
+    assert r100.delta is not None and not math.isnan(r100.delta)  # reason, not a silent NaN
+
+    r10 = _row(rows, "rerank", "recall@10")
+    assert r10.note is None  # NOT excluded (k != W)
+    assert r10.delta_ci_lo is not None  # scored as a real test
+
+
+def test_no_structurally_null_family_members() -> None:
+    # Test 5: no FDR family member has an identically-zero per-query delta vector.
+    base = _baseline({f"q{i}": 0.5 for i in range(10)})
+    strong = _variant({f"q{i}": 0.8 for i in range(10)})  # ndcg delta +0.3 (non-null)
+    systems = {"bm25": base, "v": strong}
+    contrasts = [Contrast("v", "bm25", True)]
+    rows = Comparator(
+        replace(StatsCfg(bootstrap_B=100, seed=1), fdr_metrics=("ndcg@10",))
+    ).compare(systems, contrasts)
+    family = [r for r in rows if r.in_family]
+    assert family
+    for r in family:
+        assert not np.allclose(_delta_vector(systems, r), 0.0)
+
+
+def test_no_duplicate_family_members() -> None:
+    # Test 4: two family contrasts with DISTINCT delta vectors -> no duplicate members.
+    base = _baseline({f"q{i}": 0.5 for i in range(10)})
+    v1 = _variant({f"q{i}": 0.6 for i in range(10)})
+    v2 = _variant({f"q{i}": 0.7 for i in range(10)})
+    systems = {"bm25": base, "v1": v1, "v2": v2}
+    contrasts = [Contrast("v1", "bm25", True), Contrast("v2", "bm25", True)]
+    rows = Comparator(
+        replace(StatsCfg(bootstrap_B=100, seed=1), fdr_metrics=("ndcg@10",))
+    ).compare(systems, contrasts)
+    vectors = [_delta_vector(systems, r) for r in rows if r.in_family]
+    assert len(vectors) == 2
+    for i in range(len(vectors)):
+        for j in range(i + 1, len(vectors)):
+            assert not np.array_equal(vectors[i], vectors[j])
+
+
+# --------------------------------------------------------------------------------------------------
 # FDR family-wide (§8.3) — direct unit test of the _fdr_adjust helper (BH step-up + q-values, BY).
 # --------------------------------------------------------------------------------------------------
 
@@ -632,6 +705,65 @@ def test_value_a_and_value_b_use_the_same_nan_mask() -> None:
     assert math.isclose(r.value_a, 0.6, abs_tol=1e-6)  # mean(0.5, 0.7)
     assert math.isclose(r.delta, r.value_a - r.value_b, abs_tol=1e-6)
     assert r.n_common == 2
+
+
+# --------------------------------------------------------------------------------------------------
+# Verification harness (PART 4) — tests 1 (estimand consistency) & 2 (single baseline value).
+# --------------------------------------------------------------------------------------------------
+
+
+def test_estimand_consistency() -> None:
+    # Test 1 (SF-5): per row, the UNADJUSTED bootstrap CI brackets 0 IFF the RAW p >= alpha (NOT the
+    # FDR flag). Both are Monte-Carlo off the same seed, so skip a comparison whose p sits within the
+    # p-resolution floor eps = 2/(B+1) of alpha, where the two procedures can legitimately disagree.
+    rng = np.random.default_rng(0)
+    n = 80
+    alpha = 0.05
+    bootstrap_b = 2000
+    base = _baseline({f"q{i}": 0.0 for i in range(n)})
+    systems: dict[str, dict[str, dict[str, float]]] = {"bm25": base}
+    contrasts = []
+    for name, shift in [("strong", 0.6), ("null", 0.0)]:
+        draws = rng.normal(shift, 1.0, size=n)
+        variant: dict[str, dict[str, float]] = {}
+        for i in range(n):
+            row = _all_metrics(0.0)
+            row["ndcg@10"] = float(draws[i])
+            variant[f"q{i}"] = row
+        systems[name] = variant
+        contrasts.append(Contrast(name, "bm25", True))
+
+    rows = Comparator(StatsCfg(bootstrap_B=bootstrap_b, seed=7, alpha=alpha)).compare(
+        systems, contrasts
+    )
+    eps = 2.0 / (bootstrap_b + 1)
+    checked = 0
+    for r in rows:
+        if r.note is not None or r.metric != "ndcg@10":
+            continue
+        if abs(r.p_value - alpha) < eps:
+            continue  # boundary — the bootstrap and permutation MC can disagree here (documented)
+        assert r.delta_ci_lo is not None and r.delta_ci_high is not None
+        ci_brackets_zero = r.delta_ci_lo <= 0.0 <= r.delta_ci_high
+        p_not_significant = r.p_value >= alpha
+        assert ci_brackets_zero == p_not_significant
+        checked += 1
+    assert checked  # at least one row exercised the equivalence
+
+
+def test_single_baseline_value() -> None:
+    # Test 2: a system appearing in multiple contrasts reports ONE value per metric.
+    base = _qmap({f"q{i}": 0.1 for i in range(6)})
+    v1 = _qmap({f"q{i}": 0.5 for i in range(6)})
+    v2 = _qmap({f"q{i}": 0.7 for i in range(6)})
+    systems = {"bm25": base, "v1": v1, "v2": v2}
+    contrasts = [Contrast("v1", "bm25", True), Contrast("v2", "bm25", True)]
+    rows = Comparator(StatsCfg(bootstrap_B=100, seed=1)).compare(systems, contrasts)
+    for metric in CANONICAL_METRICS:
+        baseline_values = {
+            r.value_b for r in rows if r.metric == metric and r.value_b is not None
+        }
+        assert len(baseline_values) <= 1  # one baseline value per metric across contrasts
 
 
 # --------------------------------------------------------------------------------------------------

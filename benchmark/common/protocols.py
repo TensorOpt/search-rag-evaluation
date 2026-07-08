@@ -144,6 +144,16 @@ class Dataset(ABC):
             if spec.role in _SEARCH_TEXT_ROLES
         )
 
+    def gain_mapping(self) -> Mapping[str, float]:
+        """The human-readable label->gain map this adapter applied to ``qrels()`` (§7, P0-3, SF-1).
+
+        Recorded in the run manifest alongside the qrels digest so a human can read the resolved
+        grading (a hash cannot provide it). A string-labeled dataset (WANDS ``Exact``/``Partial``/
+        ``Irrelevant``) overrides this to return its map; a numeric-qrels dataset (BEIR sets
+        ``gain = float(rel)`` directly) keeps the empty default — there is no label->gain map.
+        """
+        return {}
+
     @staticmethod
     def map_label(label: str, mapping: Mapping[str, float]) -> float:
         """Map a string relevance label to a float gain via ``mapping`` (§7). Exhaustive.
@@ -219,3 +229,13 @@ class IndexWriter(Protocol):
     def ensure_index(self, mapping: IndexMapping) -> None: ...
     def bulk_index(self, docs: Iterable[Document], *, mapping: IndexMapping) -> None: ...
     def doc_count(self) -> int | None: ...
+
+    def resolved_index_profile(self) -> Mapping[str, Any]:
+        """The lexical scoring profile RESOLVED FROM THE INDEX, for the manifest (§5, P1-2).
+
+        Read back from the live backend (never assumed): the BM25 ``similarity`` params (``k1``/``b``)
+        and the ``analysis`` chain (``analyzer``/``tokenizer``/``filters``) the ``search_text`` field
+        actually uses. Every backend implements it (no ``getattr`` feature-probing, move-with-
+        certainty); the runner calls it directly and records the result under ``diagnostics.index``.
+        """
+        ...
