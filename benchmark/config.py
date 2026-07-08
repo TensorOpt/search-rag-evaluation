@@ -196,7 +196,7 @@ class PipelineCfg:
 
 @dataclass(frozen=True)
 class CacheCfg:
-    """Persistent inference/result cache config (docs/caching_design.md §9).
+    """Persistent inference/result cache config (docs/architecture.md §5.5).
 
     ``enabled`` is opt-in — a config with the ``cache`` block ABSENT is disabled (a clean cold run
     by default). ``dir`` is the cache directory (gitignored). A pure config value: it rides in
@@ -725,7 +725,7 @@ def make_index_writer(indexer_cfg: Mapping[str, Any]) -> Any:
 
 
 def open_cache(cache_cfg: CacheCfg) -> DiskCache | None:
-    """Open the live persistent cache from ``cache_cfg`` (docs/caching_design.md §5/§7).
+    """Open the live persistent cache from ``cache_cfg`` (docs/architecture.md §5.5).
 
     Returns ``None`` ONLY when caching is disabled (the factories then skip wrapping entirely — a
     true bypass). When caching is ENABLED, an unopenable/corrupt ``inference.sqlite``
@@ -760,7 +760,7 @@ def make_searchers(
     -> the backend's lazily-imported ``build_searchers``. The resulting map is shared across all
     pipelines (a pipeline just selects its leaves by name in :func:`build_pipeline`). ``cache`` is
     threaded to the backend's ``build_searchers`` (which fetches the index fingerprint + builds each
-    leaf's identity + wraps in ``CachingSearcher``); ``None`` bypasses wrapping (docs/caching_design.md §5).
+    leaf's identity + wraps in ``CachingSearcher``); ``None`` bypasses wrapping (docs/architecture.md §5.5).
     """
     provider = _require(indexer_cfg, "provider", "indexer")
     target = SEARCHER_BUILDER_TARGETS.get(provider)
@@ -803,7 +803,7 @@ def make_embedders(services: Services, *, cache: DiskCache | None = None) -> dic
     so config validation stays offline. Returns ``{name: Embedder}``; the provider was validated
     against ``_EMBEDDER_PROVIDERS`` at config load. When ``cache`` is set each connector is wrapped in
     a :class:`~benchmark.common.cache.CachingEmbedder` (query/doc vectors memoized on disk);
-    ``cache is None`` bypasses wrapping ENTIRELY (docs/caching_design.md §5). ``provider``/``model_id``/
+    ``cache is None`` bypasses wrapping ENTIRELY (docs/architecture.md §5.5). ``provider``/``model_id``/
     ``endpoint``/``dims`` are passed EXPLICITLY from the ``EmbedderCfg`` (the ``Embedder`` Protocol
     exposes none of them) so the airtight key stays honest.
     """
@@ -831,7 +831,7 @@ def make_rerankers(services: Services, *, cache: DiskCache | None = None) -> dic
     Resolves ``benchmark.reranking`` at CALL time (§11). Returns ``{name: RerankClient}``; the
     provider was validated against ``_RERANKER_PROVIDERS`` at config load. When ``cache`` is set each
     connector is wrapped in a :class:`~benchmark.common.cache.CachingRerankClient` (per-``(query,
-    doc)`` scores memoized); ``cache is None`` bypasses wrapping ENTIRELY (docs/caching_design.md §5).
+    doc)`` scores memoized); ``cache is None`` bypasses wrapping ENTIRELY (docs/architecture.md §5.5).
     """
     make = _resolve_target("benchmark.reranking:make_reranker")
     out: dict[str, Any] = {}

@@ -100,7 +100,7 @@ class ExperimentRunner:
         dataset = config.load_dataset(cfg.dataset)
         writer = config.make_index_writer(cfg.indexer)
         # The composition layer owns the live cache resource: open it here (None when disabled or on
-        # a corrupt DB, docs/caching_design.md §5/§7), thread it into the factories that wrap the
+        # a corrupt DB, docs/architecture.md §5.5), thread it into the factories that wrap the
         # embedder/rerank connectors + searcher leaves, and CLOSE it in `finally`.
         cache = config.open_cache(cfg.cache)
         try:

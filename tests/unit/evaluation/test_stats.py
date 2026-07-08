@@ -1,4 +1,4 @@
-"""Unit tests for the Comparator (docs/methodology.md §8). Phase 3 + methodology_fixes.md Fix 3/6/7.
+"""Unit tests for the Comparator (docs/methodology.md §8)..
 
 Covers: seeded bootstrap-CI determinism and B honoring; the two degenerate short-circuits
 (empty paired set / all-zero deltas) with a hard assertion that scipy/bootstrap/RNG are NEVER

@@ -503,7 +503,7 @@ def build_searchers(
     keyed by the index fingerprint (:func:`_index_version`, fetched ONCE — cheap, and the index is
     already known to exist, §6) and a per-leaf ``identity`` (``match:field`` for lexical;
     ``knn:field:num_candidates=N:emb=<embedder cache_identity>`` for vector — the embedder identity
-    makes a re-embed-into-the-same-index model swap a guaranteed miss, docs/caching_design.md §4/§5).
+    makes a re-embed-into-the-same-index model swap a guaranteed miss, docs/architecture.md §5.5).
     ``cache is None`` returns bare leaves (full bypass; no fingerprint fetch, no identity built).
     """
     client, msearch_chunk_size, num_candidates = _open(indexer_cfg)

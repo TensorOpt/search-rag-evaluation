@@ -1,4 +1,4 @@
-"""Persistent inference/result cache tests (docs/caching_design.md §11).
+"""Persistent inference/result cache tests (docs/architecture.md §5.5).
 
 The DIRECT wrapper unit tests here are the real key-correctness guards (§11): they use COUNTING
 FAKES whose output is DERIVED from the keyed fields — an embedder vector from
@@ -436,7 +436,7 @@ def test_runner_plumbing_cache_enabled(monkeypatch, tmp_path) -> None:
     assert (cache_dir / "inference.sqlite").exists()  # cache opened (and closed) without error
 
 
-# --- config surface: resolve_config parsing + open_cache (docs/caching_design.md §5/§9) --------
+# --- config surface: resolve_config parsing + open_cache (docs/architecture.md §5.5) --------
 
 _MINIMAL_RAW = {
     "dataset": {"name": "wands", "path": "./x"},

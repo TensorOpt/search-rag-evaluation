@@ -66,6 +66,6 @@ stats:
   fdr_metrics: [ndcg@10, recall@100]   # the ONLY metrics that enter the BH family (§8.3, Fix 7)
 cutoff: 10                      # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
 top_k: 100                      # uniform retrieval depth: fuser.window == rerank_window_size == top_k (§5.3)
-cache:                          # persistent inference/result cache (docs/caching_design.md)
+cache:                          # persistent inference/result cache (docs/architecture.md §5.5)
   enabled: true                 # block ABSENT -> disabled; embeddings/rerank/searcher lists memoized
   dir: .cache                   # single sqlite file (.cache/inference.sqlite), gitignored; `rm -rf .cache` to clear

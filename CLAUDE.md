@@ -16,8 +16,8 @@ OpenAI) in `benchmark/providers/inference.py` — ES runs no `_inference`.
   mapping, caching, data flow + single execution path, artifact schemas, config, module layout,
   extension guide (the HOW).
 - **These two are the source of truth.** When code and a doc disagree on a name or schema, the doc
-  wins. (`docs/{experiment,plan,caching_design,refactor_design,methodology_fixes}.md` are retired,
-  frozen historical records — not authoritative.)
+  wins. (The former `experiment.md` and the per-feature design docs have been folded into these two
+  and removed.)
 - **`README.md`** — operational guide: how to run the evals end to end.
 
 ## Stack

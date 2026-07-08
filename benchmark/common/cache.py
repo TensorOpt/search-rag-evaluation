@@ -1,6 +1,6 @@
 """Persistent inference/result cache — sqlite KV store + airtight key builders + Decorators.
 
-docs/caching_design.md. A **pure-function cache** (`key -> value`, where the key captures EVERY
+docs/architecture.md §5.5. A **pure-function cache** (`key -> value`, where the key captures EVERY
 value-determining input, §2/§6) shared by three Decorators, each explicitly subclassing the
 ``common.protocols`` seam it fulfills (CLAUDE.md "declare the interface"):
 

@@ -761,7 +761,7 @@ expensive/redundant computations of a run — query & document **embeddings**, *
 **searcher** result lists — to a local disk store (`.cache/`, a single stdlib `sqlite3` file; **no new
 dependency**). Because components are shared across variants (the runner builds them once, §6) and
 re-runs repeat identical work, this preserves computation **within a run and across runs**. It is
-**off unless enabled** in the config. `docs/caching_design.md` is the historical companion spec.
+**off unless enabled** in the config.
 
 - **Reproducibility invariant (load-bearing).** The cache is a **pure-function** cache: running with
   it enabled or disabled yields **byte-identical** metrics — it changes *speed*, never *numbers*
@@ -785,6 +785,14 @@ re-runs repeat identical work, this preserves computation **within a run and acr
   disabled), the shipped config enables it. Clear the cache by deleting the directory (`.cache/`,
   gitignored). The resolved `cache` config is captured in `run_config_*.json` for provenance and
   cannot change metrics.
+
+> **Load-bearing assumption — rerank scoring is pointwise.** `CachingRerankClient` keys per
+> `(query, doc-text)` because the shipped rerankers (Cohere `rerank-v3.5`, Voyage `rerank-2.x`) are
+> cross-encoders that score each document **independently** of the others in the request. A future
+> **listwise** reranker (whose per-doc score depends on the rest of the candidate set) would make that
+> key unsound and must run with `CachingRerankClient` gated off (§13).
+
+The store, key derivation, and Decorator internals live in `benchmark/common/cache.py`.
 
 ---
 
@@ -990,7 +998,7 @@ methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_fam
 - **Caching does not affect numbers:** the optional disk cache (§5.5) memoizes embeddings / rerank
   scores / searcher results as a **pure-function** cache — a run with the cache enabled or disabled
   produces **byte-identical** metrics, so it never affects reproducibility. The resolved `cache` config
-  (`enabled`, `dir`) is captured in `run_config_{timestamp}.json`. See `docs/caching_design.md`.
+  (`enabled`, `dir`) is captured in `run_config_{timestamp}.json` (§5.5).
 
 ---
 
@@ -1251,6 +1259,11 @@ rerank. No code change unless the provider is new — then add one `RerankClient
   (`text_similarity_reranker`) server-side in a single round trip, which would cut per-query latency;
   adopting that as an optional fast path (an alternate `Searcher` that emits the nested retriever tree,
   selected by config) is deferred. Out of scope for the v1 relevance-quality success criteria.
+- **Listwise rerankers (would break the rerank cache):** the shipped rerankers are pointwise
+  cross-encoders, so `CachingRerankClient` keys per `(query, doc-text)` (§5.5). A **listwise** reranker
+  — whose per-doc score depends on the whole candidate set — would make that key unsound; adding one
+  requires gating `CachingRerankClient` off (or re-keying the whole candidate list). Deferred until a
+  listwise reranker is in scope.
 - **Multiple vector stores / per-store indexing model (deferred, no adapter today):** see §12. The
   single-`indexer`-block model indexes into ONE ES index (§5.2) because ES holds BM25 + every
   `dense_vector` field together; a pure vector store needs one collection per embedding. The clean
