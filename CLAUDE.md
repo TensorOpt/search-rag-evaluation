@@ -28,7 +28,9 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
 
 - **DRY / one path.** All 6 variants (`bm25`, `semantic`, `hybrid`, `bm25_rerank`,
   `semantic_rerank`, `hybrid_rerank`) are config rows through a single `SearchPipeline` +
-  `ExperimentRunner`. No per-variant code.
+  `ExperimentRunner`. No per-variant code. The full {bm25, semantic, hybrid} × {rerank off/on}
+  factorial is realized on WANDS as `bm25`, `semantic_co`, `hybrid_co_k60`, `bm25_rerank`,
+  **`semantic_co_rerank`**, `hybrid_co_rerank` — all six cells present (none omitted).
 - **Generality.** Swapping dataset, backend/vector index, embedding model, or reranker must be a
   new adapter + config only — never edits to the domain engine (`search`/`indexing`/`evaluation`).
   ES + WANDS are adapters behind Protocols; a new backend is an `IndexWriter` +
@@ -36,13 +38,23 @@ Status: **Phase 0 done** (scaffolding: `pyproject.toml` + hatch envs, `docker-co
   `Indexer`/factory (the domain `Indexer` is backend-agnostic and shared).
 - **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. Binary-relevance
   threshold for precision/recall is `gain >= 0.5` (Partial or Exact). A **MISSING** judgement (no
-  qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (§7) — **NOT** treated
-  as irrelevant; only a **judged** `0.0` is irrelevant. Per-query `n_results` (docs returned),
-  `n_scored`/`n_missing` are recorded.
+  qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (§7) for the CONDENSED
+  metrics (`avg_relevance`/`ndcg@10`/`precision@10`) — **NOT** treated as irrelevant; only a
+  **judged** `0.0` is irrelevant. **Recall is STANDARD** (`|judged-relevant ∩ result.docs[:k]| / R`,
+  `R` from qrels) at cutoffs `{10, 50, 100}` — invariant-safe: it never scores a MISSING doc as
+  irrelevant (its denominator is `R`), and it penalizes retrieval failures (empty result → `0`, not
+  NaN, when `R > 0`). Per-query `n_results` (docs returned), `n_scored`/`n_missing` (condensed
+  top-10) are recorded.
+- **Uniform retrieval depth (kill the confound).** Every system retrieves/returns to ONE depth:
+  `fuser.window == rerank_window_size == top_k` (WANDS: 100), reranker `top_n >= W`. No knob may make
+  depth co-vary with the rerank/fusion treatment (§5.3).
+- **Default significance test = mean-δ sign-flip permutation** (§8.2): the p-value, point estimate,
+  and CI share one estimand (the mean paired difference). `wilcoxon` stays selectable.
 - **Exact CSV artifact schemas (do not rename/reorder fields) — one file per run, all pipelines:**
   - `result_{timestamp}.csv` — `variant, query_id, product_id, score, position`
-  - `metrics_{timestamp}.csv` — `variant, query_id, avg_relevance, ndcg@10, recall@10, precision@10, n_results, n_scored, n_missing`
-  - `comparison_{timestamp}.csv` — `baseline, variant, metric, baseline_value, variant_value, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, p_value_adjusted, significant`
+  - `metrics_{timestamp}.csv` — `variant, query_id, avg_relevance, ndcg@10, recall@10, recall@50, recall@100, precision@10, n_results, n_scored, n_missing`
+  - `comparison_{timestamp}.csv` — `system_a, system_b, metric, value_a, value_b, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, in_family, p_value_adjusted, significant, n_common`
+    (FDR family = `contrast.family × fdr_metrics`; **`in_family=false ⟺ p_value_adjusted and significant BOTH empty`**, §8.3.)
 - **RRF k-sweep** is over `rank_constant` ∈ {10,20,…,100}.
 
 ## Conventions

@@ -1,6 +1,6 @@
 # Search-Relevance Benchmark
 
-A reproducible harness for measuring how much different retrieval strategies improve search relevance over a **BM25 baseline**, on a fixed dataset and qrel set. It indexes documents into ElasticSearch, runs each variant (semantic, hybrid + RRF, and reranked combinations) through **one shared pipeline**, scores them with graded relevance metrics (`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`), and emits per-run CSV artifacts plus a paired statistical comparison against the baseline. The first concrete instantiation uses **WANDS** (Wayfair ANnotation Dataset for Search) on ElasticSearch **>= 8.15**, used as a **plain vector + BM25 index**: the harness embeds the corpus and queries via provider connectors (Cohere / Voyage / OpenAI) and retrieves with BM25 `match` + `knn` over `dense_vector` fields.
+A reproducible harness for measuring how much different retrieval strategies improve search relevance over a **BM25 baseline**, on a fixed dataset and qrel set. It indexes documents into ElasticSearch, runs each variant (semantic, hybrid + RRF, and reranked combinations) through **one shared pipeline**, scores them with graded relevance metrics (`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`, `recall@100`, `precision@10`), and emits per-run CSV artifacts plus a paired statistical comparison against the baseline. The first concrete instantiation uses **WANDS** (Wayfair ANnotation Dataset for Search) on ElasticSearch **>= 8.15**, used as a **plain vector + BM25 index**: the harness embeds the corpus and queries via provider connectors (Cohere / Voyage / OpenAI) and retrieves with BM25 `match` + `knn` over `dense_vector` fields.
 
 This README is the operational guide for **running the evals**. For the full experimental design — abstractions, metric definitions, statistics, and the DRY single-execution-path argument — read [`docs/experiment.md`](docs/experiment.md). Where this guide and the design doc differ on a name, the design doc wins.
 
@@ -285,32 +285,35 @@ One file for all pipelines (baseline included). One row per returned doc; `varia
 ### `metrics_{timestamp}.csv`
 
 ```
-variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing
+variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing
 ```
 
-One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. Metrics use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. `n_results` = docs the pipeline returned for the query (`<= top_k`); `n_scored` = judged docs the metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; all three are non-negative integers, always present. Any of the four metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, `recall@10` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
+One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. The **condensed** metrics (`avg_relevance`/`ndcg@10`/`precision@10`) use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. **Recall is standard/coverage** (`|judged-relevant ∩ actual top-k| / R`, `R` from qrels) at cutoffs `{10, 50, 100}` — it looks at the true retrieved positions, never scores a MISSING doc as irrelevant, and scores an empty/failed result `0` (not NaN) when `R > 0`. `n_results` = docs the pipeline returned for the query (`<= top_k`); `n_scored` = judged docs the condensed metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; all three are non-negative integers, always present. Any of the six metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, every `recall@k` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
 
 ### `comparison_{timestamp}.csv`
 
 ```
-baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant
+system_a,system_b,metric,value_a,value_b,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,in_family,p_value_adjusted,significant,n_common
 ```
 
-One file for all variants (the baseline is not compared to itself, so there is no baseline-vs-baseline row). One row per (variant, metric ∈ {`avg_relevance`, `ndcg@10`, `recall@10`, `precision@10`}); `baseline` is the baseline pipeline's id (same on every row) and `variant` is the compared pipeline's id.
+One file for all contrasts. Each row is a contrast between two systems (the baseline is just a system, so variant-vs-variant contrasts look the same; the default all-vs-baseline run never compares the baseline to itself). One row per (contrast, metric ∈ {`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`, `recall@100`, `precision@10`}).
 
-- `baseline_value` / `variant_value` — the per-metric means of the baseline and the variant over the shared paired (non-NaN) query set.
-- `delta` — mean paired difference (`variant_value − baseline_value`) over that set.
-- `delta_ci_lo` / `delta_ci_high` — the **per-comparison, unadjusted 2.5/97.5 percentile bootstrap interval**. This is effect-size context only; it is **not** a significance gate.
-- `p_value` — the **raw** (uncorrected) Wilcoxon signed-rank (or permutation) p-value.
+- `system_a` / `system_b` — the contrast's two system ids (`delta = value_a − value_b`, positive = `a` wins).
+- `value_a` / `value_b` — the per-metric means of `a` and `b` over the shared **family-wide common subset** (finite in every contrast-referenced system) for that metric.
+- `delta` — mean paired difference (`value_a − value_b`) over that subset.
+- `delta_ci_lo` / `delta_ci_high` — the **per-comparison, unadjusted 2.5/97.5 percentile bootstrap interval**. Effect-size context only; **not** a significance gate.
+- `p_value` — the **raw** (uncorrected) p-value from the **mean-δ sign-flip permutation** test (default; Wilcoxon signed-rank if `test: wilcoxon`).
 - `significant_raw` ∈ {`true`,`false`} — the **uncorrected** per-test decision (`p_value <= α`), independent of the family.
-- `p_value_adjusted` — the **FDR-adjusted p-value (q-value)**: Benjamini-Hochberg by default (Benjamini-Yekutieli if `correction: by`), computed over the family of all `(variant × metric)` tests in the run.
-- `significant` ∈ {`true`,`false`} — the **FDR decision** (`p_value_adjusted <= α`) over that family, at level `q = α = 0.05`.
+- `in_family` ∈ {`true`,`false`} — FDR-family membership: `contrast.family AND metric ∈ fdr_metrics AND non-degenerate` (default `fdr_metrics = {ndcg@10, recall@100}`).
+- `p_value_adjusted` — the **FDR-adjusted p-value (q-value)** (Benjamini-Hochberg by default, Benjamini-Yekutieli if `correction: by`), computed over the family rows only. **Empty when `in_family=false`.**
+- `significant` ∈ {`true`,`false`} — the **FDR decision** (`p_value_adjusted <= α`) at level `q = α = 0.05`. **Empty when `in_family=false`** (rule: `in_family=false ⟺ both `p_value_adjusted` and `significant` empty`).
+- `n_common` — the common-subset size for that metric (always present).
 
-> The CI lives in a different role from the significance flags and **may disagree** with them — this is expected under a step-up FDR procedure (see §8.3 of the design doc). The CI is descriptive; `significant` is the FDR gate, `significant_raw` is the uncorrected view. The design uses FDR (not FWER/Holm) because this is an **exploratory** search for the best pipeline among many **correlated** configurations, where the cost of a false positive is low and asymmetric and BH keeps far more power than Bonferroni-style FWER.
+> The CI lives in a different role from the significance flags and **may disagree** with them — this is expected under a step-up FDR procedure (see §8.3 of the design doc). The CI is descriptive; `significant` is the FDR gate, `significant_raw` is the uncorrected view. The FDR family is deliberately small — only the headline metrics (`ndcg@10` = ranking quality, `recall@100` = coverage) enter it, so near-collinear metrics do not inflate it; the rest are descriptive. The design uses FDR (not FWER/Holm) because this is an **exploratory** search for the best pipeline among many **correlated** configurations, where the cost of a false positive is low and asymmetric and BH keeps far more power than Bonferroni-style FWER.
 
 ### `run_config_{timestamp}.json`
 
-The fully-resolved config + seed: the resolved services registry and named pipelines (baseline + variants, each with its retrievers/fuser/reranker/window), bootstrap `B`, CI level, family `α` and size `m`, correction method, test + its zero/tie params, dataset version, ES + endpoint versions, cutoff, and any degenerate-paired-set notes. Given the recorded seed, the statistics are reproducible.
+The fully-resolved config + seed: the resolved services registry and named pipelines (baseline + variants, each with its retrievers/fuser/reranker/window), the stats block (incl. `contrasts` and `fdr_metrics`), bootstrap `B`, CI level, family `α`, correction method, test + its zero/tie params, dataset version, ES + endpoint versions, cutoff, uniform retrieval depth (`top_k`), and a `diagnostics` block (per-metric common-subset `n_common`/`n_excluded` + per-system retrieval-failure counts). Given the recorded seed, the statistics are reproducible.
 
 ```bash
 ls -1 results/

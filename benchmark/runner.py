@@ -184,25 +184,36 @@ class ExperimentRunner:
             write_results_csv(results_by_variant, cfg.timestamp, output_dir=output_dir)
             write_metrics_csv(per_query, cfg.timestamp, output_dir=output_dir)
 
-            # Comparator pass — ONE family-wide call so the FDR correction (§8.3) is applied across the
-            # whole (variant × metric) family. Adapt each Metrics -> {metric: value} via as_dict(): the
-            # baseline maps come from the baseline pipeline, the variant maps from every non-baseline
-            # pipeline (the baseline is NEVER compared to itself, §8.0).
-            baseline_maps = {
-                query_id: m.as_dict() for query_id, m in per_query[cfg.baseline_id].items()
-            }
-            variant_maps = {
+            # Comparator pass — ONE call over the config-declared contrasts. Every pipeline (baseline
+            # included, no longer split out) becomes a system map via Metrics.as_dict(); the baseline
+            # is just another system and "variant vs bm25" is one contrast among many (§8.1/§8.3).
+            systems = {
                 vid: {query_id: m.as_dict() for query_id, m in metrics.items()}
                 for vid, metrics in per_query.items()
-                if vid != cfg.baseline_id
             }
-            rows = Comparator(cfg.stats).compare(baseline_maps, variant_maps)  # family-wide FDR inside
-            write_comparison_csv(cfg.baseline_id, rows, cfg.timestamp, output_dir=output_dir)
-            write_run_config(cfg, output_dir=output_dir)
+            rows = Comparator(cfg.stats).compare(systems, cfg.stats.contrasts)  # family FDR inside
+            write_comparison_csv(rows, cfg.timestamp, output_dir=output_dir)
+
+            # Reproducibility diagnostics (§9.1, Fix 6): per-metric common-subset sizes (all rows of a
+            # metric share n_common) and per-system retrieval-failure counts (queries with 0 results).
+            n_queries = len(queries)
+            common_subset = {
+                row.metric: {"n_common": row.n_common, "n_excluded": n_queries - row.n_common}
+                for row in rows
+            }
+            retrieval_failures = {
+                vid: sum(1 for m in metrics.values() if m.n_results == 0)
+                for vid, metrics in per_query.items()
+            }
+            diagnostics = {
+                "common_subset": common_subset,
+                "retrieval_failures": retrieval_failures,
+            }
+            write_run_config(cfg, diagnostics=diagnostics, output_dir=output_dir)
             logger.info(
-                "run complete: %d pipeline(s), %d variant comparison(s) written to %r",
+                "run complete: %d pipeline(s), %d comparison(s) written to %r",
                 len(per_query),
-                len(variant_maps),
+                len(rows),
                 output_dir,
             )
         finally:

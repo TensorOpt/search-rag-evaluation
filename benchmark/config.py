@@ -42,7 +42,12 @@ from benchmark.common.cache import CachingEmbedder, CachingRerankClient, DiskCac
 from benchmark.common.logging_setup import get_logger
 from benchmark.common.models import IndexMapping
 from benchmark.common.protocols import Embedder, Reranker, RerankClient, Searcher
-from benchmark.evaluation.stats import StatsCfg
+from benchmark.evaluation.stats import (
+    CANONICAL_METRICS,
+    DEFAULT_FDR_METRICS,
+    Contrast,
+    StatsCfg,
+)
 from benchmark.search import HybridSearch, RRFFuser, SearchPipeline
 
 logger = get_logger(__name__)
@@ -362,7 +367,12 @@ def resolve_config(raw: Mapping[str, Any], *, timestamp: str | None = None) -> R
     indexer = _require(cfg, "indexer", "config")
     services = _resolve_services(_require(cfg, "services", "config"))
     baseline, variants = _resolve_pipelines(_require(cfg, "pipelines", "config"), services)
-    stats = _resolve_stats(_require(cfg, "stats", "config"))
+    # Resolve pipelines BEFORE stats so contrast/fdr validation (M2) sees the known system ids.
+    stats = _resolve_stats(
+        _require(cfg, "stats", "config"),
+        baseline_id=baseline.id,
+        variant_ids=[v.id for v in variants],
+    )
 
     raw_cache = cfg.get("cache") or {}  # block absent -> disabled (opt-in, no behavior change)
     cache = CacheCfg(
@@ -601,18 +611,79 @@ def _resolve_fuser(
     )
 
 
-def _resolve_stats(raw: Mapping[str, Any]) -> StatsCfg:
-    """Build :class:`StatsCfg` from the §10 ``stats`` block. ``ci_level`` is parsed, not a gate."""
+def _resolve_stats(
+    raw: Mapping[str, Any],
+    *,
+    baseline_id: str,
+    variant_ids: Sequence[str],
+) -> StatsCfg:
+    """Build :class:`StatsCfg` from the §10 ``stats`` block. ``ci_level`` is parsed, not a gate.
+
+    ``contrasts`` (optional) is a list of ``{a, b, family}`` system-pair entries; when absent it is
+    synthesized as every-variant-vs-baseline, all ``family: true`` (§10, Fix 3). ``fdr_metrics``
+    (optional) restricts the FDR family (Fix 7). Both are validated at build time (M2, fail fast):
+    every contrast id must be a known system (``{baseline_id} ∪ variant_ids``) and every
+    ``fdr_metrics`` entry must be a canonical metric, else :class:`ConfigError`.
+    """
+    system_ids = {baseline_id, *variant_ids}
+    contrasts = _resolve_contrasts(raw.get("contrasts"), baseline_id, variant_ids, system_ids)
+    fdr_metrics = _resolve_fdr_metrics(raw.get("fdr_metrics"))
     return StatsCfg(
         bootstrap_B=int(raw.get("bootstrap_B", 10000)),
         ci_level=float(raw.get("ci_level", 0.95)),
         alpha=float(raw.get("alpha", 0.05)),
         correction=str(raw.get("correction", "bh")),
-        test=str(raw.get("test", "wilcoxon")),
+        test=str(raw.get("test", "permutation")),
         wilcoxon_zero_method=str(raw.get("wilcoxon_zero_method", "wilcox")),
         wilcoxon_correction=bool(raw.get("wilcoxon_correction", True)),
         seed=int(_require(raw, "seed", "stats")),
+        contrasts=contrasts,
+        fdr_metrics=fdr_metrics,
     )
+
+
+def _resolve_contrasts(
+    raw: Any,
+    baseline_id: str,
+    variant_ids: Sequence[str],
+    system_ids: set[str],
+) -> tuple[Contrast, ...]:
+    """Parse (or synthesize) ``stats.contrasts`` (§10, Fix 3), validating every id (M2)."""
+    if raw is None:
+        # Absent -> reproduce the old all-vs-baseline behavior (every variant vs the baseline).
+        return tuple(Contrast(a=vid, b=baseline_id, family=True) for vid in variant_ids)
+    if not isinstance(raw, list):
+        raise ConfigError("'stats.contrasts' must be a list of {a, b, family} entries")
+    contrasts: list[Contrast] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            raise ConfigError("each 'stats.contrasts' entry must be a mapping with keys a, b, family")
+        a = str(_require(entry, "a", "stats.contrasts entry"))
+        b = str(_require(entry, "b", "stats.contrasts entry"))
+        for system_id in (a, b):
+            if system_id not in system_ids:
+                raise ConfigError(
+                    f"stats.contrasts references unknown system {system_id!r}; "
+                    f"known: {sorted(system_ids)}"
+                )
+        contrasts.append(Contrast(a=a, b=b, family=bool(entry.get("family", True))))
+    return tuple(contrasts)
+
+
+def _resolve_fdr_metrics(raw: Any) -> tuple[str, ...]:
+    """Parse ``stats.fdr_metrics`` (§10, Fix 7), validating each against CANONICAL_METRICS (M2)."""
+    if raw is None:
+        return DEFAULT_FDR_METRICS
+    if not isinstance(raw, list):
+        raise ConfigError("'stats.fdr_metrics' must be a list of metric names")
+    metrics = tuple(str(m) for m in raw)
+    for metric in metrics:
+        if metric not in CANONICAL_METRICS:
+            raise ConfigError(
+                f"stats.fdr_metrics entry {metric!r} is not a canonical metric; "
+                f"known: {list(CANONICAL_METRICS)}"
+            )
+    return metrics
 
 
 # --- lazy adapter factories (§11, Phase 11) ----------------------------------------------------

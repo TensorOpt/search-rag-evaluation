@@ -12,7 +12,7 @@ services:                       # named, typed, reusable building blocks
   # Voyage / OpenAI directly — ES runs no inference (§1.1/§3.4). `provider` selects the connector;
   # `model_id`/`api_key`/`rate_limit`/`dims`(optional) live in `settings`. OpenAI has NO reranker.
   - embedder: { name: cohere, provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: embed-english-v3.0, rate_limit: { requests_per_minute: 90 } } }
-  - reranker: { name: co-rr,  provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 25, rate_limit: { requests_per_minute: 90 } } }
+  - reranker: { name: co-rr,  provider: cohere, settings: { api_key: "${COHERE_KEY}", model_id: rerank-v3.5, top_n: 100, rate_limit: { requests_per_minute: 90 } } }
 #  - embedder: { name: voyage, provider: voyage, settings: { api_key: "${VOYAGE_KEY}", model_id: voyage-3.5, rate_limit: { requests_per_minute: 300 } } }
 #  - embedder: { name: openai, provider: openai, settings: { api_key: "${OPENAI_KEY}", model_id: text-embedding-3-small } }
 #  - reranker: { name: vo-rr,  provider: voyage, settings: { api_key: "${VOYAGE_KEY}", model_id: rerank-2.5, top_n: 25, rate_limit: { requests_per_minute: 100 } } }
@@ -35,25 +35,37 @@ pipelines:
     semantic_co:   { retriever: semantic_co }
     hybrid_co_k60:
       retrievers: [bm25, semantic_co]
-      fuser: { type: rrf, rank_constant: 60, window: 25 }
+      fuser: { type: rrf, rank_constant: 60, window: 100 }
     bm25_rerank:
       retriever: bm25
       reranker: co-rr
-      rerank_window_size: 25
+      rerank_window_size: 100
+    semantic_co_rerank:         # 6th factorial cell: rerank isolated on dense-only retrieval
+      retriever: semantic_co
+      reranker: co-rr
+      rerank_window_size: 100
     hybrid_co_rerank:
       retrievers: [bm25, semantic_co]
-      fuser: { type: rrf, rank_constant: 60, window: 25 }
+      fuser: { type: rrf, rank_constant: 60, window: 100 }
       reranker: co-rr
-      rerank_window_size: 25
+      rerank_window_size: 100
 stats:
-  test: wilcoxon
+  test: permutation             # mean-δ sign-flip permutation (§8.2 default); wilcoxon selectable
   correction: bh                # Benjamini-Hochberg FDR (§8.3, default); by = Benjamini-Yekutieli
   alpha: 0.05                   # BOTH the raw per-test threshold AND the FDR target level q
-  bootstrap_B: 1000
+  bootstrap_B: 10000            # CI resamples AND permutation count; p-resolution floor 1/(B+1) (§8.2)
   ci_level: 0.95                # UNADJUSTED per-comparison effect-size CI (§8.2); NOT a gate
   seed: 1234
-cutoff: 10                      # metrics @10
-top_k: 50                       # results retrieved per query
+  contrasts:                    # explicit system_a vs system_b pairs (§8.1); absent => every variant vs baseline
+    - { a: semantic_co,        b: bm25,          family: true }   # headline: does dense beat lexical?
+    - { a: hybrid_co_k60,      b: semantic_co,   family: true }   # does RRF-with-bm25 help or hurt dense?
+    - { a: hybrid_co_rerank,   b: semantic_co,   family: true }   # is hybrid+rerank indistinguishable from dense?
+    - { a: bm25_rerank,        b: bm25,          family: true }   # rerank isolation on lexical
+    - { a: semantic_co_rerank, b: semantic_co,   family: true }   # rerank isolation on dense
+    - { a: hybrid_co_rerank,   b: hybrid_co_k60, family: true }   # rerank isolation on hybrid
+  fdr_metrics: [ndcg@10, recall@100]   # the ONLY metrics that enter the BH family (§8.3, Fix 7)
+cutoff: 10                      # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
+top_k: 100                      # uniform retrieval depth: fuser.window == rerank_window_size == top_k (§5.3)
 cache:                          # persistent inference/result cache (docs/caching_design.md)
   enabled: true                 # block ABSENT -> disabled; embeddings/rerank/searcher lists memoized
   dir: .cache                   # single sqlite file (.cache/inference.sqlite), gitignored; `rm -rf .cache` to clear

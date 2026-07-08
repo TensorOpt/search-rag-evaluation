@@ -56,14 +56,19 @@ def test_qrelindex_sorted_judged_gains_descending():
 
 def test_metrics_as_dict_exact_canonical_keys():
     m = Metrics(
-        avg_relevance=0.1, ndcg_at_10=0.2, recall_at_10=0.3, precision_at_10=0.4,
+        avg_relevance=0.1, ndcg_at_10=0.2, recall_at_10=0.3, recall_at_50=0.35,
+        recall_at_100=0.45, precision_at_10=0.4,
         n_results=7, n_scored=5, n_missing=2,
     )
     d = m.as_dict()
-    assert set(d.keys()) == {"avg_relevance", "ndcg@10", "recall@10", "precision@10"}
+    assert set(d.keys()) == {
+        "avg_relevance", "ndcg@10", "recall@10", "recall@50", "recall@100", "precision@10"
+    }
     assert d["avg_relevance"] == 0.1
     assert d["ndcg@10"] == 0.2
     assert d["recall@10"] == 0.3
+    assert d["recall@50"] == 0.35
+    assert d["recall@100"] == 0.45
     assert d["precision@10"] == 0.4
     # counts are int fields, NOT in as_dict()
     assert m.n_scored == 5
@@ -127,10 +132,15 @@ def test_missing_doc_skipped_judged_irrelevant_kept():
 
 def test_condensed_reaches_past_rank_ten():
     # 12 returned docs. The FIRST TWO are MISSING (no qrel), then p0..p9 are judged Exact (1.0).
-    # The condensed top-10 must collect p0..p9 — reaching original ranks 3..12 (past rank 10).
+    # The condensed top-10 (avg/ndcg/precision) must collect p0..p9 — reaching original ranks
+    # 3..12 (past rank 10).
     #   n_scored = 10, n_missing = 2 (the two missing docs in the scanned prefix, ranks 1-2).
     #   All 10 condensed gains are 1.0 -> a perfect top-10. R = 10 judged relevant.
     #   IDCG@10 = Σ_{i=1..10} 1/log2(i+1); DCG over condensed == IDCG -> nDCG == 1.0.
+    # STANDARD recall@10 (Fix 4) is over the ACTUAL top-10 positions, NOT the condensed list:
+    #   result.docs[:10] = [m1, m2, p0..p7]; relevant hits among them = p0..p7 = 8 -> recall@10 =
+    #   8/10 = 0.8 (the two MISSING docs occupy top-10 slots and are not hits). recall@50/@100 see
+    #   all 12 docs -> all 10 relevant -> 1.0.
     judged = [Qrel("q1", f"p{i}", 1.0) for i in range(10)]
     qrels = QrelIndex(judged)
     returned = ["m1", "m2"] + [f"p{i}" for i in range(10)]  # 2 missing, then 10 judged
@@ -141,7 +151,9 @@ def test_condensed_reaches_past_rank_ten():
     assert m.avg_relevance == pytest.approx(1.0, abs=1e-12)
     assert math.isclose(m.ndcg_at_10, 1.0, abs_tol=1e-12)
     assert m.precision_at_10 == pytest.approx(1.0, abs=1e-12)  # 10/10, denom = n_scored
-    assert m.recall_at_10 == pytest.approx(1.0, abs=1e-12)  # 10/10
+    assert m.recall_at_10 == pytest.approx(8.0 / 10.0, abs=1e-12)  # standard: 8 hits in top-10 / R=10
+    assert m.recall_at_50 == pytest.approx(1.0, abs=1e-12)  # all 10 relevant in top-50 / R=10
+    assert m.recall_at_100 == pytest.approx(1.0, abs=1e-12)
 
 
 def test_missing_docs_after_ten_judged_not_counted():
@@ -308,10 +320,12 @@ def test_score_run_keyed_by_query_id():
 
 
 def test_custom_cutoff_condensed_denominator():
-    # cutoff=2: condensed top-2 only. Returned p1(1.0), p_miss(MISSING), p2(1.0), p3(1.0).
+    # cutoff=2 governs ONLY the condensed top-2 (avg/ndcg/precision). Returned p1(1.0), p_miss(MISSING),
+    # p2(1.0), p3(1.0).
     #   scan: p1 judged (1), p_miss skipped (n_missing=1), p2 judged (2) -> stop at k=2.
     #   condensed = [1.0, 1.0], n_scored = 2. avg = 2/2 = 1.0. precision = 2/2 = 1.0.
-    #   R = 3 judged relevant; recall = 2/3.
+    # STANDARD recall@10 (Fix 4) is INDEPENDENT of the condensed cutoff: it scans result.docs[:10] =
+    #   all 4 returned; relevant hits = p1, p2, p3 = 3; R = 3 -> recall@10 = 3/3 = 1.0.
     qrels = QrelIndex(
         [Qrel("q1", "p1", 1.0), Qrel("q1", "p2", 1.0), Qrel("q1", "p3", 1.0)]
     )
@@ -320,4 +334,4 @@ def test_custom_cutoff_condensed_denominator():
     assert m.n_missing == 1
     assert m.avg_relevance == pytest.approx(1.0, abs=1e-12)  # (1+1)/2
     assert m.precision_at_10 == pytest.approx(1.0, abs=1e-12)  # 2 hits / 2
-    assert m.recall_at_10 == pytest.approx(2.0 / 3.0, abs=1e-12)  # R = 3
+    assert m.recall_at_10 == pytest.approx(1.0, abs=1e-12)  # standard: 3 hits in top-10 / R=3

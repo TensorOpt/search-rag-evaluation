@@ -65,6 +65,13 @@ that does not arise for paired IR-metric deltas — this is the accepted paired 
 exhaustive branch in `_p_value` stays). The `wilcoxon_zero_method`/`wilcoxon_correction` settings stay
 but are inert unless `test: wilcoxon`.
 
+**`bootstrap_B` (S1).** `bootstrap_B` governs **both** the CI resample count (§8.2) **and** the Monte-
+Carlo permutation count (the exact-enumeration branch only fires when `2**n ≤ bootstrap_B`, never at
+n≈470), so it is the p-value resolution floor: two-sided permutation p is quantized to `1/(B+1)`.
+`B = 10000` gives ~1e-4 resolution — adequate below the α=0.05 FDR threshold. **config.yaml ships
+`bootstrap_B: 1000`; raise to `10000`** to match the `StatsCfg` default and §10. Add a one-line §8.2
+note stating this dual role + the floor.
+
 **Modules changed:**
 - `stats.py` — `StatsCfg.test` default `"wilcoxon"` → `"permutation"`. No logic change (both branches
   already exist; `_permutation_p_value` is the one that runs).
@@ -170,16 +177,36 @@ Field-by-field, in order:
 delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, in_family, p_value_adjusted (float|None),
 significant (bool|None), n_common (int), note`.
 
+**Consistency rule (load-bearing, M3):** `in_family == false ⟺ p_value_adjusted and significant cells
+are BOTH empty`. FDR-adjusted values exist **only** for family rows. This one rule governs three row
+kinds uniformly:
+- **family** (`contrast.family AND metric ∈ fdr_metrics AND non-degenerate`): `in_family=true`,
+  `p_value_adjusted` = BH/BY q-value, `significant` = FDR decision.
+- **descriptive** (real test, not in family): `in_family=false`, `p_value_adjusted=None`,
+  `significant=None` → empty cells; `p_value`/`significant_raw` still populated.
+- **degenerate** (`empty_paired_set` / `all_zero_delta`): `in_family=false`, `p_value_adjusted=None`,
+  `significant=None` → empty cells (this **supersedes** the old §8.1 `p_value_adjusted=1.0`/
+  `significant=false` prescription — see the §8.1 proposed edit). `p_value=1.0`, `significant_raw=false`,
+  `note` set, `n_common` populated (0 for `empty_paired_set`).
+
 **Modules changed:**
 - `stats.py` — add `Contrast`; rewrite `compare(systems, contrasts)`; rename `ComparisonResult` fields;
   `_paired_values` gets the common mask (Fix 6); FDR step iterates only family rows (Fix 7).
 - `config.py` — `StatsCfg` gains `contrasts: tuple[Contrast, ...]` (+ `fdr_metrics`, Fix 7);
   `_resolve_stats` parses `stats.contrasts`; `resolve_config` synthesizes the default from
-  (baseline_id, variants) when absent.
+  (baseline_id, variants) when absent. **Config-time validation (M2, fail fast — CLAUDE.md
+  move-with-certainty + the fail-fast invariant):** `resolve_config`/`_resolve_stats` raise
+  `ConfigError` if any contrast `a`/`b` ∉ `{baseline_id} ∪ variant ids`, or any `fdr_metrics` entry ∉
+  `CANONICAL_METRICS`. A bad contrast id or headline metric is caught at build time, never at run time.
+  (Requires `_resolve_stats` to see baseline/variant ids — resolve pipelines first, then stats, passing
+  the known id set + `CANONICAL_METRICS`.)
 - `runner.py` — build `systems = {vid: {q: m.as_dict() …} for all pipelines}` (baseline no longer
   split out); `Comparator(cfg.stats).compare(systems, cfg.stats.contrasts)`.
 - `io_csv.py` — new `_COMPARISON_HEADER` (14 cols); `write_comparison_csv(rows, timestamp, …)` **drops
-  the `baseline_id` param**; `_bool_cell` handles `None → ""` (for `significant` on descriptive rows).
+  the `baseline_id` param**. Only `_bool_cell` needs a `None → ""` path (for `significant` on
+  descriptive/degenerate rows, M3); `_float_cell` **already** maps `None`/`NaN → ""`, so `value_a`/
+  `value_b`/`p_value_adjusted` empty cells need no change (N5). `_bool_cell` for `in_family` is a plain
+  bool (never None); `n_common` is a plain int.
 
 **Invariants.** DRY/one-path (one `compare`, one CSV writer, config-driven contrasts — no per-contrast
 code); generality (contrasts are just id pairs, dataset/backend-agnostic); the comparator still imports
@@ -212,14 +239,15 @@ counted relevant nor penalized in any denominator — it is simply not a relevan
 exists to stop unjudged docs from deflating **precision/nDCG**; recall's denominator is immune, so
 recall is the one metric where actual-position (standard) semantics is both correct and invariant-safe.
 
-**Should recall@10 also switch?** RECOMMEND **yes** — switch recall@10 to standard too, so all three
-recall columns share one definition (a reader never guesses which recall a column is). Numerically
-recall@10 barely moves (few MISSING in the top 10), but coherence matters more than backward-compat of
-one pinned-at-ceiling number. (Open decision — alternative below.)
+**recall@10 also switches (DECIDED, decision 3).** recall@10 becomes standard too, so all three recall
+columns share one definition (a reader never guesses which recall a column is). Numerically recall@10
+barely moves (few MISSING in the top 10) but the value **does** shift — this is why the
+`test_condensed_reaches_past_rank_ten` fixture must be recomputed (standard recall@10 = 8/10 = 0.8, not
+the condensed 1.0).
 
-**Cutoffs.** RECOMMEND `{10, 50, 100}`: @10 keeps the headline comparable, @100 is the coverage story at
-the normalized depth (Fix 5), @50 shows the curve between. `recall@100` == `recall@min(100, n_returned)`
-(a query returning fewer than 100 caps there — expected).
+**Cutoffs (DECIDED, decision 2): `{10, 50, 100}`** — @10 keeps the headline comparable, @100 is the
+coverage story at the normalized depth (Fix 5), @50 shows the curve between. `recall@100` ==
+`recall@min(100, n_returned)` (a query returning fewer than 100 caps there — expected).
 
 **NaN condition.** `recall@k = NaN` iff `R == 0` (same as today). Standard recall is otherwise always
 defined (numerator 0..R) — including 0 for an empty result set, so recall **penalizes** retrieval
@@ -307,14 +335,17 @@ baseline included — has exactly **one** mean per metric (the 3-distinct-baseli
 replaces the current pairwise finite-in-both mask, which produces a different query set per contrast.
 
 **`_paired_values` change.** Today it recomputes a pairwise mask per (variant, metric). New flow: in
-`compare`, precompute once per metric a single common mask over all systems, then select each contrast's
+`compare`, precompute once per metric a single common mask, then select each contrast's
 `value_a`/`value_b`/`δ` from that shared mask:
 
 ```python
-def _common_qids(systems, metric) -> list[str]:
-    # sorted query ids finite for THIS metric in EVERY system (deterministic order for the seeded bootstrap)
+def _common_qids(systems, contrasts, metric) -> list[str]:
+    # Scope (S2): only the systems REFERENCED BY THE CONTRASTS — not all of `systems`. A system in no
+    # contrast can't shrink everyone's subset; still ONE shared mask, so every referenced system
+    # (baseline included) keeps ONE value per metric.
+    used = {s for c in contrasts for s in (c.a, c.b)}
     return [qid for qid in sorted(all_qids)
-            if all(not isnan(systems[s].get(qid, {}).get(metric, nan)) for s in systems)]
+            if all(not isnan(systems[s].get(qid, {}).get(metric, nan)) for s in used)]
 
 def _paired_values(map_a, map_b, metric, common_qids) -> (np.ndarray, np.ndarray):
     # select metric over the SINGLE precomputed common mask (no per-pair recompute)
@@ -323,7 +354,12 @@ def _paired_values(map_a, map_b, metric, common_qids) -> (np.ndarray, np.ndarray
 `n_common[metric] = len(common_qids)`; emitted on every row (col 14) and, with `n_excluded = n_queries
 − n_common`, recorded per metric in `run_config_{ts}.json`.
 
-**Policy: drop vs score-0 for `n_scored == 0` (open decision — recommendation + tradeoffs).**
+**Power cost (S2, state plainly in §8.1).** The family-wide common subset is the **union of per-system
+NaN queries** across the referenced systems, so `n_common ≤ any pairwise finite-in-both subset` — the
+common subset trades statistical power for coherence (one value per system), **by design**. `n_common`
+on every row makes the traded-away queries visible.
+
+**Policy: drop vs score-0 for `n_scored == 0` (DECIDED, decision 4: DROP + retrieval-failure count).**
 
 `n_scored == 0` (no judged doc in the condensed top-10) makes `avg_relevance`/`ndcg@10`/`precision@10`
 NaN → excluded. Two distinct causes: (a) **empty result** (system retrieved nothing — bm25/bm25_rerank
@@ -331,7 +367,7 @@ on query 383, the only such query in WANDS); (b) **non-empty but all-MISSING top
 7-12 queries/variant). Under the common subset, a query NaN in **any** system is dropped for **all**
 systems on that metric.
 
-RECOMMEND: **keep DROP** (NaN → excluded) as default, because scoring an all-MISSING top-k as 0 would
+DECIDED: **keep DROP** (NaN → excluded), because scoring an all-MISSING top-k as 0 would
 treat MISSING as irrelevant — a direct violation of the load-bearing condensed-list invariant. Two
 things make DROP safe here:
 1. **Standard recall already penalizes the failure.** Fix 4's `recall@k` scores an empty/failed
@@ -343,19 +379,31 @@ things make DROP safe here:
    is invisible.
 
 Asymmetry to STATE in §7/§8: DROP does not penalize a system that returned nothing usable in the
-condensed metrics — mitigated by (1) and (2). Alternatives (open decision): **score-0** (penalizes
-failure but breaks the MISSING invariant for the all-MISSING case and enlarges every metric's query
-set), or a **refinement** (empty-result → 0, all-MISSING → drop) that distinguishes the two causes at
-the cost of one extra branch.
+condensed metrics — mitigated by (1) and (2). Rejected alternatives (record only): **score-0**
+(penalizes failure but breaks the MISSING invariant for the all-MISSING case and enlarges every
+metric's query set), or a **refinement** (empty-result → 0, all-MISSING → drop) that distinguishes the
+two causes at the cost of one extra branch.
+
+**Empty common subset (S3).** If a metric's common subset is empty, `_common_qids` returns `[]` →
+`_paired_values` returns empty arrays → the existing `deltas.size == 0` branch fires →
+`note="empty_paired_set"`, `n_common=0`, `in_family=false`, and (per M3) `p_value_adjusted=None`,
+`significant=None` → empty cells. Both degenerate short-circuits (`empty_paired_set`, `all_zero_delta`)
+must be updated to populate the NEW `in_family` (always `false`) and `n_common` fields, and to emit
+`p_value_adjusted=None`/`significant=None` (not the old `1.0`/`false`).
 
 **Modules changed:**
 - `stats.py` — `_paired_values` takes a precomputed `common_qids`; `compare` computes `_common_qids`
-  once per metric; each `ComparisonResult` carries `n_common`.
+  once per metric (scoped to contrast-referenced systems, S2); each `ComparisonResult` carries
+  `n_common` + `in_family`; the two degenerate short-circuits emit `in_family=false`, `n_common`, and
+  `p_value_adjusted=None`/`significant=None` (M3, S3).
 - `runner.py` — collect per-metric `n_excluded` and per-system retrieval-failure counts (from the
   in-memory `Metrics`: `n_results == 0`) and pass to `write_run_config` (or compute in `write_run_config`
   from the config-plus-metrics — simplest: runner assembles a small `diagnostics` dict).
-- `io_csv.py` — `write_run_config` serializes the `diagnostics` block (common-subset counts +
-  retrieval-failure counts).
+- `io_csv.py` — `write_run_config(cfg, *, diagnostics=None, output_dir=…)` gains a `diagnostics`
+  keyword; it merges a top-level `"diagnostics"` key (`{common_subset: {metric: {n_common, n_excluded}},
+  retrieval_failures: {system: count}}`) into the `dataclasses.asdict(cfg)` payload before serializing.
+  `_RUN_CONFIG_KEYS` (schema-lint) gains `"diagnostics"`. Keyword-only + defaulted so existing callers
+  and the round-trip stay valid.
 
 **Invariants.** Condensed MISSING-skip preserved (DROP, not score-0); generality (mask logic operates on
 delta arrays only, dataset-agnostic, stays in `stats.py`); reproducibility (sorted qids → deterministic
@@ -371,7 +419,7 @@ fdr_metrics` AND the row is non-degenerate**. Only those rows get `p_value_adjus
 every other row is **descriptive** — `delta` + bootstrap CI + raw `p_value`/`significant_raw`, but
 `in_family=false` and empty `p_value_adjusted`/`significant`.
 
-**Headline metric(s) (open decision).** RECOMMEND `fdr_metrics = ("ndcg@10", "recall@100")`:
+**Headline metric(s) (DECIDED, decision 6): `fdr_metrics = ("ndcg@10", "recall@100")`.**
 - `ndcg@10` = ranking quality (the "better ordering" claim).
 - `recall@100` = coverage (the "semantic finds more" claim) — available after Fix 4, and **nearly
   orthogonal** to nDCG@10 (quality vs coverage answer different questions), so adding it does not inflate
@@ -400,8 +448,10 @@ stats:
 - `config.py` — `StatsCfg.fdr_metrics: tuple[str, ...] = ("ndcg@10", "recall@100")`; `_resolve_stats`
   parses `stats.fdr_metrics`.
 - `stats.py` — in `compare`, `in_family = contrast.family and metric in cfg.fdr_metrics and not
-  degenerate`; the FDR step (`_fdr_adjust`) runs over family rows only; non-family real-test rows get
-  `p_value_adjusted=None`, `significant=None`. Degenerate rows unchanged (`note`, excluded from family).
+  degenerate`; the FDR step (`_fdr_adjust`) runs over family rows only; **every** non-family row
+  (descriptive real test AND degenerate) gets `p_value_adjusted=None`, `significant=None` → empty cells
+  (M3 rule: `in_family=false ⟺ both empty`). This drops the old degenerate `p_value_adjusted=1.0`/
+  `significant=false`.
 
 **Invariants.** DRY (one comparator, one FDR step); the single coherent FDR regime (§8.3) is preserved,
 just applied to a well-chosen family; `significant_raw`/CI roles unchanged.
@@ -416,14 +466,20 @@ just applied to a well-chosen family; `significant_raw`/CI roles unchanged.
 - **§7** — recall becomes **standard** at cutoffs `{10,50,100}` (state the standard-vs-condensed
   distinction and why recall is invariant-safe); precision/nDCG/avg stay condensed; add the drop-vs-
   score-0 policy (DROP + retrieval-failure count) and the recall-penalizes-failure note. (Fix 4, Fix 6)
-- **§8.1** — pairing uses the **family-wide common subset** (one value per system), not the pairwise
-  finite-in-both mask; define `n_common`/`n_excluded`; retrieval-failure reporting. (Fix 6)
+- **§8.1** — pairing uses the **family-wide common subset** (one value per system, scoped to
+  contrast-referenced systems, S2), not the pairwise finite-in-both mask; define `n_common`/`n_excluded`
+  + the power-cost note (subset = union of per-system NaN queries); retrieval-failure reporting.
+  **Rewrite the degenerate-row table (M3):** `empty_paired_set`/`all_zero_delta` now emit
+  `p_value_adjusted` and `significant` as **empty** (not `1.0`/`false`), plus `in_family=false` and
+  `n_common`. Call out explicitly that this **supersedes** the current §8.1 `1.0`/`false` prescription.
+  (Fix 6)
 - **§8.2** — permutation (mean-δ) is the **primary/default** test; point estimate + CI + p-value all
-  concern the **mean difference**; Wilcoxon demoted to opt-in; add the exchangeability soundness note.
-  (Fix 2)
-- **§8.3** — FDR family = `contrast.family × fdr_metrics` (headline nDCG@10 [+ recall@100]);
-  descriptive rows carry delta+CI+raw-p only (`in_family` flag, empty adjusted cells); rationale for
-  dropping near-collinear metrics from the family. (Fix 3, Fix 7)
+  concern the **mean difference**; Wilcoxon demoted to opt-in; add the exchangeability soundness note;
+  add the `bootstrap_B` dual-role + p-resolution-floor note (S1). (Fix 2)
+- **§8.3** — FDR family = `contrast.family × fdr_metrics` (headline nDCG@10 + recall@100); state the M3
+  rule (`in_family=false ⟺ empty `p_value_adjusted`/`significant``); descriptive rows carry
+  delta+CI+raw-p only; rationale for dropping near-collinear metrics (avg_relevance≈precision@10) from
+  the family. (Fix 3, Fix 7)
 - **§5.3 / §8.0** — add the **uniform retrieval depth** invariant (`fuser.window ==
   rerank_window_size == top_k`, target 100) and the rerank-cost note. (Fix 5)
 - **§9** — rewrite the two frozen headers (metrics + comparison, below); reproducibility block records
@@ -446,40 +502,79 @@ just applied to a well-chosen family; `significant_raw`/CI roles unchanged.
 - Add `semantic_co_rerank` variant (Fix 1).
 - `top_k: 50 → 100`; every `fuser.window: 25 → 100`; every `rerank_window_size: 25 → 100`; reranker
   `co-rr` `top_n: 25 → 100` (Fix 5).
-- `stats.test: wilcoxon → permutation` (Fix 2).
+- `stats.test: wilcoxon → permutation` (Fix 2); `stats.bootstrap_B: 1000 → 10000` (S1).
 - Add `stats.contrasts` (6 rows) and `stats.fdr_metrics: [ndcg@10, recall@100]` (Fix 3, Fix 7).
+
+**`README.md`** (operational guide — update):
+- `metrics_{ts}.csv` header (add `recall@50,recall@100`) + its prose (recall is standard/coverage, the
+  other three stay condensed).
+- `comparison_{ts}.csv` header (12 → 14 cols) + its prose (`system_a/system_b`, `in_family`,
+  `n_common`, per-metric FDR family).
+- The 4-metric enumeration near the top (line 3) → 6 metrics
+  (`avg_relevance, ndcg@10, recall@10, recall@50, recall@100, precision@10`).
+- The `comparison_*` metric-set enumeration (`{avg_relevance, ndcg@10, recall@10, precision@10}` → the
+  6-metric set).
+
+### Tests & fixtures (every target the schema/signature changes break — M1)
+
+- **`tests/unit/test_schema_lint.py`** — update `_METRICS_HEADER` (11 cols), `_COMPARISON_HEADER`
+  (14 cols), and `_RUN_CONFIG_KEYS` (exact-set assertion — add the new `diagnostics` key from Fix 6/9).
+- **`tests/unit/test_io_csv.py`** — the 12-col comparison-header test → 14-col; `write_comparison_csv`
+  loses the `baseline_id` arg; renamed `ComparisonResult` fields (`system_a`/`system_b`/`value_a`/
+  `value_b`/`in_family`/`n_common`); `Metrics(...)` now 6 metric fields; degenerate-row cell asserts →
+  empty `p_value_adjusted`/`significant` (M3).
+- **`tests/unit/evaluation/test_stats.py`** — `compare(baseline, {...})` → `compare(systems,
+  contrasts)`; `_paired_values` signature gains `common_qids`; `.variant`/`.baseline_value` reads →
+  `.system_a`/`.value_a`; add cases for `in_family`, per-metric common subset, empty-common-subset (S3),
+  and the M3 degenerate empties.
+- **`tests/unit/evaluation/test_metrics.py`** — `Metrics(...)` 6-field + `as_dict` 6-key; **recompute
+  `test_condensed_reaches_past_rank_ten`**: standard recall@10 on that fixture is **8/10 = 0.8**, not
+  the condensed `1.0` (Fix 4 — the key behavioral change to assert).
+- **`tests/fixtures/golden/metrics_20260101T000000Z.csv`** (11-col header) and
+  **`comparison_20260101T000000Z.csv`** (14-col header) — regenerate for the new headers/fields;
+  degenerate comparison rows show empty adjusted cells (M3). **`result_*.csv` golden is unchanged.**
+- **`tests/unit/test_config.py`** — parse `stats.contrasts`/`fdr_metrics`; assert the M2 `ConfigError`
+  on an unknown contrast id and on an `fdr_metrics` entry ∉ `CANONICAL_METRICS`; assert the absent-
+  `contrasts` default (every variant vs baseline).
+
+Integration tests (`tests/integration/test_runner.py`) and `tests/unit/test_runner.py` exercise the
+runner's `compare(systems, contrasts)` call + the dropped `baseline_id` writer arg — verify their fakes
+match the new signatures.
 
 ---
 
-## Open decisions (need user sign-off)
+## Open decisions — RESOLVED (user signed off; all recommendations accepted as-is)
 
-1. **Uniform depth value.** RECOMMEND **100** — enables recall@100 and equalizes depth. *Rationale:*
+Every item below is locked to the accepted choice (was the recommendation). Alternatives are retained
+only for the record — they are NOT to be implemented.
+
+1. **Uniform depth value.** ACCEPTED **100** — enables recall@100 and equalizes depth. *Rationale:*
    the coverage story needs depth and the confound needs equal depth. *Alt:* 50 (cheaper rerank, caps
    the recall@100 story) / 200 (more coverage, ~2× rerank cost).
-2. **Recall cutoffs.** RECOMMEND **{10, 50, 100}**. *Rationale:* @10 comparable headline, @100 coverage
+2. **Recall cutoffs.** ACCEPTED **{10, 50, 100}** (user explicitly kept @50). *Rationale:* @10 comparable headline, @100 coverage
    at depth, @50 the curve. *Alt:* {10, 100} (leaner) or {10, 20, 50, 100} (finer).
-3. **Recall semantics.** RECOMMEND **standard for all recall, incl. recall@10**. *Rationale:* one
+3. **Recall semantics.** ACCEPTED **standard for all recall, incl. recall@10**. *Rationale:* one
    definition across all recall columns; recall is a coverage/position metric and standard is
    invariant-safe. *Alt:* keep recall@10 condensed (backward-compatible headline, but mixed
    definitions across columns).
-4. **Drop vs score-0 for `n_scored==0`.** RECOMMEND **DROP (NaN→excluded) + per-system retrieval-failure
+4. **Drop vs score-0 for `n_scored==0`.** ACCEPTED **DROP (NaN→excluded) + per-system retrieval-failure
    count**. *Rationale:* score-0 would treat all-MISSING top-k as irrelevant (breaks the invariant);
    standard recall already scores empty/failed retrieval as 0, and query 383 is surfaced by the failure
    count. *Alt:* score-0 (penalizes failure, breaks invariant, grows the query set) / hybrid refinement
    (empty→0, all-MISSING→drop — one extra branch).
-5. **Contrast family (exact list).** RECOMMEND the **6 contrasts** in Fix 3 (headline dense-vs-bm25,
+5. **Contrast family (exact list).** ACCEPTED the **6 contrasts** in Fix 3 (headline dense-vs-bm25,
    RRF-hurts-dense, hybrid+rerank-vs-dense, three rerank isolations). *Rationale:* answers every named
    research question with the minimum set. *Alt:* add pairwise reranker/embedder contrasts later
    (config-only).
-6. **FDR headline metric(s).** RECOMMEND **{ndcg@10, recall@100}**. *Rationale:* the two headline claims
+6. **FDR headline metric(s).** ACCEPTED **{ndcg@10, recall@100}**. *Rationale:* the two headline claims
    (quality + coverage), nearly orthogonal, no collinear inflation. *Alt:* {ndcg@10} only (smallest
    family).
-7. **Comparison-CSV shape.** RECOMMEND the **14-col `system_a/system_b/... in_family, n_common`** header.
+7. **Comparison-CSV shape.** ACCEPTED the **14-col `system_a/system_b/... in_family, n_common`** header.
    *Rationale:* expresses arbitrary contrasts, self-documents family membership + query count. *Alt:*
    keep `baseline/variant` naming — rejected (cannot express variant-vs-variant).
-8. **Significance test default.** RECOMMEND **permutation (mean-δ), Wilcoxon demoted to opt-in**.
+8. **Significance test default.** ACCEPTED **permutation (mean-δ), Wilcoxon demoted to opt-in**.
    *Rationale:* aligns the test with the reported mean-difference estimand; already implemented and
    seeded. *Alt:* remove Wilcoxon entirely (more deletion, loses a diagnostic + more doc surgery).
-9. **`n_common`/`n_excluded` reporting.** RECOMMEND **`n_common` per comparison row + `n_excluded` per
+9. **`n_common`/`n_excluded` reporting.** ACCEPTED **`n_common` per comparison row + `n_excluded` per
    metric and retrieval-failure counts in `run_config`**. *Rationale:* each row self-documents its query
    set; run-level facts stay in run metadata. *Alt:* run_config only (leaner CSV, less self-documenting).

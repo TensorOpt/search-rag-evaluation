@@ -92,12 +92,16 @@ def _metrics_by_variant() -> dict[str, dict[str, Metrics]]:
     """
     return {
         "bm25": {
-            "q_full": Metrics(0.75, 0.9, 0.5, 1.0, n_results=6, n_scored=4, n_missing=2),
-            "q_noscore": Metrics(math.nan, math.nan, 0.0, math.nan, n_results=3, n_scored=0, n_missing=3),
-            "q_norel": Metrics(0.0, 0.0, math.nan, 0.0, n_results=2, n_scored=2, n_missing=0),
+            "q_full": Metrics(0.75, 0.9, 0.5, 0.6, 0.7, 1.0, n_results=6, n_scored=4, n_missing=2),
+            "q_noscore": Metrics(
+                math.nan, math.nan, 0.0, 0.0, 0.0, math.nan, n_results=3, n_scored=0, n_missing=3
+            ),
+            "q_norel": Metrics(
+                0.0, 0.0, math.nan, math.nan, math.nan, 0.0, n_results=2, n_scored=2, n_missing=0
+            ),
         },
         "semantic_e5": {
-            "q_full": Metrics(0.8, 0.95, 1.0, 0.5, n_results=4, n_scored=3, n_missing=1),
+            "q_full": Metrics(0.8, 0.95, 1.0, 1.0, 1.0, 0.5, n_results=4, n_scored=3, n_missing=1),
         },
     }
 
@@ -113,72 +117,91 @@ def test_metrics_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
 def test_metrics_header_ends_with_counts(tmp_path: Path) -> None:
     """The metrics header leads with variant and ends with the two int count columns (§9)."""
     path = write_metrics_csv(
-        {"bm25": {"q1": Metrics(1.0, 1.0, 1.0, 1.0, n_results=2, n_scored=1, n_missing=0)}},
+        {"bm25": {"q1": Metrics(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, n_results=2, n_scored=1, n_missing=0)}},
         TIMESTAMP,
         output_dir=tmp_path,
     )
     header = path.read_text(encoding="utf-8").splitlines()[0]
-    assert header == "variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing"
+    assert header == (
+        "variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,"
+        "n_results,n_scored,n_missing"
+    )
 
 
 def test_metrics_nan_serializes_as_empty_adjacent_commas(tmp_path: Path) -> None:
     """A NaN metric cell is two adjacent commas (empty field), while counts stay integers."""
     path = write_metrics_csv(
-        {"bm25": {"q0": Metrics(math.nan, math.nan, math.nan, math.nan, n_results=0, n_scored=0, n_missing=0)}},
+        {
+            "bm25": {
+                "q0": Metrics(
+                    math.nan, math.nan, math.nan, math.nan, math.nan, math.nan,
+                    n_results=0, n_scored=0, n_missing=0,
+                )
+            }
+        },
         TIMESTAMP,
         output_dir=tmp_path,
     )
     row = path.read_text(encoding="utf-8").splitlines()[1]
-    # variant + query_id + four empty metric cells + two int counts.
-    assert row == "bm25,q0,,,,,0,0,0"
+    # variant + query_id + six empty metric cells + three int counts.
+    assert row == "bm25,q0,,,,,,,0,0,0"
 
 
 # --- comparison CSV ---------------------------------------------------------------------------
 
 
 def _comparison_rows() -> list[ComparisonResult]:
-    """A normal row + empty_paired_set + all_zero_delta, exercising baseline_value/variant_value."""
+    """A normal family row + empty_paired_set + all_zero_delta, exercising value_a/value_b + M3."""
     return [
         ComparisonResult(
-            variant="semantic_e5",
+            system_a="semantic_e5",
+            system_b="bm25",
             metric="avg_relevance",
-            baseline_value=0.5,
-            variant_value=0.625,
+            value_a=0.625,
+            value_b=0.5,
             delta=0.125,
             delta_ci_lo=0.05,
             delta_ci_high=0.2,
             p_value=0.01,
             significant_raw=True,
+            in_family=True,
             p_value_adjusted=0.02,
             significant=True,
+            n_common=40,
             note=None,
         ),
         ComparisonResult(
-            variant="semantic_e5",
+            system_a="semantic_e5",
+            system_b="bm25",
             metric="ndcg@10",
-            baseline_value=None,
-            variant_value=None,
+            value_a=None,
+            value_b=None,
             delta=None,
             delta_ci_lo=None,
             delta_ci_high=None,
             p_value=1.0,
             significant_raw=False,
-            p_value_adjusted=1.0,
-            significant=False,
+            in_family=False,
+            p_value_adjusted=None,
+            significant=None,
+            n_common=0,
             note="empty_paired_set",
         ),
         ComparisonResult(
-            variant="semantic_e5",
+            system_a="semantic_e5",
+            system_b="bm25",
             metric="recall@10",
-            baseline_value=0.4,
-            variant_value=0.4,
+            value_a=0.4,
+            value_b=0.4,
             delta=0.0,
             delta_ci_lo=0.0,
             delta_ci_high=0.0,
             p_value=1.0,
             significant_raw=False,
-            p_value_adjusted=1.0,
-            significant=False,
+            in_family=False,
+            p_value_adjusted=None,
+            significant=None,
+            n_common=40,
             note="all_zero_delta",
         ),
     ]
@@ -186,46 +209,48 @@ def _comparison_rows() -> list[ComparisonResult]:
 
 def test_comparison_csv_matches_golden(tmp_path: Path, golden_dir: Path) -> None:
     """comparison CSV: a normal row + empty_paired_set + all_zero_delta, byte-for-byte golden (§8.1)."""
-    path = write_comparison_csv("bm25", _comparison_rows(), TIMESTAMP, output_dir=tmp_path)
+    path = write_comparison_csv(_comparison_rows(), TIMESTAMP, output_dir=tmp_path)
     assert path.name == f"comparison_{TIMESTAMP}.csv"
     golden = (golden_dir / f"comparison_{TIMESTAMP}.csv").read_bytes()
     assert path.read_bytes() == golden
 
 
-def test_comparison_header_is_twelve_columns(tmp_path: Path) -> None:
-    """The comparison header is exactly the 12-column §9 header (baseline + values + stats)."""
-    path = write_comparison_csv("bm25", [], TIMESTAMP, output_dir=tmp_path)
+def test_comparison_header_is_fourteen_columns(tmp_path: Path) -> None:
+    """The comparison header is exactly the 14-column §9 header (contrast + values + stats + counts)."""
+    path = write_comparison_csv([], TIMESTAMP, output_dir=tmp_path)
     header = path.read_text(encoding="utf-8").splitlines()[0]
     assert header == (
-        "baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,"
-        "p_value,significant_raw,p_value_adjusted,significant"
+        "system_a,system_b,metric,value_a,value_b,delta,delta_ci_lo,delta_ci_high,"
+        "p_value,significant_raw,in_family,p_value_adjusted,significant,n_common"
     )
 
 
 def test_comparison_empty_paired_set_row(tmp_path: Path) -> None:
-    """empty_paired_set: baseline_value/variant_value/delta/CI empty, p=1.0, flags false (§8.1)."""
+    """empty_paired_set: values/delta/CI empty, p=1.0; in_family=false -> adjusted+significant empty (M3)."""
     row = ComparisonResult(
-        variant="v", metric="recall@10", baseline_value=None, variant_value=None,
+        system_a="v", system_b="bm25", metric="recall@10", value_a=None, value_b=None,
         delta=None, delta_ci_lo=None, delta_ci_high=None,
-        p_value=1.0, significant_raw=False, p_value_adjusted=1.0, significant=False,
+        p_value=1.0, significant_raw=False, in_family=False,
+        p_value_adjusted=None, significant=None, n_common=0,
         note="empty_paired_set",
     )
-    path = write_comparison_csv("bm25", [row], TIMESTAMP, output_dir=tmp_path)
+    path = write_comparison_csv([row], TIMESTAMP, output_dir=tmp_path)
     data = path.read_text(encoding="utf-8").splitlines()[1]
-    assert data == "bm25,v,recall@10,,,,,,1.0,false,1.0,false"
+    assert data == "v,bm25,recall@10,,,,,,1.0,false,false,,,0"
 
 
 def test_comparison_all_zero_delta_row(tmp_path: Path) -> None:
-    """all_zero_delta: baseline_value==variant_value, delta=0.0, CI 0.0/0.0, p=1.0, flags false (§8.1)."""
+    """all_zero_delta: value_a==value_b, delta=0.0, CI 0.0/0.0, p=1.0; adjusted+significant empty (M3)."""
     row = ComparisonResult(
-        variant="v", metric="ndcg@10", baseline_value=0.3, variant_value=0.3,
+        system_a="v", system_b="bm25", metric="ndcg@10", value_a=0.3, value_b=0.3,
         delta=0.0, delta_ci_lo=0.0, delta_ci_high=0.0,
-        p_value=1.0, significant_raw=False, p_value_adjusted=1.0, significant=False,
+        p_value=1.0, significant_raw=False, in_family=False,
+        p_value_adjusted=None, significant=None, n_common=40,
         note="all_zero_delta",
     )
-    path = write_comparison_csv("bm25", [row], TIMESTAMP, output_dir=tmp_path)
+    path = write_comparison_csv([row], TIMESTAMP, output_dir=tmp_path)
     data = path.read_text(encoding="utf-8").splitlines()[1]
-    assert data == "bm25,v,ndcg@10,0.3,0.3,0.0,0.0,0.0,1.0,false,1.0,false"
+    assert data == "v,bm25,ndcg@10,0.3,0.3,0.0,0.0,0.0,1.0,false,false,,,40"
 
 
 # --- run_config JSON --------------------------------------------------------------------------
@@ -317,10 +342,16 @@ def test_run_config_round_trips_and_has_section_9_1_fields(tmp_path: Path) -> No
     assert stats["correction"] == "bh"
     assert stats["bootstrap_B"] == 10000
     assert stats["ci_level"] == 0.95
-    assert stats["test"] == "wilcoxon"
+    assert stats["test"] == "permutation"  # Fix 2: mean-δ permutation is the default
     assert stats["wilcoxon_zero_method"] == "wilcox"
     assert stats["wilcoxon_correction"] is True
     assert stats["seed"] == 1234
+    assert stats["fdr_metrics"] == ["ndcg@10", "recall@100"]  # StatsCfg default (Fix 7)
+    assert stats["contrasts"] == []  # StatsCfg default (no contrasts synthesized outside resolve)
+
+    # Diagnostics key is always present (null when the writer is called without diagnostics).
+    assert "diagnostics" in loaded
+    assert loaded["diagnostics"] is None
 
 
 def test_run_config_from_full_config_yaml(tmp_path: Path, repo_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:

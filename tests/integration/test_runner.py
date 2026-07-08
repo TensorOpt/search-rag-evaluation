@@ -156,7 +156,8 @@ def test_run_end_to_end_produces_all_artifacts(es_index: str, tmp_path: Path) ->
     assert _variant_column(result_file) == all_pipelines
     assert _variant_column(metrics_file) == all_pipelines
 
-    # Comparison: baseline col constant; variant col is the variants only — never baseline vs itself.
+    # Comparison: every default contrast is variant-vs-baseline, so system_b (col 1) is constant ==
+    # the baseline and system_a (col 0) is the variants only — never baseline vs itself.
     comparison_rows = comparison_file.read_text(encoding="utf-8").splitlines()[1:]
-    assert {line.split(",")[0] for line in comparison_rows} == {base}
-    assert {line.split(",")[1] for line in comparison_rows} == {"semantic_co", "hybrid_co", "bm25_rerank"}
+    assert {line.split(",")[0] for line in comparison_rows} == {"semantic_co", "hybrid_co", "bm25_rerank"}
+    assert {line.split(",")[1] for line in comparison_rows} == {base}

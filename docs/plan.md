@@ -170,7 +170,7 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Test / acceptance criteria.** *(pure / offline)*
 - **Hand-computed** values on tiny fixtures for all four metrics, including: a perfect ranking (nDCG=1.0); a MISSING doc is SKIPPED (condensed), NOT scored 0.0, while a JUDGED-irrelevant (`0.0`) doc is KEPT and counts toward `n_scored`/DCG; the condensed list reaching **past original rank 10** to fill 10 judged docs; `n_scored`/`n_missing` correct on a mixed judged/missing list (arithmetic written out); precision/avg denominators are `n_scored` (proven with `n_scored < 10`); `n_scored=0` → avg/ndcg/precision `NaN` and recall `0.0` (if `R>0`) else `NaN`; `R=0 → recall NaN`; a query with **> 10 relevant docs** confirming IDCG truncation to 10; `IDCG=0 → nDCG=0`.
 - A graded case with mixed `{0, 0.5, 1}` judged gains **and missing docs** where DCG/IDCG are computed by hand in the test and asserted to a tight tolerance (`2^0.5-1 ≈ 0.41421356`).
-- `as_dict()` keys are EXACTLY `{avg_relevance, ndcg@10, recall@10, precision@10}`; `n_results`/`n_scored`/`n_missing` are int fields on `Metrics` (not in `as_dict()`).
+- `as_dict()` keys are EXACTLY `{avg_relevance, ndcg@10, recall@10, recall@50, recall@100, precision@10}`; `n_results`/`n_scored`/`n_missing` are int fields on `Metrics` (not in `as_dict()`). Recall is STANDARD (`|judged-relevant ∩ docs[:k]| / R`) at `{10,50,100}`; avg/ndcg/precision stay condensed (§7).
 
 **Developer / reviewer responsibilities.** Developer implements per §7. Reviewer recomputes at least the nDCG and IDCG-truncation cases independently and confirms the condensed-list / missing-`NaN` / per-metric-`NaN` policy.
 
@@ -303,14 +303,14 @@ Each phase uses the same template: **Objective · Deliverables · Depends on · 
 **Depends on.** Phases 1, 2, 3 (consumes `RankedResult`, `Metrics`, comparator rows).
 
 **Implementation notes (§9, CLAUDE.md invariants).**
-- Filenames (ONE file per run, all pipelines): `result_{timestamp}.csv`, `metrics_{timestamp}.csv`, `comparison_{timestamp}.csv`, `run_config_{timestamp}.json`; `{timestamp}` = single per-run UTC `YYYYMMDDTHHMMSSZ`. `result`/`metrics` carry a leading `variant` column (baseline included); `comparison` a leading `baseline` column.
+- Filenames (ONE file per run, all pipelines): `result_{timestamp}.csv`, `metrics_{timestamp}.csv`, `comparison_{timestamp}.csv`, `run_config_{timestamp}.json`; `{timestamp}` = single per-run UTC `YYYYMMDDTHHMMSSZ`. `result`/`metrics` carry a leading `variant` column (baseline included); `comparison` carries `system_a`/`system_b` columns (arbitrary contrasts, §8.1).
 - **Exact headers / field order (do not rename/reorder):**
   - result → `variant,query_id,product_id,score,position`
-  - metrics → `variant,query_id,avg_relevance,ndcg@10,recall@10,precision@10,n_results,n_scored,n_missing`
-  - comparison → `baseline,variant,metric,baseline_value,variant_value,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,p_value_adjusted,significant` (12 columns)
+  - metrics → `variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing`
+  - comparison → `system_a,system_b,metric,value_a,value_b,delta,delta_ci_lo,delta_ci_high,p_value,significant_raw,in_family,p_value_adjusted,significant,n_common` (14 columns)
 - **`position` derived** as the 1-based index into `RankedResult.docs` at write time (§3.1, §9); ≤ `top_k` rows/query.
-- **Any of the FOUR metric cells `NaN` → empty field** (two adjacent commas, no quoting) per §7/§9: `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored==0`, `recall@10` empty when `R==0`. `n_results`/`n_scored`/`n_missing` are non-negative ints, **ALWAYS present** (never empty). `significant_raw`/`significant` ∈ {`true`,`false`} lowercase; `p_value`/`p_value_adjusted` are numeric.
-- **Degenerate comparison rows (§8.1/§9):** empty paired set → `delta`/CI cells empty, `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`; all-zero → `0.0`/`0.0`/`0.0`, `p_value=1.0`, `significant_raw=false`, `p_value_adjusted=1.0`, `significant=false`.
+- **Any of the SIX metric cells `NaN` → empty field** (two adjacent commas, no quoting) per §7/§9: `avg_relevance`/`ndcg@10`/`precision@10` empty when `n_scored==0`, every `recall@k` empty when `R==0`. `n_results`/`n_scored`/`n_missing` are non-negative ints, **ALWAYS present** (never empty). `significant_raw`/`in_family` ∈ {`true`,`false`} lowercase; `p_value` numeric; `p_value_adjusted`/`significant` are populated only for FDR-family rows and **empty otherwise** (`in_family=false ⟺ both empty`, §8.3).
+- **Degenerate comparison rows (§8.1/§9):** empty paired set → `value_a`/`value_b`/`delta`/CI cells empty, `p_value=1.0`, `significant_raw=false`, `n_common=0`; all-zero → `0.0` delta/CI, `p_value=1.0`, `significant_raw=false`. Both are `in_family=false` → `p_value_adjusted`/`significant` **empty** (M3; supersedes the older `1.0`/`false` prescription).
 - `write_run_config` serializes the fully-resolved config + seed per §9.1 (the resolved services registry + named pipelines, B, fixed CI level 2.5/97.5, `α` as both the raw threshold and the FDR level q, family size m, correction (`bh`/`by`), test + zero/tie params, degenerate notes, dataset/ES/endpoint versions, cutoff, seed). The BH/BY q-values are emitted per test in the comparison CSV (`p_value_adjusted`).
 
 **Test / acceptance criteria.** *(pure / offline, golden files)*

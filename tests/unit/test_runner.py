@@ -42,7 +42,7 @@ from benchmark.config import (
     SearcherCfg,
     Services,
 )
-from benchmark.evaluation.stats import StatsCfg
+from benchmark.evaluation.stats import Contrast, StatsCfg
 
 from tests.conftest import FakeReranker, FakeSearcher
 
@@ -220,13 +220,16 @@ def _config(
     timestamp: str = "20260702T000000Z",
 ) -> ResolvedConfig:
     baseline = PipelineCfg(id="bm25", retrievers=("bm25",), fuser=None, reranker=None, rerank_window_size=None)
+    # Build ResolvedConfig directly (bypassing resolve_config), so synthesize the default every-
+    # variant-vs-baseline contrasts here the way resolve_config would (§10, Fix 3).
+    contrasts = tuple(Contrast(a=v.id, b="bm25", family=True) for v in variants)
     return ResolvedConfig(
         dataset={"name": "fake"},
         indexer={"provider": "elasticsearch", "index": "fake_index"},
         services=services or _services(),
         baseline=baseline,
         variants=list(variants),
-        stats=StatsCfg(bootstrap_B=200, seed=7),
+        stats=StatsCfg(bootstrap_B=200, seed=7, contrasts=contrasts),
         cutoff=10,
         top_k=100,
         baseline_id="bm25",
@@ -323,12 +326,13 @@ def test_run_produces_all_artifacts_baseline_first(
     assert _variant_order(result_file) == ["bm25", "semantic_e5", "hybrid_e5", "bm25_rerank"]
     assert _variant_order(metrics_file) == ["bm25", "semantic_e5", "hybrid_e5", "bm25_rerank"]
 
-    # Comparison: baseline col constant == bm25; one row per (variant, metric); NO baseline-vs-itself.
-    baseline_col = _column(comparison_file, 0)
-    variant_col = _column(comparison_file, 1)
-    assert set(baseline_col) == {"bm25"}
-    assert "bm25" not in variant_col  # baseline never compared to itself
-    assert len(variant_col) == 3 * 4  # 3 variants x 4 canonical metrics
+    # Comparison: system_b col constant == bm25 (every default contrast is variant-vs-baseline);
+    # one row per (contrast, metric); NO baseline-vs-itself.
+    system_a_col = _column(comparison_file, 0)
+    system_b_col = _column(comparison_file, 1)
+    assert set(system_b_col) == {"bm25"}
+    assert "bm25" not in system_a_col  # baseline never on the a side of a default contrast
+    assert len(system_a_col) == 3 * 6  # 3 contrasts x 6 canonical metrics
 
     # eval:run does NOT index — the ingest seam is never exercised here (that's eval:index's job).
     assert patched_factories.ensured is False

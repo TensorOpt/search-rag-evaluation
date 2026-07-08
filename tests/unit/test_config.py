@@ -122,8 +122,71 @@ def test_stats_block_parsed() -> None:
     resolved = resolve_config(_parsed())
     assert resolved.stats.ci_level == pytest.approx(0.95)  # parsed, never a gate (§8.2)
     assert resolved.stats.correction == "bh"
-    assert resolved.stats.test == "wilcoxon"
+    assert resolved.stats.test == "wilcoxon"  # CONFIG_YAML sets it explicitly; default is permutation
     assert resolved.stats.seed == 1234
+
+
+def test_stats_test_defaults_to_permutation() -> None:
+    # Fix 2: when `stats.test` is absent, the default is the mean-δ permutation test.
+    raw = _parsed()
+    del raw["stats"]["test"]
+    assert resolve_config(raw).stats.test == "permutation"
+
+
+# --- stats.contrasts / stats.fdr_metrics (§8.1/§8.3, Fix 3/6/7) --------------------------------
+
+
+def test_contrasts_default_is_every_variant_vs_baseline() -> None:
+    # Absent `stats.contrasts` -> synthesized as each variant vs the baseline, all family:true.
+    from benchmark.evaluation.stats import Contrast
+
+    resolved = resolve_config(_parsed())
+    assert resolved.stats.contrasts == (
+        Contrast(a="semantic_e5", b="baseline", family=True),
+        Contrast(a="hybrid_e5_k60", b="baseline", family=True),
+        Contrast(a="bm25_rerank", b="baseline", family=True),
+    )
+
+
+def test_contrasts_parsed_from_config() -> None:
+    from benchmark.evaluation.stats import Contrast
+
+    raw = _parsed()
+    raw["stats"]["contrasts"] = [
+        {"a": "semantic_e5", "b": "baseline", "family": True},
+        {"a": "hybrid_e5_k60", "b": "semantic_e5", "family": False},
+    ]
+    resolved = resolve_config(raw)
+    assert resolved.stats.contrasts == (
+        Contrast(a="semantic_e5", b="baseline", family=True),
+        Contrast(a="hybrid_e5_k60", b="semantic_e5", family=False),
+    )
+
+
+def test_fdr_metrics_defaults_to_headline_pair() -> None:
+    assert resolve_config(_parsed()).stats.fdr_metrics == ("ndcg@10", "recall@100")
+
+
+def test_fdr_metrics_parsed_from_config() -> None:
+    raw = _parsed()
+    raw["stats"]["fdr_metrics"] = ["ndcg@10"]
+    assert resolve_config(raw).stats.fdr_metrics == ("ndcg@10",)
+
+
+def test_unknown_contrast_id_raises() -> None:
+    # M2 fail-fast: a contrast referencing an unknown system id must raise at build time.
+    raw = _parsed()
+    raw["stats"]["contrasts"] = [{"a": "nope", "b": "baseline", "family": True}]
+    with pytest.raises(ConfigError, match="unknown system"):
+        resolve_config(raw)
+
+
+def test_unknown_fdr_metric_raises() -> None:
+    # M2 fail-fast: an fdr_metrics entry that is not a canonical metric must raise at build time.
+    raw = _parsed()
+    raw["stats"]["fdr_metrics"] = ["ndcg@5"]
+    with pytest.raises(ConfigError, match="not a canonical metric"):
+        resolve_config(raw)
 
 
 # --- services registry --------------------------------------------------------------------------
