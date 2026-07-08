@@ -51,6 +51,24 @@ test = "pytest {args}"
 lint = "ruff check {args}"
 typecheck = "mypy benchmark {args}"
 
+# ---------------------------------------------------------------------------
+# notebook environment — interactive data analysis in notebooks/ (e.g. wands.ipynb).
+#   hatch run notebook:lab   launches JupyterLab with these deps on the path.
+# These are ISOLATED here — deliberately NOT in [project].dependencies or the eval
+# env, so running evals / indexing never pulls pandas / duckdb / jupyter. numpy comes
+# from the installed project; benchmark itself is importable for analysing results.
+# ---------------------------------------------------------------------------
+[tool.hatch.envs.notebook]
+dependencies = [
+  "jupyterlab",
+  "pandas",
+  "duckdb",
+  "matplotlib",
+]
+
+[tool.hatch.envs.notebook.scripts]
+lab = "jupyter lab {args}"
+
 [tool.ruff]
 target-version = "py311"
 
