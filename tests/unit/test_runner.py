@@ -347,6 +347,13 @@ def test_run_produces_all_artifacts_baseline_first(
     ]
     assert (tmp_path / f"run_config_{ts}.json").exists()
 
+    # Manifest provenance (§9.1): the dataset version and the degenerate-note list are persisted.
+    import json
+
+    payload = json.loads((tmp_path / f"run_config_{ts}.json").read_text(encoding="utf-8"))
+    assert payload["diagnostics"]["dataset"]["version"] == "0"
+    assert isinstance(payload["diagnostics"]["stats"]["degenerate"], list)
+
     # Every pipeline (baseline first, then variants in config order) appears in the variant column.
     def _variant_order(path: Path) -> list[str]:
         seen: list[str] = []

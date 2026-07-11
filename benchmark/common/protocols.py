@@ -233,9 +233,10 @@ class IndexWriter(Protocol):
     def resolved_index_profile(self) -> Mapping[str, Any]:
         """The lexical scoring profile RESOLVED FROM THE INDEX, for the manifest (§5).
 
-        Read back from the live backend (never assumed): the BM25 ``similarity`` params (``k1``/``b``)
-        and the ``analysis`` chain (``analyzer``/``tokenizer``/``filters``) the ``search_text`` field
-        actually uses. Every backend implements it (no ``getattr`` feature-probing, move-with-
-        certainty); the runner calls it directly and records the result under ``diagnostics.index``.
+        Read back from the live backend (never assumed): the backend ``server_version``, the BM25
+        ``similarity`` params (``k1``/``b``), and the ``analysis`` chain (``analyzer``/``tokenizer``/
+        ``filters``) the ``search_text`` field actually uses. Every backend implements it (no
+        ``getattr`` feature-probing, move-with-certainty); the runner calls it directly and records
+        the result under ``diagnostics.index`` (§9.1).
         """
         ...

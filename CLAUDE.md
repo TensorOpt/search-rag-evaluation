@@ -38,23 +38,32 @@ OpenAI) in `benchmark/providers/inference.py` — ES runs no `_inference`.
   ES + WANDS are adapters behind Protocols; a new backend is an `IndexWriter` +
   `build_searchers`/`build_rerankers` in `providers/` + config target-table rows, no per-backend
   `Indexer`/factory (the domain `Indexer` is backend-agnostic and shared).
-- **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. Binary-relevance
-  threshold for precision/recall is `gain >= 0.5` (Partial or Exact). A **MISSING** judgement (no
-  qrel entry for a returned doc) is **SKIPPED** via condensed-list evaluation (methodology.md §7) for the CONDENSED
-  metrics (`avg_relevance`/`ndcg@10`/`precision@10`) — **NOT** treated as irrelevant; only a
-  **judged** `0.0` is irrelevant. **Recall is STANDARD** (`|judged-relevant ∩ result.docs[:k]| / R`,
-  `R` from qrels) at cutoffs `{10, 50, 100}` — invariant-safe: it never scores a MISSING doc as
-  irrelevant (its denominator is `R`), and it penalizes retrieval failures (empty result → `0`, not
-  NaN, when `R > 0`). Per-query `n_results` (docs returned), `n_scored`/`n_missing` (condensed
-  top-10) are recorded.
+- **Relevance gains** (float; WANDS): `Exact=1.0`, `Partial=0.5`, `Irrelevant=0.0`. **ONE
+  `metrics.unjudged` policy governs ALL SIX metrics identically** (methodology.md §7; config keys
+  `metrics.unjudged` + `metrics.relevance_threshold`) — there is **no per-metric carve-out**. Under
+  the shipped `condensed` default, a **MISSING** judgement (no qrel entry for a returned doc) is
+  **DROPPED** from the eval list — **NOT** treated as irrelevant; only a **judged** `0.0` is
+  irrelevant. Under `irrelevant` (trec_eval) a MISSING doc is scored `0.0` in place. Every metric —
+  recall included — slices the one policy-built eval list (recall is condensed under `condensed`,
+  standard/positional under `irrelevant`). The binary-relevance threshold for precision/recall AND
+  the recall denominator `R` (from qrels) is `gain >= metrics.relevance_threshold` (default `0.5`:
+  Partial or Exact). Recall (cutoffs `{10, 50, 100}`) still penalizes retrieval failures (empty
+  result → `0`, not NaN, when `R > 0`) and is NaN iff `R == 0`. Per-query `n_results` (docs
+  returned), `n_scored`/`n_missing` (always-condensed top-10 diagnostics), and `n_relevant` (= `|R|`
+  under the resolved threshold) are recorded.
 - **Uniform retrieval depth (kill the confound).** Every system retrieves/returns to ONE depth:
   `fuser.window == rerank_window_size == top_k` (WANDS: 100), reranker `top_n >= W`. No knob may make
-  depth co-vary with the rerank/fusion treatment (architecture.md §5.3).
+  depth co-vary with the rerank/fusion treatment (architecture.md §5.3). This is a **config
+  convention for `eval:run`** — recorded in the manifest, deliberately NOT hard-validated at load
+  (the `eval:sweep --axis=rerank_window` diagnostic must vary `rerank_window_size` per cell); only
+  `W <= top_n` is asserted (R0).
 - **Default significance test = mean-δ sign-flip permutation** (methodology.md §8.2): the p-value, point estimate,
   and CI share one estimand (the mean paired difference). `wilcoxon` stays selectable.
 - **Exact CSV artifact schemas (do not rename/reorder fields) — one file per run, all pipelines:**
   - `result_{timestamp}.csv` — `variant, query_id, product_id, score, position`
-  - `metrics_{timestamp}.csv` — `variant, query_id, avg_relevance, ndcg@10, recall@10, recall@50, recall@100, precision@10, n_results, n_scored, n_missing`
+  - `metrics_{timestamp}.csv` — `variant, query_id, avg_relevance, ndcg@10, recall@10, recall@50, recall@100, precision@10, n_results, n_scored, n_missing, n_relevant`
+    (`n_relevant` = the relevant-set size `|R|` under the resolved threshold; non-negative int,
+    always present.)
   - `comparison_{timestamp}.csv` — `system_a, system_b, metric, value_a, value_b, delta, delta_ci_lo, delta_ci_high, p_value, significant_raw, in_family, p_value_adjusted, significant, n_common`
     (FDR family = `contrast.family × fdr_metrics`; **`in_family=false ⟺ p_value_adjusted and significant BOTH empty`**, methodology.md §8.3.)
 

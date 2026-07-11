@@ -138,9 +138,10 @@ def test_bm25_similarity_written_to_index() -> None:
 
 
 def test_resolved_index_profile_reads_back_from_es() -> None:
-    # resolved_index_profile reads the BM25 params + analyzer BACK from _mapping/_settings
-    # (never assumed). k1/b arrive as strings from ES settings -> coerced to float.
+    # resolved_index_profile reads the server version + BM25 params + analyzer BACK from
+    # info/_mapping/_settings (never assumed). k1/b arrive as strings from ES settings -> coerced.
     client = _fake_client()
+    client.info.return_value = {"version": {"number": "8.18.2"}}
     client.indices.get_mapping.return_value = {
         "wands_bench": {
             "mappings": {
@@ -167,6 +168,7 @@ def test_resolved_index_profile_reads_back_from_es() -> None:
 
     profile = writer.resolved_index_profile()
 
+    assert profile["server_version"] == "8.18.2"
     assert profile["bm25"] == {"similarity": "bm25_tuned", "k1": 1.5, "b": 0.3}
     assert profile["analysis"]["analyzer"] == "standard"
     client.indices.get_settings.assert_called_once_with(
@@ -179,6 +181,7 @@ def test_resolved_index_profile_deep_merges_index_settings() -> None:
     # tokenizer/filters live under defaults.index.analysis. A shallow {**defaults, **settings} merge
     # would drop the analysis sub-dict wholesale; the deep per-sub-key merge keeps BOTH.
     client = _fake_client()
+    client.info.return_value = {"version": {"number": "8.18.2"}}
     client.indices.get_mapping.return_value = {
         "wands_bench": {
             "mappings": {

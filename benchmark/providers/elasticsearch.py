@@ -236,14 +236,16 @@ class ESIndexWriter(IndexWriter):
         return int(self.client.count(index=self.index)["count"])
 
     def resolved_index_profile(self) -> dict[str, Any]:
-        """The BM25 similarity + analysis chain RESOLVED FROM the live index (§5).
+        """The server version + BM25 similarity + analysis chain RESOLVED FROM the live index (§5).
 
-        Reads ``_mapping`` (the ``search_text`` field's ``similarity``/``analyzer`` names) and
-        ``_settings?include_defaults=true`` (the named similarity's ``k1``/``b`` — falling back to the
-        ES BM25 defaults when the field uses the built-in ``BM25`` similarity; and any custom analyzer
-        definition). Never assumed — read back so the manifest records what the index actually scores
-        with. The single ``text`` field is ``search_text`` (our schema has exactly one).
+        Reads the ES server version (``client.info()``), ``_mapping`` (the ``search_text`` field's
+        ``similarity``/``analyzer`` names) and ``_settings?include_defaults=true`` (the named
+        similarity's ``k1``/``b`` — falling back to the ES BM25 defaults when the field uses the
+        built-in ``BM25`` similarity; and any custom analyzer definition). Never assumed — read back
+        so the manifest records what the index actually scores with (§9.1 ``diagnostics.index``).
+        The single ``text`` field is ``search_text`` (our schema has exactly one).
         """
+        server_version = str(self.client.info()["version"]["number"])
         mapping = self.client.indices.get_mapping(index=self.index)[self.index]["mappings"]
         props = mapping.get("properties", {})
         text_field = next(
@@ -266,6 +268,7 @@ class ESIndexWriter(IndexWriter):
         analysis = index_settings.get("analysis", {})
         analyzer_def = analysis.get("analyzer", {}).get(analyzer_name, {})
         return {
+            "server_version": server_version,
             "bm25": {
                 "similarity": similarity_name,
                 "k1": float(sim_def.get("k1", _DEFAULT_BM25_K1)),

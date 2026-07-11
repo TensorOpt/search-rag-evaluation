@@ -53,7 +53,7 @@ WANDS instantiation realizes all six as named config pipelines (`bm25`, `semanti
 `hybrid_co_k60`, `bm25_rerank`, `semantic_co_rerank`, `hybrid_co_rerank`); **none is omitted**.
 
 The **contrasts** (§8.1) turn the factorial into explicit hypotheses — each is one `stats.contrasts`
-entry:
+entry; the shipped config declares **eight**:
 
 | Contrast (`a` vs `b`) | Research question |
 |-----------------------|-------------------|
@@ -63,6 +63,8 @@ entry:
 | `bm25_rerank` vs `bm25` | Rerank effect isolated on lexical. |
 | `semantic_co_rerank` vs `semantic_co` | Rerank effect isolated on dense. |
 | `hybrid_co_rerank` vs `hybrid_co_k60` | Rerank effect isolated on hybrid. |
+| `semantic_co_rerank` vs `bm25_rerank` | Embeddings-with-rerank: does dense still beat lexical once both are reranked? |
+| `hybrid_co_rerank` vs `semantic_co_rerank` | Fusion-with-rerank: does RRF fusion still help once both sides are reranked? |
 
 The `hybrid_co_k60 vs semantic_co` verdict is stated at the fixed `rank_constant = 60`; its robustness
 to that choice is a one-shot diagnostic — `eval:sweep --axis=rrf_k` over `{20,60,100}`
@@ -163,8 +165,9 @@ then **slices** it. Let `g_1..g_m` be the point slice `eval_list[:10]` (`m = len
 
 - **avg_relevance** = `(1/m) · Σ_{i=1..m} g_i`. **`NaN` if `m == 0`.**
 - **ndcg@10**: `DCG@10 = Σ_{i=1..m} (2^{g_i} − 1) / log2(i+1)` over positions `1..m`. `IDCG@10` = DCG
-  of this query's **judged** gains sorted descending, **truncated to the top 10** (over all the
-  query's qrels, judged-only in both policies), so queries with > 10 relevant docs are not deflated.
+  of this query's **judged** gains sorted descending, **truncated to the top `cutoff` (= 10
+  shipped)** (over all the query's qrels, judged-only in both policies), so queries with > 10
+  relevant docs are not deflated.
   `nDCG@10 = DCG@10 / IDCG@10`, defined `0` if `IDCG@10 = 0`. **`NaN` if `m == 0`.**
 - **precision@10** = `|{g_i >= t}| / m` (`t` = threshold). `m = n_scored` under `condensed` (documented
   explicitly), `m = min(10, n_results)` under `irrelevant`. **`NaN` if `m == 0`.**
@@ -176,10 +179,11 @@ then **slices** it. Let `g_1..g_m` be the point slice `eval_list[:10]` (`m = len
   `k` docs caps at `recall@min(k, n_returned)` (expected).
 
 **Two DIAGNOSTIC counts are recorded (always condensed semantics at cutoff depth, in BOTH policies):**
-- **`n_scored`** = size of the condensed top-10 (`<= 10` judged docs) — "total this was calculated
-  from" (the point denom under `condensed`).
-- **`n_missing`** = `MISSING` docs skipped while scanning to the 10th judged doc (rank 1 up to and
-  including it, or the whole list if fewer than 10 judged) — "number where the judgement was missing".
+- **`n_scored`** = size of the condensed top-`cutoff` (= top-10 shipped; `<= cutoff` judged docs) —
+  "total this was calculated from" (the point denom under `condensed`).
+- **`n_missing`** = `MISSING` docs skipped while scanning to the `cutoff`-th (10th shipped) judged
+  doc (rank 1 up to and including it, or the whole list if fewer judged) — "number where the
+  judgement was missing".
 
 **`n_relevant`** = `|R|` (the relevant-set size under the threshold) is also recorded per query
 (architecture.md §9); a `recall@k` whose `k/median(|R|)` falls below `0.2` is flagged
@@ -259,15 +263,17 @@ The comparator handles two degenerate cases uniformly, before any bootstrap/test
 | Case | Trigger | Comparator output for that `(contrast, metric)` row |
 |------|---------|-----------------------------------------------------|
 | **Empty paired set** | `n_common == 0` (the metric is `NaN` on every query for some referenced system — e.g. recall with `R=0` everywhere, or `avg_relevance`/`ndcg`/`precision` with `n_scored=0` everywhere) | `value_a`/`value_b`/`delta`/`delta_ci_lo`/`delta_ci_high` = **empty**, `p_value = 1.0`, `significant_raw = false`, `in_family = false`, `p_value_adjusted` = **empty**, `significant` = **empty**, `n_common = 0`, note `note=empty_paired_set` |
-| **All-zero deltas** | ≥1 paired query but every `δ_q == 0` | `value_a == value_b`, `delta = 0.0`, `delta_ci_lo = delta_ci_high = 0.0`, `p_value = 1.0`, `significant_raw = false`, `in_family = false`, `p_value_adjusted` = **empty**, `significant` = **empty**, `n_common` populated, note `note=all_zero_delta` (§8.2) |
+| **All-zero deltas** | ≥1 paired query but every `\|δ_q\| <= 1e-6` (`ZERO_ABS_TOL` — a tolerance, never float `==`) | `value_a == value_b`, `delta = 0.0`, `delta_ci_lo = delta_ci_high = 0.0`, `p_value = 1.0`, `significant_raw = false`, `in_family = false`, `p_value_adjusted` = **empty**, `significant` = **empty**, `n_common` populated, note `note=all_zero_delta` (§8.2) |
 
 Both degenerate rows emit **empty** `p_value_adjusted` **and** empty `significant`, matching the
 load-bearing rule **`in_family == false ⟺ p_value_adjusted and significant are BOTH empty`**
 (§8.3): FDR-adjusted values exist ONLY for family rows. `p_value=1.0` and `significant_raw=false` are
-still populated, and the note is recorded per affected `(contrast, metric)` row. In both cases the
-comparator never calls scipy/the bootstrap, so `mean of empty set` and a bootstrap over zero indices
-are never evaluated. For WANDS the empty case does not arise, but the behavior is defined so a
-different dataset cannot produce an undefined metric or crash.
+still populated, and the note is recorded per affected `(contrast, metric)` row — **persisted in the
+manifest under `diagnostics.stats.degenerate`** (architecture.md §9.1); the frozen 14-column
+comparison CSV has no `note` column, where a degenerate row is identifiable by `p_value=1.0` + empty
+CI cells. In both cases the comparator never calls scipy/the bootstrap, so `mean of empty set` and a
+bootstrap over zero indices are never evaluated. For WANDS the empty case does not arise, but the
+behavior is defined so a different dataset cannot produce an undefined metric or crash.
 
 ### 8.2 Effect-size CI & p-value (seeded, reproducible)
 The CI and the significance decision are deliberately kept in **distinct, clearly-labeled roles**:
@@ -279,30 +285,36 @@ step-up FDR procedure.
 p-value also concerns `mean(δ)` — so all three describe **the same quantity: the mean paired
 difference**.
 
-- **delta_ci_lo / delta_ci_high** = **per-comparison percentile bootstrap CI at the fixed unadjusted
-  level** (`2.5` / `97.5` percentiles, a nominal 95% interval): resample the **paired query indices**
-  with replacement `B = bootstrap_B` times using a seeded `numpy.random.default_rng(seed)`, recompute
-  mean `δ` each time, and take the 2.5 / 97.5 percentiles. Resampling **query indices** (not metrics
-  independently) preserves pairing. This interval is reported **purely as effect-size / uncertainty
-  context for a single comparison**; it is **not** multiplicity-adjusted and is **not** a significance
-  gate. The level (2.5/97.5) is fixed and recorded in run metadata (architecture.md §9.1).
+- **delta_ci_lo / delta_ci_high** = **per-comparison, unadjusted percentile bootstrap CI at the
+  configured `ci_level`** (default `0.95` → the 2.5 / 97.5 percentiles; the tails are
+  `(1 − ci_level)/2`): resample the **paired query indices** with replacement `B = bootstrap_B` times
+  using a seeded `numpy.random.default_rng(seed)`, recompute mean `δ` each time, and take the two
+  tail percentiles. Resampling **query indices** (not metrics independently) preserves pairing. This
+  interval is reported **purely as effect-size / uncertainty context for a single comparison**; it is
+  **not** multiplicity-adjusted and is **not** a significance gate. The resolved `ci_level` is
+  recorded in run metadata (architecture.md §9.1).
 - **p_value** = **seeded sign-flip paired-permutation test** (two-sided, **primary/default**) on the
   paired `δ_q`, statistic = `mean(δ)`. The null is that the paired differences are **exchangeable in
   sign** (each `δ_q` equally likely `±|δ_q|` — symmetric about 0, the standard randomization null for
   a paired design); two-sided `p = (1 + #{|perm_stat| ≥ |obs_stat|}) / (B + 1)`. This targets the
   **mean** (not a pseudo-median), and sign-flipping a zero delta leaves it zero, so **zero-deltas are
   retained** and contribute to the null — correct for the sparse-delta nDCG/recall/precision
-  distributions. Exact enumeration when `2**n ≤ bootstrap_B`, else Monte-Carlo with `bootstrap_B`
-  sign-flip resamples off the same seeded `rng`. (Caveat: the null is symmetry-about-0; a distribution
-  asymmetric-about-0 yet mean-0 is a theoretical corner that does not arise for paired IR-metric
-  deltas.)
+  distributions. **Exact enumeration** when `2**n ≤ bootstrap_B` — over all `2**n` sign assignments,
+  with the same add-one form and the enumeration size as denominator:
+  `p = (1 + #{|perm_stat| ≥ |obs_stat|}) / (2**n + 1)` (slightly conservative vs the classical
+  `count / 2**n`; deterministic) — else Monte-Carlo with `bootstrap_B` sign-flip resamples off the
+  same seeded `rng`. (Caveat: the null is symmetry-about-0; a distribution asymmetric-about-0 yet
+  mean-0 is a theoretical corner that does not arise for paired IR-metric deltas.)
   - **Wilcoxon signed-rank** (two-sided) is retained as a **non-default opt-in** (`test: wilcoxon`),
-    with pinned `zero_method="wilcox"` (drop zero-deltas before ranking) + `correction=True`, both
-    recorded so the p-value is reproducible regardless of scipy default drift. It targets the
-    pseudo-median (a *different* estimand from the reported mean) and drops zero-deltas, so it is
-    demoted; the `wilcoxon_*` settings are inert unless `test: wilcoxon`.
-  - **All-zero deltas** (every `δ_q == 0`, both tests undefined): the harness short-circuits to
-    `p_value = 1.0` / `significant_raw = false` rather than calling scipy (see §8.1 table).
+    with `zero_method` defaulted to `"wilcox"` (drop zero-deltas before ranking) and `correction`
+    defaulted to `True` — both **configurable** (`wilcoxon_zero_method` / `wilcoxon_correction`) and
+    recorded in the manifest so the p-value is reproducible regardless of scipy default drift. The
+    two keys are **rejected at config load unless `test: wilcoxon`** (architecture.md §10), so a
+    permutation config can never carry misleading Wilcoxon params. It targets the pseudo-median (a
+    *different* estimand from the reported mean) and drops zero-deltas, so it is demoted.
+  - **All-zero deltas** (every `|δ_q| <= 1e-6` = `ZERO_ABS_TOL`, both tests undefined): the harness
+    short-circuits to `p_value = 1.0` / `significant_raw = false` rather than calling scipy (see
+    §8.1 table).
 - **`bootstrap_B` (dual role + p-resolution floor).** `bootstrap_B` governs **both** the CI resample
   count **and** the Monte-Carlo permutation count (the exact-enumeration branch only fires when
   `2**n ≤ bootstrap_B`, never at n≈470), so it is the p-value **resolution floor**: two-sided
@@ -327,7 +339,10 @@ difference**.
   when **`rerank_window_size == k`** (top-k-set identity: the reranked and base top-k document SETS
   are equal, so recall is invariant under reranking). Such a row is emitted **structurally decided** —
   `in_family=false`, empty adjusted/significant, a **reason string** `note` (never a silent `NaN`),
-  no test/bootstrap call — regardless of the observed delta. At the shipped `W = 100` only
+  no test/bootstrap call — regardless of the observed delta. Its other cells carry the **real**
+  `value_a`/`value_b`/`delta` (means over the common subset — they may be non-zero), an **empty** CI,
+  `p_value=1.0`, and `significant_raw=false`; structural exclusion takes **precedence** over the
+  §8.1 degenerate-note branches. At the shipped `W = 100` only
   `recall@100` is excluded for the three rerank-only contrasts; `recall@10`/`recall@50` ARE identified
   (reranking moves docs across those boundaries). The rule is computed in the **runner** from
   `cfg.pipelines()` (so `evaluation/stats.py` names no adapter/pipeline, §11) and passed to the
@@ -344,7 +359,8 @@ difference**.
     `p_value`/`significant_raw` are still populated — context, not a decision.
   - **degenerate** (`empty_paired_set` / `all_zero_delta`, §8.1): `in_family=false`,
     `p_value_adjusted` and `significant` **empty**; `p_value=1.0`, `significant_raw=false`, note +
-    `n_common` recorded.
+    `n_common` recorded (the note is persisted under `diagnostics.stats.degenerate`, architecture.md
+    §9.1).
 - Degenerate rows never enter the family size `m` — `m` is the number of *real* family tests (those
   that produced a p-value from the permutation/Wilcoxon test). `significant_raw` (the
   family-independent per-test decision) stays populated on **every** real-test row (family AND

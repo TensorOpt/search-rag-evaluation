@@ -122,6 +122,11 @@ class Dataset(ABC):
     def build_search_text(field_values: Mapping[str, Any], schema: FieldSchema) -> str:
         """§5.1: join every BM25- and SEMANTIC_SOURCE-role field value, in schema order,
         by "\n". A missing search-text key raises (never silently emits empty)."""
+    def gain_mapping(self) -> Mapping[str, float]:
+        """The human-readable label->gain map applied while emitting qrels(), recorded in
+        the run manifest (§9.1). CONCRETE, default {} (a numeric-qrels dataset like BEIR has
+        no map); a label-mapped dataset (WANDS) overrides it to return its map."""
+        return {}
     @staticmethod
     def map_label(label: str, mapping: Mapping[str, float]) -> float:
         """Map a string label to a float gain via `mapping`; exhaustive, raises ValueError
@@ -247,12 +252,19 @@ class IndexWriter(Protocol):
     # index-writer / ingest seam (retrieval lives in Searcher/Fuser/Reranker)
     # ES is a plain index writer: the harness embeds the corpus client-side and hands
     # documents whose field bag already carries the dense_vector values — no inference here.
+    index: str                                               # the target index name
     embed_batch_size: int                                    # ingest buffering granularity (§3.5)
     def sem_field_name(self, embedder_id: str) -> str: ...   # backend-safe dense_vector field name
     def create_mapping(self, schema: FieldSchema, sem_fields: Mapping[str, str],
                        vector_dims: Mapping[str, int]) -> "IndexMapping": ...
     def ensure_index(self, mapping: "IndexMapping") -> None: ...
     def bulk_index(self, docs: Iterable[Document], *, mapping: "IndexMapping") -> None: ...
+    def doc_count(self) -> int | None: ...
+        # docs currently in the index, None if it does not exist — the runner's
+        # index-ready check before an eval (§6.2; eval:run does NOT index)
+    def resolved_index_profile(self) -> Mapping[str, Any]: ...
+        # the backend server_version + BM25 similarity (k1/b) + analysis chain, read back
+        # FROM THE LIVE INDEX (never assumed) for the manifest's diagnostics.index (§5.2/§9.1)
 ```
 
 > **Query binding is internal to each `Searcher`.** A concrete `Searcher.search(query, top_k)`
@@ -306,8 +318,11 @@ are computed by **provider connectors** the harness calls directly — realized 
 
 An **`EmbedderCfg` / `RerankerCfg`** service entry (§10) carries only `name`, `provider`, and a
 `settings` block (`api_key`, `model_id`, optional `rate_limit.requests_per_minute`, `batch_size`,
-`dims`, …). The runner instantiates the connectors lazily via `config.make_embedders` /
-`make_rerankers` (§11); a `provider` outside the shipped set raises at config load.
+`dims`, `timeout` (per-request seconds), `max_retries` (retry budget for 429/5xx, §5.4), and
+`base_url` (endpoint override; the provider's public endpoint by default — captured in the resolved
+services for provenance, §9.1)). The runner instantiates the connectors lazily via
+`config.make_embedders` / `make_rerankers` (§11); a `provider` outside the shipped set raises at
+config load.
 
 `Reranker` is **behavioral** (§3.3): a concrete reranker (ES `ESReranker`) is constructed from a
 `RerankClient` + a doc-text lookup and, inside `rerank(query, candidates)`, fetches the candidate
@@ -332,6 +347,9 @@ class IndexMapping:
 class Indexer:                                 # benchmark/indexing.py — concrete, backend-agnostic
     def __init__(self, writer: IndexWriter, embedders: Sequence[Embedder]) -> None: ...
     def build(self, dataset: Dataset) -> "IndexMapping": ...
+    def mapping(self, dataset: Dataset) -> "IndexMapping": ...
+        # QUERY-ONLY: the IndexMapping for an ALREADY-BUILT index — field names for the leaf
+        # searchers, NO dim probe, NO ingest, empty backend_mapping. eval:run uses this (§6.2).
 ```
 
 `Indexer` is a single concrete domain object (not a Protocol — there is exactly one implementation).
@@ -492,10 +510,10 @@ def fuse_rrf_local(lists: Sequence[Sequence[ScoredDoc]], *,
     RRF: score(d) = Σ 1/(rank_constant + rank_d_in_truncated_list), rank 1-based.
     Returns merged list sorted by fused score desc, tie-break doc_id."""
 
-def rerank_local(query: Query, candidates: Sequence[ScoredDoc], *,
+def rerank_local(query: str, candidates: Sequence[ScoredDoc], *,
                  rank_window_size: int,
                  doc_text: Callable[[str], str],
-                 score_fn: Callable[[Query, Sequence[str]], Sequence[float]]) -> list[ScoredDoc]:
+                 score_fn: Callable[[str, Sequence[str]], Sequence[float]]) -> list[ScoredDoc]:
     """Take only the top rank_window_size candidates, score them via
     score_fn(query, [doc_text(doc_id) for each]) -> one relevance score per doc
     text (higher = more relevant), return re-sorted by model score; candidates
@@ -741,7 +759,11 @@ rerank (`rerank_window_size`); fixed per matrix and recorded.
 > three knobs to one depth means every variant is compared at equal depth and enables `recall@100`
 > (methodology.md §7). Cost: the reranker now scores `top_k` docs/query (≈4× the rerank requests vs
 > `top_n=25`); `_msearch` retrieval cost is negligibly changed, and the optional disk cache (§5.5)
-> absorbs re-runs. The three knobs are captured in `run_config_*.json` (§9.1).
+> absorbs re-runs. The three knobs are captured in `run_config_*.json` (§9.1). **This equality is a
+> config CONVENTION for `eval:run`, deliberately NOT hard-validated at load**: the
+> `eval:sweep --axis=rerank_window` diagnostic (§5.6) must vary `rerank_window_size` per grid cell,
+> so a load-time assertion would break it. Only `W <= top_n` is asserted (R0, §6); the recorded
+> knobs make any deviation auditable in the manifest.
 
 ### 5.4 Provider connectors & failure model
 Embeddings and reranking are computed by direct **provider connectors** in
@@ -1002,8 +1024,9 @@ with a message pointing at `eval:index`.
 
 `{timestamp}` = UTC `YYYYMMDDTHHMMSSZ` of run start (single value for the whole run). Each run writes
 exactly three CSVs (plus `run_config`), each holding **all** pipelines: the leading `variant` column is
-the pipeline's name from config (its `pipelines.variants` map key, e.g. `hybrid_e5_k60`), and
-`baseline` is the baseline pipeline's id (`bm25`/`baseline`). All CSVs UTF-8, comma-separated, header
+the pipeline's name from config (its `pipelines.variants` map key, e.g. `hybrid_e5_k60`); the
+baseline's id **defaults to `baseline`** and is set via `pipelines.baseline_id` (the shipped config
+sets `baseline_id: bm25`, §10). All CSVs UTF-8, comma-separated, header
 present. **Field names and order are fixed:**
 
 **`result_{timestamp}.csv`**
@@ -1052,17 +1075,27 @@ that metric. The CI is in a different role from the significance flags and **may
 (methodology.md §8.3). For a degenerate paired set, `value_a`/`value_b`/`delta`/CI cells are **empty**
 (empty paired set) or `0.0` (all-zero deltas — `value_a`/`value_b` equal, `delta = 0.0`) per the
 methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_family=false`, and empty
-`p_value_adjusted`/`significant`.
+`p_value_adjusted`/`significant`. A **structurally-excluded** row (a reranker-only `recall@k`
+contrast at `W == k`, methodology.md §8.3) carries the **real** `value_a`/`value_b`/`delta` (means
+over the common subset — possibly non-zero), an **empty** CI, `p_value=1.0`,
+`significant_raw=false`, `in_family=false`, and empty adjusted/significant; structural exclusion
+takes **precedence** over the degenerate-note branches. The 14 columns are frozen — there is **no
+`note` column**; degenerate/structural notes are persisted in the manifest
+(`diagnostics.stats.degenerate` / `diagnostics.stats.excluded`, §9.1).
 
 ### 9.1 Reproducibility
 - **Config capture:** the fully-resolved config (the resolved **services** registry —
-  embedders/rerankers/searchers by name — and the resolved **pipelines**: the baseline plus every
+  embedders/rerankers/searchers by name; each connector's `model_id` + endpoint `base_url` are the
+  provider-endpoint provenance — and the resolved **pipelines**: the baseline plus every
   named variant with its retrievers/fuser/reranker/window; the stats block incl. **`contrasts`** and
-  **`fdr_metrics`**; bootstrap B, the fixed CI level 2.5/97.5, `α` — recorded as **both** the raw
-  per-test threshold **and** the FDR level `q`, family size m, correction method (`bh` or `by`), test
-  + its zero/tie params, dataset version, ES + endpoint versions, cutoff, uniform retrieval depth
-  (`top_k`), seed; and the **`metrics` policy** `unjudged`/`relevance_threshold`) is serialized
-  to `run_config_{timestamp}.json` alongside the CSVs. Under BH/BY the harness records/emits
+  **`fdr_metrics`**; bootstrap B, the configured **`ci_level`** (default `0.95` → 2.5/97.5
+  percentiles), `α` — recorded as **both** the raw per-test threshold **and** the FDR level `q`,
+  family size m (under `diagnostics.stats`), correction method (`bh` or `by`), test + its zero/tie
+  params (the wilcoxon-only params are serialized only under `test: wilcoxon`), cutoff, uniform
+  retrieval depth (`top_k`), seed; and the **`metrics` policy** `unjudged`/`relevance_threshold`) is
+  serialized to `run_config_{timestamp}.json` alongside the CSVs. The **dataset version** and the
+  **backend (ES) server version** ride in the `diagnostics` block (`diagnostics.dataset.version` /
+  `diagnostics.index.server_version`, below). Under BH/BY the harness records/emits
   FDR-adjusted p-values (q-values) per family test in the comparison CSV (§9), so — unlike Holm — the
   adjusted significance is fully materialized.
 - **Secret redaction.** Any config key matching `api_key|token|secret|password|credential`
@@ -1074,13 +1107,17 @@ methodology.md §8.1 table, with `p_value=1.0`, `significant_raw=false`, `in_fam
   - `common_subset` (per metric: `n_common`, `n_excluded = n_queries − n_common`) and
     `retrieval_failures` (per system: `#queries with n_results == 0`; for WANDS exactly 1 — query 383
     under bm25/bm25_rerank — so DROP hides nothing).
-  - `dataset` — `qrels_digest` (SHA-256 over the gain-mapped `(qid, doc, gain)` triples + threshold),
-    the human-readable `gain_mapping` (`Dataset.gain_mapping()`), the resolved
-    `relevance_threshold`, and `n_qrels`. Two runs with differing digests are **not comparable**.
-  - `index` — the BM25 similarity (`k1`/`b`) + analysis chain (`analyzer`/`tokenizer`/`filters`)
-    **resolved from the live index** (`resolved_index_profile()`).
-  - `stats` — the FDR `family_size (m)`, full `family_members`, and the reasoned structural
-    `excluded` contrasts.
+  - `dataset` — the dataset `version` (`Dataset.version`), `qrels_digest` (SHA-256 over the
+    gain-mapped `(qid, doc, gain)` triples + threshold), the human-readable `gain_mapping`
+    (`Dataset.gain_mapping()`), the resolved `relevance_threshold`, and `n_qrels`. Two runs with
+    differing digests are **not comparable**.
+  - `index` — the backend `server_version` (ES: `client.info()`) plus the BM25 similarity
+    (`k1`/`b`) + analysis chain (`analyzer`/`tokenizer`/`filters`), all **resolved from the live
+    backend/index** (`resolved_index_profile()`).
+  - `stats` — the FDR `family_size (m)`, full `family_members`, the reasoned structural `excluded`
+    contrasts, and the data-`degenerate` rows (`empty_paired_set` / `all_zero_delta` notes,
+    methodology.md §8.1 — the frozen comparison CSV has no `note` column, so the notes persist
+    here).
   - `recall_information` — `recall@k → k/median(|R|)`; a cutoff below `0.2` is logged low-information
     (WANDS `recall@10 ≈ 0.068` warns).
   - `cost_latency` — **present only under `eval:run --profile`** (§5.6). A per-system entry:
@@ -1132,10 +1169,17 @@ services:                       # named, typed, reusable building blocks
 indexer:
   provider: elasticsearch
   index: wands_bench
-  # BM25 k1/b + analyzer are INDEX-TIME (baked at eval:index) and belong here, resolved from the index
-  # into the manifest. Absent -> ES defaults, set explicitly so they read back.
-  settings: { url: ${ES_URL}, bm25: { k1: 1.2, b: 0.75 }, analysis: { analyzer: standard } }
+  # settings: `url` (required) + optional knobs — `request_timeout` (ES client per-request timeout,
+  # seconds; default 60), `bulk_chunk_size` (streaming_bulk chunk; default 500), `embed_batch_size`
+  # (ingest embed buffering; default 96), `msearch_chunk_size` (default 100), `knn_num_candidates`
+  # (default 100). BM25 `k1`/`b` + `analysis.analyzer` are INDEX-TIME (baked at eval:index); when the
+  # keys are ABSENT the writer bakes the explicit ES defaults (k1=1.2, b=0.75, `standard`) into the
+  # index anyway (as the named `bm25_tuned` similarity, §5.2) and the manifest records the values
+  # resolved from the live index — so they always read back.
+  settings: { url: ${ES_URL}, bulk_chunk_size: 96, request_timeout: 30 }
+  # settings: { ..., bm25: { k1: 1.2, b: 0.75 }, analysis: { analyzer: standard } }  # optional
 pipelines:
+  baseline_id: bm25              # the baseline's artifact/system id; DEFAULTS to `baseline` when absent (§9)
   baseline:                      # the reference every variant is compared against
     retriever: bm25
   variants:                      # each is one explicit run; the map key is its id
@@ -1187,7 +1231,8 @@ cache:                           # OPTIONAL (§5.5): memoize embeddings/rerank/s
 **Services (`${VAR}` env placeholders resolved at load, secrets never in the file):**
 - **`embedder`** — a named embedding **provider connector** (§3.4). `provider` selects the connector
   (`cohere` | `voyage` | `openai`); `settings` carries connector knobs (`model_id`, `api_key`,
-  optional `rate_limit.requests_per_minute`, `batch_size`, `dims`, …). The runner instantiates it
+  optional `rate_limit.requests_per_minute`, `batch_size`, `dims`, `timeout`, `max_retries`,
+  `base_url` — §3.4). The runner instantiates it
   lazily via `make_embedders`; the harness embeds the corpus into a `dense_vector` field (§3.5). An
   unknown `provider` raises at config load.
 - **`reranker`** — a named rerank **provider connector** (§3.4; `cohere` | `voyage` — **OpenAI has no
@@ -1258,6 +1303,13 @@ benchmark/
   config.py            #   config value types + YAML load/resolve + build_pipeline + lazy dotted adapter factories
   runner.py            #   ExperimentRunner (the single execution path, §6)
   io_csv.py            #   write_results_csv / write_metrics_csv / write_comparison_csv / write_run_config
+scripts/               # entry points / composition layer — thin CLIs over the engine (§5.6/§6)
+  wait_for_es.py       #   eval:wait-for-es — poll cluster health until yellow/green
+  fetch_data.py        #   eval:fetch-data — download WANDS into dataset/wands/
+  index.py             #   eval:index — build/populate the index (ExperimentRunner.build_index)
+  run.py               #   eval:run — the standard run (--config / --output-dir / --dry-run / --profile)
+  sweep.py             #   eval:sweep — one-shot diagnostic parameter sweeps (§5.6)
+tests/                 # unit tests (offline fakes: no ES, no network; incl. import-graph + schema lint)
 docs/methodology.md    # evaluation science (metrics, statistics)
 docs/architecture.md   # this document
 dataset/wands/         # query.csv, product.csv, label.csv (gitignored)

@@ -33,7 +33,7 @@ hatch run eval:fetch-data       # downloads query.csv / product.csv / label.csv
 # 5. Embed the corpus + build the index
 hatch run eval:index
 
-# 6. Run the full experiment matrix (baseline + 5 variants)
+# 6. Run all six configured pipelines (baseline + 5 variants)
 hatch run eval:run
 
 # 7. Inspect results
@@ -84,6 +84,8 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 │   │   ├── models.py          # Query, Document, Qrel, ScoredDoc, RankedResult, FieldSchema, IndexMapping, enums
 │   │   ├── protocols.py       # Searcher/Fuser/Reranker + Dataset ABCs; Embedder, RerankClient, IndexWriter Protocols
 │   │   ├── ranking.py         # fuse_rrf_local + rerank_local (pure windowed ranking primitives)
+│   │   ├── cache.py           # optional disk cache (architecture.md §5.5): DiskCache + Caching* Decorators
+│   │   ├── profiling.py       # optional --profile timing Decorators (architecture.md §5.6)
 │   │   └── logging_setup.py   # console + file logging (logs/run_{timestamp}.log)
 │   ├── providers/             # (f) concrete adapters — depend ONLY on common
 │   │   ├── inference.py       # OpenAI/Cohere/Voyage Embedders + Cohere/Voyage RerankClients (stdlib-HTTP)
@@ -100,6 +102,8 @@ Every pipeline is an explicit named entry in the config — there is no per-vari
 │   ├── config.py              # config value types (PipelineCfg/Services/ResolvedConfig, NO expansion) + build_pipeline; YAML/JSON load + resolve; lazy dotted adapter factories
 │   ├── runner.py              # ExperimentRunner — the single execution path
 │   └── io_csv.py              # write_results_csv / write_metrics_csv / write_comparison_csv / write_run_config
+├── scripts/                   # entry points: wait_for_es.py, fetch_data.py, index.py, run.py, sweep.py
+├── tests/                     # offline unit tests (fakes — no ES, no network)
 ├── dataset/
 │   └── wands/                 # query.csv, product.csv, label.csv  (NOT in the repo; see below)
 ├── results/                   # run artifacts land here (gitignored)
@@ -250,10 +254,41 @@ The pipelines run are **exactly** those you wrote in `config.yaml` (a `baseline`
 Useful invocations:
 
 ```bash
-hatch run eval:run                       # all pipelines from config.yaml
+hatch run eval:run                         # all pipelines from config.yaml
 hatch run eval:run -- --config myrun.yaml  # alternate config
+hatch run eval:run -- --output-dir out/    # write artifacts somewhere other than results/
 hatch run eval:run -- --dry-run            # print the pipeline list, run nothing
+hatch run eval:run -- --profile            # + per-system cost/latency diagnostics (see below)
 ```
+
+### Cost & latency profiling (`--profile`)
+
+`eval:run -- --profile` additionally emits a **diagnostic, non-frozen** per-system cost/latency
+table: `cost_latency_{timestamp}.csv` alongside the metrics, plus a `diagnostics.cost_latency`
+block in `run_config_{timestamp}.json`. Connector API **call/doc/token counts are the primary cost
+figure**; stage latency is **indicative** (retrieval is batch-amortized via `_msearch` — totals and
+per-query averages, never p50/p95; rerank is per-query with p50/p95, and wall-clock is contaminated
+by the connector rate limiter). Profile a **cold-cache** run for a full read — with a warm cache the
+counters show ~0 marginal API cost, by design. Off by default so a standard run's artifacts stay
+byte-identical. Details → architecture.md §5.6.
+
+### Parameter sweeps (`eval:sweep`)
+
+A one-shot **diagnostic** that re-runs the runner's scoring path over a parameter grid — it is not
+part of `eval:run` and never touches the frozen artifacts:
+
+```bash
+hatch run eval:sweep -- --axis rerank_window   # rerank_window_size ∈ {10, 25, 50, 100}
+hatch run eval:sweep -- --axis rrf_k           # RRF rank_constant ∈ {20, 60, 100}
+hatch run eval:sweep -- --axis bm25_k1_b       # k1 ∈ {0.9,1.2,1.5,2.0} × b ∈ {0.3,0.5,0.75,0.9}
+# common flags: --config config.yaml, --out results/sweep
+```
+
+Output is a tidy, **non-frozen** `sweep_{axis}_{timestamp}.csv` with columns
+`axis_value,system,metric,value,ci_lo,ci_high,n_common`. `rerank_window` and `rrf_k` re-run only the
+rerank/fusion stage over the live index; **`bm25_k1_b` reindexes a scratch index per cell** (BM25
+`k1`/`b` are index-time) and tears it down after. A sweep needs a live index + provider keys, like
+`eval:run`. Details → architecture.md §5.6.
 
 ### Caching (optional)
 
@@ -267,13 +302,13 @@ cache:
 
 - **Enable / disable:** set `cache.enabled` (or omit the block for a cold run — disabled).
 - **Clear:** `rm -rf .cache/` (or delete `.cache/inference.sqlite`). It is gitignored; there is no dedicated command.
-- **Note:** the key uses the model *name*, not its weights — if a provider silently retrains a model behind a stable alias, clear the cache. A corrupt cache never crashes a run: it is logged and the run proceeds without it.
+- **Note:** the key uses the model *name*, not its weights — if a provider silently retrains a model behind a stable alias, clear the cache. An enabled cache that cannot be trusted **fails fast**: an unopenable cache file or a corrupt/undecodable entry **raises** (never a silent degrade to a slower cacheless run — architecture.md §5.5). Remedy: delete `.cache/inference.sqlite` and re-run.
 
 ---
 
 ## Outputs
 
-Artifacts are written to `results/` with a single per-run UTC timestamp `{timestamp} = YYYYMMDDTHHMMSSZ`. Each run produces exactly three CSVs (plus `run_config`), each holding **all** pipelines in one file: the `variant` column is the pipeline's name from config (e.g. `hybrid_e5_k60`), and `baseline` is the baseline pipeline's id (`bm25`). All CSVs are UTF-8, comma-separated, with a header. **Field names and order are fixed.**
+Artifacts are written to `results/` (or `--output-dir`) with a single per-run UTC timestamp `{timestamp} = YYYYMMDDTHHMMSSZ`. Each run produces exactly three CSVs (plus `run_config`; plus the diagnostic `cost_latency_{timestamp}.csv` under `--profile` only), each CSV holding **all** pipelines in one file: the `variant` column is the pipeline's name from config (e.g. `hybrid_e5_k60`); the baseline's id defaults to `baseline` and is set via `pipelines.baseline_id` (the shipped config sets `baseline_id: bm25`). All CSVs are UTF-8, comma-separated, with a header. **Field names and order are fixed.**
 
 ### `result_{timestamp}.csv`
 
@@ -286,10 +321,10 @@ One file for all pipelines (baseline included). One row per returned doc; `varia
 ### `metrics_{timestamp}.csv`
 
 ```
-variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing
+variant,query_id,avg_relevance,ndcg@10,recall@10,recall@50,recall@100,precision@10,n_results,n_scored,n_missing,n_relevant
 ```
 
-One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. The **condensed** metrics (`avg_relevance`/`ndcg@10`/`precision@10`) use **condensed-list** evaluation: a returned doc with **no qrel entry (a MISSING judgement)** is **skipped** (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. **Recall is standard/coverage** (`|judged-relevant ∩ actual top-k| / R`, `R` from qrels) at cutoffs `{10, 50, 100}` — it looks at the true retrieved positions, never scores a MISSING doc as irrelevant, and scores an empty/failed result `0` (not NaN) when `R > 0`. `n_results` = docs the pipeline returned for the query (`<= top_k`); `n_scored` = judged docs the condensed metrics were computed over (`<= 10`); `n_missing` = missing docs skipped to collect them; all three are non-negative integers, always present. Any of the six metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, every `recall@k` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
+One file for all pipelines (baseline included). One row per (variant, query); `variant` is the pipeline id, baseline first. **ONE `metrics.unjudged` policy governs all six metrics identically** (methodology.md §7; config keys `metrics.unjudged` + `metrics.relevance_threshold`). Under the shipped **`condensed`** default, a returned doc with **no qrel entry (a MISSING judgement)** is **dropped** from the eval list (not scored as 0); only a **judged-irrelevant** doc (`gain 0.0`) counts as a zero. Under **`irrelevant`** (trec_eval) a MISSING doc is scored `0.0` in place. Every metric — recall included — slices the same policy-built eval list, so recall (cutoffs `{10, 50, 100}`) is **condensed** under `condensed` and **standard (positional)** under `irrelevant`; its denominator `R` always comes from qrels under the threshold (`gain >= metrics.relevance_threshold`, default `0.5`), it never scores a MISSING doc as irrelevant, and it scores an empty/failed result `0` (not NaN) when `R > 0`. `n_results` = docs the pipeline returned for the query (`<= top_k`); `n_scored` = judged docs in the condensed top-10; `n_missing` = missing docs skipped to collect them (both always condensed diagnostics, in either policy); `n_relevant` = the relevant-set size `|R|` under the resolved threshold; all four are non-negative integers, always present. Any of the six metric cells is written as an **empty field** (two adjacent commas) when its value is `NaN` — `avg_relevance`/`ndcg@10`/`precision@10` when `n_scored=0`, every `recall@k` when `R=0` — meaning "excluded from that metric's aggregation", not zero.
 
 ### `comparison_{timestamp}.csv`
 
@@ -305,16 +340,25 @@ One file for all contrasts. Each row is a contrast between two systems (the base
 - `delta_ci_lo` / `delta_ci_high` — the **per-comparison, unadjusted 2.5/97.5 percentile bootstrap interval**. Effect-size context only; **not** a significance gate.
 - `p_value` — the **raw** (uncorrected) p-value from the **mean-δ sign-flip permutation** test (default; Wilcoxon signed-rank if `test: wilcoxon`).
 - `significant_raw` ∈ {`true`,`false`} — the **uncorrected** per-test decision (`p_value <= α`), independent of the family.
-- `in_family` ∈ {`true`,`false`} — FDR-family membership: `contrast.family AND metric ∈ fdr_metrics AND non-degenerate` (default `fdr_metrics = {ndcg@10, recall@100}`).
+- `in_family` ∈ {`true`,`false`} — FDR-family membership: `contrast.family AND metric ∈ fdr_metrics AND non-degenerate` (default `fdr_metrics = {ndcg@10}`).
 - `p_value_adjusted` — the **FDR-adjusted p-value (q-value)** (Benjamini-Hochberg by default, Benjamini-Yekutieli if `correction: by`), computed over the family rows only. **Empty when `in_family=false`.**
 - `significant` ∈ {`true`,`false`} — the **FDR decision** (`p_value_adjusted <= α`) at level `q = α = 0.05`. **Empty when `in_family=false`** (rule: `in_family=false ⟺ both `p_value_adjusted` and `significant` empty`).
 - `n_common` — the common-subset size for that metric (always present).
 
-> The CI is descriptive effect-size context in a different role from the significance flags, and **may disagree** with them — expected under a step-up FDR procedure. `significant` is the FDR gate; `significant_raw` is the uncorrected view. The FDR family is deliberately small — only the headline metrics (`ndcg@10` = ranking quality, `recall@100` = coverage) enter it. Why FDR (not FWER/Holm), why a small family, the CI/flag disagreement, and the exact mean-δ estimand → methodology.md §8.
+> The CI is descriptive effect-size context in a different role from the significance flags, and **may disagree** with them — expected under a step-up FDR procedure. `significant` is the FDR gate; `significant_raw` is the uncorrected view. The FDR family is deliberately small — **8 contrasts × 1 headline metric (`ndcg@10` = ranking quality) = 8 BH tests**. `recall@100` is descriptive-only: it is structurally degenerate for the rerank-only contrasts at `W == 100` (a reranker permutes the top-100 set without changing its membership), which is why it was removed from the family (methodology.md §8.3). Why FDR (not FWER/Holm), why a small family, the CI/flag disagreement, and the exact mean-δ estimand → methodology.md §8.
 
 ### `run_config_{timestamp}.json`
 
-The fully-resolved config + seed: the resolved services registry and named pipelines (baseline + variants, each with its retrievers/fuser/reranker/window), the stats block (incl. `contrasts` and `fdr_metrics`), bootstrap `B`, CI level, family `α`, correction method, test + its zero/tie params, dataset version, ES + endpoint versions, cutoff, uniform retrieval depth (`top_k`), and a `diagnostics` block (per-metric common-subset `n_common`/`n_excluded` + per-system retrieval-failure counts). Given the recorded seed, the statistics are reproducible.
+The fully-resolved config + seed: the resolved services registry (each connector's `model_id` + endpoint `base_url` are the provider-endpoint provenance) and named pipelines (baseline + variants, each with its retrievers/fuser/reranker/window), the stats block (incl. `contrasts` and `fdr_metrics`), bootstrap `B`, `ci_level`, family `α`, correction method, test + its zero/tie params, the `metrics` policy (`unjudged`/`relevance_threshold`), cutoff, uniform retrieval depth (`top_k`), plus a `diagnostics` block:
+
+- `common_subset` — per-metric `n_common`/`n_excluded`; `retrieval_failures` — per-system count of queries with zero results.
+- `dataset` — the dataset `version`, the `qrels_digest` (SHA-256 over the gain-mapped qrels + threshold; runs with differing digests are not comparable), the human-readable `gain_mapping`, the resolved `relevance_threshold`, and `n_qrels`.
+- `index` — the ES `server_version` plus BM25 `k1`/`b` + analysis chain, **resolved from the live index** (never assumed).
+- `stats` — the FDR `family_size`/`family_members`, the reasoned structurally-`excluded` contrasts, and any data-`degenerate` rows (`empty_paired_set`/`all_zero_delta`).
+- `recall_information` — `recall@k → k/median(|R|)` ratios (low-information cutoffs are flagged).
+- `cost_latency` — present only under `--profile`.
+
+Given the recorded seed, the statistics are reproducible.
 
 ```bash
 ls -1 results/
@@ -348,6 +392,7 @@ indexer:
   index: wands_bench
   settings: { url: ${ES_URL} }
 pipelines:
+  baseline_id: bm25              # the baseline's artifact/system id; DEFAULTS to `baseline` when absent
   baseline:                      # the reference every variant is compared against
     retriever: bm25
   variants:                      # each is one explicit run; the map key is its id
@@ -369,14 +414,19 @@ stats:
   bootstrap_B: 10000             # CI resamples AND permutation count; p-resolution floor 1/(B+1)
   ci_level: 0.95                 # UNADJUSTED per-comparison effect-size CI; NOT a gate
   seed: 1234
-  contrasts:                     # explicit system_a vs system_b; absent => every variant vs baseline
-    - { a: semantic_co,        b: bm25,          family: true }
-    - { a: hybrid_co_k60,      b: semantic_co,   family: true }
-    - { a: hybrid_co_rerank,   b: semantic_co,   family: true }
-    - { a: bm25_rerank,        b: bm25,          family: true }
-    - { a: semantic_co_rerank, b: semantic_co,   family: true }
-    - { a: hybrid_co_rerank,   b: hybrid_co_k60, family: true }
-  fdr_metrics: [ndcg@10, recall@100]  # the ONLY metrics that enter the BH family
+  contrasts:                     # EIGHT explicit system_a vs system_b; absent => every variant vs baseline
+    - { a: semantic_co,        b: bm25,               family: true }   # does dense beat lexical?
+    - { a: hybrid_co_k60,      b: semantic_co,        family: true }   # does RRF-with-bm25 help or hurt dense?
+    - { a: hybrid_co_rerank,   b: semantic_co,        family: true }   # is hybrid+rerank distinguishable from dense?
+    - { a: bm25_rerank,        b: bm25,               family: true }   # rerank isolated on lexical
+    - { a: semantic_co_rerank, b: semantic_co,        family: true }   # rerank isolated on dense
+    - { a: hybrid_co_rerank,   b: hybrid_co_k60,      family: true }   # rerank isolated on hybrid
+    - { a: semantic_co_rerank, b: bm25_rerank,        family: true }   # do embeddings still win once both rerank?
+    - { a: hybrid_co_rerank,   b: semantic_co_rerank, family: true }   # does fusion still help once both rerank?
+  fdr_metrics: [ndcg@10]         # the ONLY metric in the BH family: 8 contrasts × 1 = 8 tests
+metrics:                         # ONE relevance policy over ALL SIX metrics (methodology.md §7)
+  unjudged: condensed            # condensed (Sakai deletion, default) | irrelevant (trec_eval)
+  relevance_threshold: 0.5       # binary-relevance cut for precision/recall + R + qrels digest
 cutoff: 10                       # point/quality metrics @10 (avg_relevance, ndcg@10, precision@10)
 top_k: 100                       # uniform retrieval depth: fuser.window == rerank_window_size == top_k
 cache:                           # OPTIONAL: memoize embeddings/rerank/searcher results to .cache/
@@ -409,11 +459,19 @@ a single `retriever`; or `retrievers: [...]` (2+) with a `fuser` (RRF); optional
 **`stats` — the comparison regime.** `contrasts` turns the factorial into explicit hypotheses
 (each `a` vs `b`; `family: true` puts the row in the FDR family); absent, it defaults to
 every-variant-vs-baseline. `fdr_metrics` is the small set of headline metrics that enter the
-Benjamini-Hochberg family (default `ndcg@10` = ranking quality, `recall@100` = coverage) — everything
-else is reported as descriptive context. `test` is the default mean-δ sign-flip `permutation`
+Benjamini-Hochberg family (default `[ndcg@10]` — the single ranking-quality claim; with the eight
+contrasts that is 8 BH tests) — everything else, `recall@100` included, is reported as descriptive
+context. `test` is the default mean-δ sign-flip `permutation`
 (`wilcoxon` selectable), `correction` is `bh` (or `by`), `alpha` is both the raw and FDR threshold,
 `bootstrap_B` drives both the CI resamples and the permutation count, and `seed` makes it all
 reproducible. The science behind these choices → methodology.md §8.
+
+**`metrics` — the ONE relevance policy.** `unjudged` decides how a returned-but-unjudged (MISSING)
+doc is scored, identically for all six metrics: `condensed` (Sakai deletion — MISSING dropped, the
+shipped default) or `irrelevant` (trec_eval — MISSING scored `0.0` in place).
+`relevance_threshold` (default `0.5`) is the binary-relevance cut for precision/recall, the recall
+denominator `R`, and the qrels digest. Both resolved values ride in the manifest; runs with
+differing policies/thresholds are not comparable (methodology.md §7).
 
 **`cutoff` / `top_k` — uniform depth (a load-bearing invariant).** `cutoff` is the point/quality
 cutoff (10). `top_k` is the **single retrieval depth every system shares**: the config keeps
@@ -431,7 +489,8 @@ changes the numbers, only the speed — so it is not part of the experiment defi
 - `retrievers` (2+) requires a `fuser`; a `fuser` is only allowed with `retrievers` (`type: rrf` only);
 - `reranker` requires `rerank_window_size`, and vice-versa;
 - every referenced service must exist and be the right type; a vector searcher must reference an existing embedder;
-- a variant id must not duplicate the baseline id.
+- the baseline's artifact/system id defaults to `baseline` and is set via `pipelines.baseline_id`
+  (the shipped config sets `baseline_id: bm25`); a variant id must not duplicate the baseline id.
 
 ### Environment variables
 

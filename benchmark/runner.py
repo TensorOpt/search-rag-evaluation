@@ -472,10 +472,11 @@ class ExperimentRunner:
                 vid: sum(1 for m in metrics.values() if m.n_results == 0)
                 for vid, metrics in per_query.items()
             }
-            # the qrels provenance — digest (over the gain-mapped triples + threshold), the
-            # human-readable gain mapping, the resolved threshold, and n_qrels. Two runs with
-            # differing digests are not comparable (report guidance, §7 provenance note).
+            # the qrels provenance — the dataset version, digest (over the gain-mapped triples +
+            # threshold), the human-readable gain mapping, the resolved threshold, and n_qrels. Two
+            # runs with differing digests are not comparable (report guidance, §7 provenance note).
             dataset_diag = {
+                "version": str(ctx.dataset.version),
                 "qrels_digest": qrels_digest(
                     ctx.qrels_list, relevance_threshold=cfg.metrics.relevance_threshold
                 ),
@@ -483,9 +484,11 @@ class ExperimentRunner:
                 "gain_mapping": dict(ctx.dataset.gain_mapping()),
                 "n_qrels": len(ctx.qrels_list),
             }
-            # the FDR family — size m (number of in-family real tests), full membership, and
-            # the structurally-excluded contrasts with their reason strings. Recorded so a reader can
-            # audit the multiple-comparison regime (8 contrasts × 1 metric = 8 tests on WANDS).
+            # the FDR family — size m (number of in-family real tests), full membership, the
+            # structurally-excluded contrasts with their reason strings, and the data-degenerate rows
+            # (empty_paired_set / all_zero_delta, §8.1 — the comparison CSV has no note column, so
+            # their note is persisted here). Recorded so a reader can audit the multiple-comparison
+            # regime (8 contrasts × 1 metric = 8 tests on WANDS).
             family_members = [
                 {"a": row.system_a, "b": row.system_b, "metric": row.metric}
                 for row in rows
@@ -496,10 +499,17 @@ class ExperimentRunner:
                 for row in rows
                 if (row.system_a, row.system_b, row.metric) in structural_exclusions
             ]
+            degenerate = [
+                {"a": row.system_a, "b": row.system_b, "metric": row.metric, "note": row.note}
+                for row in rows
+                if row.note is not None
+                and (row.system_a, row.system_b, row.metric) not in structural_exclusions
+            ]
             stats_diag = {
                 "family_size": len(family_members),
                 "family_members": family_members,
                 "excluded": excluded,
+                "degenerate": degenerate,
             }
             # flag recall@k that is structurally uninformative on this dataset (k/median(|R|)
             # below the floor) and record the ratios. |R| is dataset-level (from qrels), one per query.
