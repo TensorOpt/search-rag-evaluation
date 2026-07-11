@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "benchmark"
-version = "0.0.0"
+version = "0.1.0"
 description = "Reproducible search-relevance benchmark harness (WANDS on ElasticSearch >= 8.15)."
 readme = "README.md"
 license = "MIT"
@@ -21,8 +21,10 @@ packages = ["benchmark"]
 
 # ---------------------------------------------------------------------------
 # eval environment — the operational CLI surface (README TL;DR).
-#   wait-for-es / fetch-data : real, pure-infra helper scripts (scripts/).
-#   index / run              : non-destructive placeholders, wired in Phase 11.
+#   wait-for-es / fetch-data : pure-infra helper scripts (scripts/).
+#   index                    : build/populate the ES index (embeds the corpus).
+#   run                      : execute all configured pipelines and write artifacts.
+#   sweep                    : one-shot diagnostic parameter sweeps (non-frozen).
 # Helper scripts live under the top-level scripts/ package so that benchmark/
 # stays exactly the docs/architecture.md §11 module set.
 # ---------------------------------------------------------------------------
@@ -101,5 +103,5 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [
-  "integration: live-ES tests (Phases 9-12); skipped when ES is unreachable (plan §5).",
+  "integration: live-ES tests; skipped when ES is unreachable.",
 ]

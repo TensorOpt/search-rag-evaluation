@@ -1,0 +1,39 @@
+# GitLab CI — the canonical pipeline for the search-relevance benchmark harness.
+#
+# Unit tests only: tests/integration needs a live ElasticSearch + provider keys and is deliberately
+# excluded here (a services-based ES job is a separate, later task). No provider secrets are
+# referenced anywhere in this file. The three jobs run exactly the dev-env scripts from pyproject.toml.
+
+default:
+  image: python:3.11
+  before_script:
+    - pip install hatch
+  cache:
+    key:
+      files:
+        - pyproject.toml
+    paths:
+      - .cache/pip       # pip download cache (PIP_CACHE_DIR)
+      - .hatch           # hatch env dir (HATCH_DATA_DIR) — reuse the built envs across pipelines
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  HATCH_DATA_DIR: "$CI_PROJECT_DIR/.hatch"
+
+stages:
+  - test
+
+unit-tests:
+  stage: test
+  script:
+    - hatch run dev:test tests/unit -q
+
+lint:
+  stage: test
+  script:
+    - hatch run dev:lint .
+
+typecheck:
+  stage: test
+  script:
+    - hatch run dev:typecheck

@@ -1,0 +1,318 @@
+{
+  "baseline": {
+    "fuser": null,
+    "id": "bm25",
+    "rerank_window_size": null,
+    "reranker": null,
+    "retrievers": [
+      "bm25"
+    ]
+  },
+  "baseline_id": "bm25",
+  "cache": {
+    "dir": ".cache",
+    "enabled": true
+  },
+  "cutoff": 10,
+  "dataset": {
+    "name": "wands",
+    "path": "./dataset/wands"
+  },
+  "diagnostics": {
+    "common_subset": {
+      "avg_relevance": {
+        "n_common": 469,
+        "n_excluded": 11
+      },
+      "ndcg@10": {
+        "n_common": 469,
+        "n_excluded": 11
+      },
+      "precision@10": {
+        "n_common": 469,
+        "n_excluded": 11
+      },
+      "recall@10": {
+        "n_common": 479,
+        "n_excluded": 1
+      },
+      "recall@100": {
+        "n_common": 479,
+        "n_excluded": 1
+      },
+      "recall@50": {
+        "n_common": 479,
+        "n_excluded": 1
+      }
+    },
+    "dataset": {
+      "gain_mapping": {
+        "Exact": 1.0,
+        "Irrelevant": 0.0,
+        "Partial": 0.5
+      },
+      "n_qrels": 233448,
+      "qrels_digest": "bbc510f2ddfe2cc7929f379d4a18e226cc61e3463a6ff13eb16cc91e9ceac60e",
+      "relevance_threshold": 0.5
+    },
+    "index": {
+      "analysis": {
+        "analyzer": "standard",
+        "filters": [],
+        "tokenizer": null
+      },
+      "bm25": {
+        "b": 0.75,
+        "k1": 1.2,
+        "similarity": "BM25"
+      }
+    },
+    "recall_information": {
+      "recall@10": 0.058823529411764705,
+      "recall@100": 0.5882352941176471,
+      "recall@50": 0.29411764705882354
+    },
+    "retrieval_failures": {
+      "bm25": 1,
+      "bm25_rerank": 1,
+      "hybrid_co_k60": 0,
+      "hybrid_co_rerank": 0,
+      "semantic_co": 0,
+      "semantic_co_rerank": 0
+    },
+    "stats": {
+      "excluded": [
+        {
+          "a": "bm25_rerank",
+          "b": "bm25",
+          "metric": "recall@100",
+          "reason": "recall@100 not identified: bm25_rerank vs bm25 differ only by a reranker with rerank_window_size == 100 (top-k set identity, MF-1)"
+        },
+        {
+          "a": "semantic_co_rerank",
+          "b": "semantic_co",
+          "metric": "recall@100",
+          "reason": "recall@100 not identified: semantic_co_rerank vs semantic_co differ only by a reranker with rerank_window_size == 100 (top-k set identity, MF-1)"
+        },
+        {
+          "a": "hybrid_co_rerank",
+          "b": "hybrid_co_k60",
+          "metric": "recall@100",
+          "reason": "recall@100 not identified: hybrid_co_rerank vs hybrid_co_k60 differ only by a reranker with rerank_window_size == 100 (top-k set identity, MF-1)"
+        }
+      ],
+      "family_members": [
+        {
+          "a": "semantic_co",
+          "b": "bm25",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "hybrid_co_k60",
+          "b": "semantic_co",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "hybrid_co_rerank",
+          "b": "semantic_co",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "bm25_rerank",
+          "b": "bm25",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "semantic_co_rerank",
+          "b": "semantic_co",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "hybrid_co_rerank",
+          "b": "hybrid_co_k60",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "semantic_co_rerank",
+          "b": "bm25_rerank",
+          "metric": "ndcg@10"
+        },
+        {
+          "a": "hybrid_co_rerank",
+          "b": "semantic_co_rerank",
+          "metric": "ndcg@10"
+        }
+      ],
+      "family_size": 8
+    }
+  },
+  "indexer": {
+    "index": "wands_bench",
+    "provider": "elasticsearch",
+    "settings": {
+      "bulk_chunk_size": 96,
+      "request_timeout": 30,
+      "url": "http://localhost:9200"
+    }
+  },
+  "metrics": {
+    "relevance_threshold": 0.5,
+    "unjudged": "condensed"
+  },
+  "seed": 1234,
+  "services": {
+    "embedders": {
+      "cohere": {
+        "name": "cohere",
+        "provider": "cohere",
+        "settings": {
+          "api_key": "${COHERE_KEY}",
+          "model_id": "embed-english-v3.0",
+          "rate_limit": {
+            "requests_per_minute": 90
+          }
+        }
+      }
+    },
+    "rerankers": {
+      "co-rr": {
+        "name": "co-rr",
+        "provider": "cohere",
+        "settings": {
+          "api_key": "${COHERE_KEY}",
+          "model_id": "rerank-v3.5",
+          "rate_limit": {
+            "requests_per_minute": 90
+          },
+          "top_n": 100
+        }
+      }
+    },
+    "searchers": {
+      "bm25": {
+        "embedder": null,
+        "kind": "lexical",
+        "name": "bm25",
+        "provider": "elasticsearch"
+      },
+      "semantic_co": {
+        "embedder": "cohere",
+        "kind": "vector",
+        "name": "semantic_co",
+        "provider": "elasticsearch"
+      }
+    }
+  },
+  "stats": {
+    "alpha": 0.05,
+    "bootstrap_B": 10000,
+    "ci_level": 0.95,
+    "contrasts": [
+      {
+        "a": "semantic_co",
+        "b": "bm25",
+        "family": true
+      },
+      {
+        "a": "hybrid_co_k60",
+        "b": "semantic_co",
+        "family": true
+      },
+      {
+        "a": "hybrid_co_rerank",
+        "b": "semantic_co",
+        "family": true
+      },
+      {
+        "a": "bm25_rerank",
+        "b": "bm25",
+        "family": true
+      },
+      {
+        "a": "semantic_co_rerank",
+        "b": "semantic_co",
+        "family": true
+      },
+      {
+        "a": "hybrid_co_rerank",
+        "b": "hybrid_co_k60",
+        "family": true
+      },
+      {
+        "a": "semantic_co_rerank",
+        "b": "bm25_rerank",
+        "family": true
+      },
+      {
+        "a": "hybrid_co_rerank",
+        "b": "semantic_co_rerank",
+        "family": true
+      }
+    ],
+    "correction": "bh",
+    "fdr_metrics": [
+      "ndcg@10"
+    ],
+    "seed": 1234,
+    "test": "permutation"
+  },
+  "timestamp": "20260708T164458Z",
+  "top_k": 100,
+  "variants": [
+    {
+      "fuser": null,
+      "id": "semantic_co",
+      "rerank_window_size": null,
+      "reranker": null,
+      "retrievers": [
+        "semantic_co"
+      ]
+    },
+    {
+      "fuser": {
+        "rank_constant": 60,
+        "type": "rrf",
+        "window": 100
+      },
+      "id": "hybrid_co_k60",
+      "rerank_window_size": null,
+      "reranker": null,
+      "retrievers": [
+        "bm25",
+        "semantic_co"
+      ]
+    },
+    {
+      "fuser": null,
+      "id": "bm25_rerank",
+      "rerank_window_size": 100,
+      "reranker": "co-rr",
+      "retrievers": [
+        "bm25"
+      ]
+    },
+    {
+      "fuser": null,
+      "id": "semantic_co_rerank",
+      "rerank_window_size": 100,
+      "reranker": "co-rr",
+      "retrievers": [
+        "semantic_co"
+      ]
+    },
+    {
+      "fuser": {
+        "rank_constant": 60,
+        "type": "rrf",
+        "window": 100
+      },
+      "id": "hybrid_co_rerank",
+      "rerank_window_size": 100,
+      "reranker": "co-rr",
+      "retrievers": [
+        "bm25",
+        "semantic_co"
+      ]
+    }
+  ]
+}

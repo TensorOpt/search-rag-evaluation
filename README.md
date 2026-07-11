@@ -1,5 +1,7 @@
 # Search-Relevance Benchmark
 
+[![pipeline status](https://gitlab.com/<GROUP>/<PROJECT>/badges/main/pipeline.svg)](https://gitlab.com/<GROUP>/<PROJECT>/-/pipelines) <!-- TODO(laszlo): fill project path -->
+
 A reproducible harness for measuring how much different retrieval strategies improve search relevance over a **BM25 baseline**, on a fixed dataset and qrel set. It indexes documents into ElasticSearch, runs each variant (semantic, hybrid + RRF, and reranked combinations) through **one shared pipeline**, scores them with graded relevance metrics (`avg_relevance`, `ndcg@10`, `recall@10`, `recall@50`, `recall@100`, `precision@10`), and emits per-run CSV artifacts plus a paired statistical comparison against the baseline. The first concrete instantiation uses **WANDS** (Wayfair ANnotation Dataset for Search) on ElasticSearch **>= 8.15**, used as a **plain vector + BM25 index**: the harness embeds the corpus and queries via provider connectors (Cohere / Voyage / OpenAI) and retrieves with BM25 `match` + `knn` over `dense_vector` fields.
 
 This README is the operational guide for **running the evals**. The design lives in two authoritative docs: the **science** (metric definitions, statistics, variants-as-hypotheses) → [`docs/methodology.md`](docs/methodology.md); the **internals** (abstractions, ES mapping, caching, the DRY single-execution-path, artifact schemas, config, module layout) → [`docs/architecture.md`](docs/architecture.md). Where this guide and a design doc differ on a name, the design doc wins.
@@ -310,6 +312,8 @@ cache:
 
 Artifacts are written to `results/` (or `--output-dir`) with a single per-run UTC timestamp `{timestamp} = YYYYMMDDTHHMMSSZ`. Each run produces exactly three CSVs (plus `run_config`; plus the diagnostic `cost_latency_{timestamp}.csv` under `--profile` only), each CSV holding **all** pipelines in one file: the `variant` column is the pipeline's name from config (e.g. `hybrid_e5_k60`); the baseline's id defaults to `baseline` and is set via `pipelines.baseline_id` (the shipped config sets `baseline_id: bm25`). All CSVs are UTF-8, comma-separated, with a header. **Field names and order are fixed.**
 
+A full reference run is committed under [`examples/`](examples/runs/20260708T164458Z/) with a walkthrough of its numbers in [`docs/example-results.md`](docs/example-results.md), so the output can be inspected without a live ES or provider keys.
+
 ### `result_{timestamp}.csv`
 
 ```
@@ -526,6 +530,20 @@ docker compose down -v        # stop ES and delete its volume (index data)
 Run artifacts in `results/` and the dataset in `dataset/wands/` are untouched by teardown; remove them manually if you want a clean slate.
 
 ---
+
+## Roadmap
+
+The following are planned and not yet implemented. The repository name (`search-rag-evaluation`) anticipates the RAG work in item 3; today the harness covers search relevance only.
+
+1. **Annotator agreement for LLM-as-judge evaluation.** Measure inter-annotator agreement between an LLM judge and the human labels on the ordinal WANDS scale (Exact / Partial / Irrelevant), using weighted Cohen's κ and Krippendorff's ordinal α. Plain (unweighted) Cohen's κ is deliberately excluded because it ignores the ordinal structure of the scale. The two statistics are reported side by side rather than treated as interchangeable, since they use different distance functions.
+2. **One-off deterministic qrel backfill.** After an initial eval, some returned documents have no judgment, and metrics are currently condensed (a MISSING judgment is dropped). A one-off backfill step will label those documents with an LLM judge, gated by the agreement study above: the agreement numbers are the basis for deciding whether backfilled labels can stand in for human labeling. Backfilled labels land in a separate CSV and are never merged into the upstream qrels file, and the step runs exactly once, so search evaluation stays deterministic.
+3. **RAG pipeline.** A major new feature. After retrieval, measure faithfulness and other answer-quality metrics under the same statistical layer as search (paired tests, bootstrap CIs, FDR). The pipeline is modular, mirroring `SearchPipeline`, so retrieval quality and faithfulness are measurable separately rather than only end to end.
+
+## Contributing
+
+Issues and reproduction reports are welcome. Open an issue before sending a PR; the harness holds several load-bearing invariants (see [CLAUDE.md](CLAUDE.md) and the design docs under [`docs/`](docs/)) and changes are discussed against them first.
+
+*Maintained by [Laszlo Csontos](https://tensoropt.ai) (TensorOpt), author of [Designing Hybrid Search Systems](https://leanpub.com/hybridsearchbook).*
 
 ## License
 

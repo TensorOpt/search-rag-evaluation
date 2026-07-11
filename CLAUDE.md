@@ -107,4 +107,5 @@ OpenAI) in `benchmark/providers/inference.py` — ES runs no `_inference`.
 - Cross-references in code and docs may point **only** to `docs/methodology.md` and
   `docs/architecture.md` (by section, e.g. `§7` / `architecture.md §5.5`); never to ephemeral
   fix-tracking IDs (`P0-x`, `MF-x`, etc.) or any other transient document.
-- Don't commit `dataset/`, `results/`, or `logs/` artifacts.
+- Don't commit `dataset/`, `results/`, or `logs/` artifacts. The curated reference run under
+  `examples/runs/` is the deliberate exception (see `docs/example-results.md`).
